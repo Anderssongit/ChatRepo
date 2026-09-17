@@ -1,0 +1,73 @@
+# De ~50 største selskapene i S&P 500. Startpunktet for databasen.
+#
+# LES DETTE FØR DU BRUKER LISTA TIL Å TESTE EP
+# ────────────────────────────────────────────
+# Disse selskapene gapper nesten aldri 10 %. Et kvartalstall flytter ikke et
+# selskap på tusen milliarder dollar så mye, og de få mega-cap-gapene som
+# finnes (NVDA og META i februar 2024) blir uansett forkastet av
+# neglisjeringstesten, fordi aksjene allerede hadde løpt inn i nyheten.
+#
+# Lista er derfor riktig som FØRSTE steg — den svarer på «slår de estimatet,
+# og gapper aksjen da?», og svaret (nesten aldri) er i seg selv nyttig og
+# etterprøvbart. Den gir deg bare ikke EP-er å backteste.
+#
+# Når du vil ha EP-er: utvid til mindre selskaper med høy ADR. Sikt mot
+# 200–400 gapdager før en treffprosent betyr noe. Se tickere_start.txt for
+# et bredere utvalg, og pekere til Nasdaqs symbolkatalog og iShares' IWV.
+#
+# Merk: BRK.B skrives ulikt hos hver leverandør (BRK-B hos Alpha Vantage,
+# BRK.B hos TwelveData), så den står utelatt her.
+
+NVDA
+MSFT
+AAPL
+AMZN
+META
+GOOGL
+AVGO
+TSLA
+LLY
+JPM
+V
+XOM
+UNH
+MA
+COST
+HD
+PG
+WMT
+JNJ
+NFLX
+ABBV
+CRM
+BAC
+ORCL
+MRK
+CVX
+KO
+AMD
+PEP
+TMO
+LIN
+ADBE
+WFC
+MCD
+CSCO
+ACN
+ABT
+DHR
+IBM
+GE
+QCOM
+TXN
+NOW
+CAT
+VZ
+INTU
+PM
+AMGN
+ISRG
+PFE
+
+# Indeksen til markedsfilteret (legges til automatisk, men greit å ha med)
+SPY

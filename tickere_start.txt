@@ -1,0 +1,142 @@
+# Startliste for --fil. IKKE Russell 3000 — det er ~100 likvide amerikanske
+# navn å komme i gang med, valgt fordi de faktisk beveger seg og har nyheter.
+#
+# Vil du ha hele universet, hent en ekte liste og pek --fil på den:
+#   • Nasdaq/NYSE-symbolkatalogen (gratis, offisiell):
+#     https://www.nasdaqtrader.com/trader.aspx?id=symboldirdefs
+#     (filene nasdaqlisted.txt og otherlisted.txt)
+#   • iShares' beholdningsliste for IWV (Russell 3000) som CSV:
+#     https://www.ishares.com/us/products/239714/
+#
+# Regnestykket før du gjør det: TwelveData gir 800 kall i døgnet, så 3000
+# tickere er fire døgns kjøring bare for dagskursene. Kjøringen tar seg opp
+# igjen der den slapp (--ferskhet), så det GÅR — det tar bare dager, ikke
+# minutter. Alpha Vantage med 50 kall i døgnet ville brukt to måneder.
+#
+# Én per linje. Alt etter # er kommentar.
+
+# ── halvledere og maskinvare ──────────────────────────────────────────────
+NVDA
+AMD
+AVGO
+MU
+INTC
+TSM
+ARM
+SMCI
+MRVL
+ONTO
+AMAT
+LRCX
+KLAC
+ASML
+QCOM
+TXN
+
+# ── programvare og internett ──────────────────────────────────────────────
+MSFT
+GOOGL
+AMZN
+META
+AAPL
+NFLX
+CRM
+NOW
+PLTR
+SNOW
+DDOG
+NET
+CRWD
+ZS
+PANW
+MDB
+TEAM
+SHOP
+SQ
+PYPL
+APP
+DUOL
+HOOD
+COIN
+RBLX
+U
+TTD
+SPOT
+UBER
+LYFT
+DASH
+ABNB
+PINS
+SNAP
+
+# ── forbruker og industri ─────────────────────────────────────────────────
+TSLA
+COST
+WMT
+TGT
+NKE
+SBUX
+CMG
+LULU
+DECK
+ANF
+CROX
+ELF
+CELH
+MNST
+GE
+CAT
+DE
+BA
+LMT
+RTX
+UNP
+
+# ── finans ────────────────────────────────────────────────────────────────
+JPM
+BAC
+GS
+MS
+SCHW
+V
+MA
+AXP
+AFRM
+UPST
+SOFI
+LC
+
+# ── helse og bioteknologi ─────────────────────────────────────────────────
+LLY
+NVO
+UNH
+ABBV
+MRK
+PFE
+AMGN
+REGN
+VRTX
+MRNA
+BNTX
+ALNY
+NBIX
+SRPT
+EXAS
+TDOC
+
+# ── energi og råvarer ─────────────────────────────────────────────────────
+XOM
+CVX
+COP
+SLB
+OXY
+FCX
+NEM
+CCJ
+FSLR
+ENPH
+PLUG
+
+# ── indeksen til markedsfilteret ──────────────────────────────────────────
+# SPY legges til automatisk, men skader ikke å ha den her.
+SPY
