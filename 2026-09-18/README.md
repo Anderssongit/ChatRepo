@@ -1,8 +1,9 @@
-# Rettelse 2026-09-18 — de to feilende strategiene
+# Rettelse 2026-09-18 — de to feilende strategiene, og datahentingen
 
-Denne mappen retter de to problemene i kjøringen 2026-09-18: ledelsessentimentet
-som stoppet på prisvalidering, og Sentiment Momentum som rapporterte `OK` mens
-den kjørte på måned gamle kurser.
+Denne mappen retter tre ting: ledelsessentimentet som stoppet på prisvalidering,
+Sentiment Momentum som rapporterte `OK` mens den kjørte på måned gamle kurser,
+og den egentlige årsaken bak den andre — at **masteren aldri hentet ned sitt
+eget datagrunnlag.**
 
 Ingenting i mappen laster ned, sender mail eller endrer de hash-beskyttede
 strategiene. `PBROE_All3` og `SentimentMomentumV31` er byte-identiske etter
@@ -41,7 +42,57 @@ Ingenting klippes, interpoleres eller gjettes. Klarer ikke regelen å bevise at 
 sprang er et enhetsavvik, stopper kjøringen som før — men nå med en liste over
 hvilke tickere som faktisk må sjekkes manuelt, ikke alle åtte.
 
-## 2. Sentiment Momentum — KAN IKKE FIKSES MED KODE
+## 2. Masteren henter nå ned alt selv — FIKSET I KODE
+
+**Hva som var galt.** `master.py` *kontrollerte* at tre filer fantes og avbrøt
+hvis de ikke gjorde det. Ingenting i repoet lagde dem:
+
+| Fil | Leses av | Ble laget av |
+|---|---|---|
+| `Data_BT/AllTickers_OSEBX_TW_*.xlsx` | `PBROE_All3.load_tickers()` | et annet program |
+| `Data_BT1/FinancialData/Stock_Prices_*.xlsx` | `SentimentMomentumV31` | et annet program |
+| `DataNLP/Step4_Sentiment_Changes_*.xlsx` | `SentimentMomentumV31` | et annet program |
+
+README-en i roten sa «behold planen som lager dem først». Ingen hadde kjørt den
+siden 2026-08-19. Det er hele forklaringen på at Sentiment Momentum backtestet
+måned gamle kurser: filen var ikke gammel fordi noe feilet, den var gammel fordi
+ingenting oppdaterte den.
+
+**Poenget: alt som trengs lastes allerede ned av denne pakken.**
+
+| Byggestein | Hentes allerede av |
+|---|---|
+| Euronext-aksjelista | `innsidehandel_pipeline.sikre_aksjeliste` |
+| Daglige kurser (yfinance) | `innsidehandel_pipeline.steg4_kurser` |
+| FinBERT-score per artikkel | `SentimentManagement` → `NLP_Sentiment_Detail_*.xlsx` |
+
+De tre filene er altså omforminger av data masterkjøringen allerede har.
+`data_acquisition.py` gjør omformingen, og masteren kaller den selv.
+
+- **Tickerlista** — `Company` er den bare tickeren, fordi PB-ROE bygger
+  `tradingview.com/symbols/OSL-<Company>/` av den. Skrives med `index=True`,
+  fordi `load_tickers()` dropper den første kolonnen før den leser `Company`.
+- **Kursfila** — lang form med `Date`, `Company`, `Ticker`, `Close`. `Company`
+  hentes fra samme selskapsliste som Step4, slik at `_map_tickers` treffer.
+- **Step4** — `Sentiment_Change` er bevegelsen fra selskapets **forrige**
+  rapport, som er nøyaktig det strategien handler på. Første artikkel per
+  selskap har ingen forgjenger og får 0,0.
+
+**Rekkefølgen er viktig.** Step4 bygges av scorene skrapingen nettopp skrev, så
+den må ligge mellom skrapingen og `SentimentMomentumV31`. Masteren gjør derfor
+hentingen i to trinn: tickerliste og kurser *før* analysene, Step4 inne i
+`kjor_alle` rett etter skrapingen.
+
+**Henting velter aldri en kjøring alene.** Feiler den mens filene allerede
+ligger der og er ferske, er ingen skade skjedd. Portene som faktisk avgjør er
+`protected_input_errors` (fil mangler) og den nye `foreldede_grunnlagsdata`
+(fil finnes, men er for gammel: kurser 7 dager, Step4 14, tickerliste 90).
+Unntaket er Step4: feiler den, stopper analysen, for uten fersk Step4 leser
+SentMom den forrige — og da er vi tilbake i 2026-09-18.
+
+Nye brytere: `--ingen-datahent` og `--tving-datahent`.
+
+## 3. Sentiment Momentum — RESTEN KAN IKKE FIKSES MED KODE
 
 **Hva som var galt.** Strategien brukte 0,9 minutter og ble rapportert `OK`.
 Den hentet ingenting: den kjørte backtesten på nytt over kursfiler som slutter
@@ -61,8 +112,10 @@ Det betyr at **selv om ledelsessentimentet hadde blitt fikset samme kveld, ville
 den felles perioden fortsatt stoppet 2026-07-31.** Rapporten nevnte ikke dette
 med ett ord. Du hadde to blokkeringer, ikke én.
 
-**Hva som er gjort.** Faktumet gjøres synlig, og det blir mulig å oppdage det på
-to sekunder i stedet for etter 106 minutter:
+**Hva som er gjort.** Kursfila bygges nå av masteren selv (punkt 2 over), så
+den normale årsaken til at den er gammel er borte. I tillegg gjøres faktumet
+synlig, og det blir mulig å oppdage på to sekunder i stedet for etter 106
+minutter:
 
 - `freshness.py` gir ferskhetsport og månedsslutt-dekning per strategi.
 - `portfolio_blend.py` returnerer nå hvilke månedsslutter som ble forkastet og
@@ -76,7 +129,7 @@ to sekunder i stedet for etter 106 minutter:
 ## Slik tar du det i bruk
 
 ```text
-python 2026-09-18/apply_patch.py          # patcher Only_260820.py
+python 2026-09-18/apply_patch.py          # patcher Only_260820.py og master.py
 python 2026-09-18/preflight_data.py       # hva blokkerer akkurat nå?
 ```
 
@@ -86,16 +139,16 @@ de beskyttede hashene er uendret før den lagrer, og legger originalen i
 `2026-09-18/backup/`. `--revert` gir byte-identisk fil tilbake. `--check`
 rapporterer status uten å endre noe.
 
-Deretter, i denne rekkefølgen:
+Deretter er `RUN_ALL.cmd` nok: masteren bygger nå grunnlagsfilene selv før den
+kjører analysene. Første kjøring tar lengre tid, fordi kursene faktisk hentes.
 
-1. **Oppdater oppstrømsfilene** som preflight flagger — særlig
-   `Stock_Prices_*.xlsx` og `Step4_Sentiment_Changes_*.xlsx`. Uten dette forblir
-   Sentiment Momentum gammel uansett hva annet du gjør.
-2. `python run_strategy.py --strategy sentmom`
-3. `python run_strategy.py --strategy management` — prisvakten retter nå
-   enhetsavvik og blokkerer resten.
-4. `python 2026-09-18/preflight_data.py` — skal si OK.
-5. `RUN_ALL.cmd`
+Vil du gjøre det stegvis:
+
+1. `RUN_ALL.cmd --tving-datahent` — bygger alle tre grunnlagsfilene på nytt.
+2. `python 2026-09-18/preflight_data.py` — skal si OK.
+
+Kjører du bare enkeltstrategier, husk at Step4 bygges av artikkelscorene:
+`run_strategy.py --strategy management` må ha kjørt skrapingen først.
 
 Bruk `portfolio_blend.py` fra denne mappen ved å legge den først i `PYTHONPATH`,
 eller kopier den over rotversjonen når du er fornøyd. Den består alle 15
@@ -107,7 +160,7 @@ eksisterende tester i `test_portfolio_blend.py` uendret.
 
 **Verifisert her, kjørbart uten pandas eller nett:**
 
-- 38 tester i `tests/` passerer.
+- 58 tester i `tests/` passerer.
 - Repoets egne `test_portfolio_blend` (15), `test_insider_selection` (16),
   `test_capital_mail` (3) og `test_master` (24) passerer uendret.
 - De beskyttede hashene til `PBROE_All3` og `SentimentMomentumV31` er uendret
@@ -115,13 +168,26 @@ eksisterende tester i `test_portfolio_blend.py` uendret.
 - `Only_260820.py` parser, og diffen er 30 linjer inn / 5 ut. CRLF er bevart —
   filen har blandede linjeskift, og patcheren matcher konvensjonen lokalt der
   blokken står.
-- `apply_patch.py --revert` gir en byte-identisk fil (tom `git diff`).
+- `apply_patch.py --revert` gir byte-identiske filer (tom `git diff`).
+- `master.py` parser, CRLF bevart, og de nye funksjonene er røykttestet med
+  `build_all` mocket: henting som feiler gir ikke fatal kjøring, mens Step4 som
+  feiler stopper analysen.
 
 **Ikke verifisert — og det kan ikke verifiseres i dette miljøet:**
 
 - `repair_price_frames` er pandas-adapteren. Beslutningslogikken under den er
   testet i detalj, men selve adapteren er ikke kjørt: pandas og numpy er ikke
   installert her, og det finnes ingen `ExcelData`- eller `data`-mappe.
+- **Ingen av de tre grunnlagsfilene er faktisk skrevet.** Radbyggingen er testet
+  rad for rad, men `write_workbook`, `read_nlp_detail`, `ensure_stock_list` og
+  `ensure_prices` krever pandas, yfinance og nettilgang. At skjemaene stemmer er
+  lest ut av koden som leser dem (`load_tickers`, `DataLoader.load_all`,
+  `PriceBook`), ikke bekreftet mot en ekte fil — det finnes ingen original i
+  repoet å sammenligne med.
+- `Sentiment_Change` er utledet av hva strategien sier den handler på
+  («kjøper på endringen fra forrige rapport»). Det originale programmet finnes
+  ikke her, så skalaen kan avvike fra den SentMom opprinnelig ble kalibrert på.
+  Første kjøring bør sammenlignes mot den gamle `Step4`-fila før tallene brukes.
 - Ingen ekte kursfil er rettet. Om alle åtte flaggede tickere faktisk *er*
   tierpotens-artefakter vet vi først når patchen kjøres mot ekte nedlastede
   kurser. BSP.OL er bekreftet fra tallene i `VALIDATION.md`; de sju andre er
@@ -142,12 +208,14 @@ opplastede repoet.
 
 | Fil | Hva den gjør |
 |---|---|
+| `data_acquisition.py` | Bygger de tre grunnlagsfilene. Radlogikk i ren Python. |
+| `patches.json` | Selve redigeringene, én post per blokk — lesbare uten å lese patcheren. |
 | `price_repair.py` | Klassifiserer og retter tierpotens-artefakter. Ren Python. |
 | `freshness.py` | Ferskhetsport og månedsslutt-dekning. Ren Python. |
 | `portfolio_blend.py` | Som roten, men forkastede månedsslutter rapporteres og bindende strategi navngis. |
-| `apply_patch.py` | Patcher `Only_260820.py`. Verifisert, idempotent, reversibel. |
+| `apply_patch.py` | Patcher `Only_260820.py` og `master.py`. Verifisert, idempotent, reversibel. |
 | `preflight_data.py` | Sjekker alle fire strategier og oppstrømsfiler før en lang kjøring. |
-| `tests/` | 38 tester, kjører uten pandas og uten nett. |
+| `tests/` | 58 tester, kjører uten pandas og uten nett. |
 
 ```text
 python -m unittest discover -s 2026-09-18/tests -t 2026-09-18/tests
