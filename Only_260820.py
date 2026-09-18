@@ -10253,14 +10253,39 @@ def SentimentHendelseLab(skriv_master: bool = True):
         close.to_csv(config.ut_dir / "management_prices_close.csv", index_label="Date")
         high.to_csv(config.ut_dir / "management_prices_high.csv", index_label="Date")
         low.to_csv(config.ut_dir / "management_prices_low.csv", index_label="Date")
-        issues = kontroller_priser(close)
+        # 2026-09-18 correction. kontroller_priser flags every 4x step between two
+        # observations and this call used to abort the entire management run on any
+        # of them. A step that is an exact power of ten (BSP.OL: 0.101440 ->
+        # 10.144007, ratio 100.000) is a provider denomination artifact, provable
+        # from the data alone. Those are rescaled BACKWARDS - the most recent
+        # prices, which live positions are marked against, are never modified -
+        # and every change is written to management_price_issues.csv. Every other
+        # flagged observation still blocks publication. Nothing is clipped,
+        # interpolated or guessed. Logic and tests: 2026-09-18/price_repair.py.
+        import sys as _sys
+        from pathlib import Path as _Path
+        _fix_dir = _Path(__file__).resolve().parent / "2026-09-18"
+        if _fix_dir.is_dir() and str(_fix_dir) not in _sys.path:
+            _sys.path.insert(0, str(_fix_dir))
+        from price_repair import repair_price_frames, blocked_tickers, summary
+        close, high, low, _repair_results, _issue_rows = repair_price_frames(
+            close, high, low, logger=log)
+        issues = pd.DataFrame(_issue_rows, columns=[
+            "ticker", "date", "issue", "previous_date", "previous_price",
+            "price", "ratio", "applied_factor", "resolution"])
         issues.to_csv(config.ut_dir / "management_price_issues.csv", index=False)
-        if not issues.empty:
-            examples = ", ".join(issues["ticker"].drop_duplicates().head(8))
+        log.info("Kurser   : prisrevisjon %s", summary(_repair_results.values()))
+        _blocked = blocked_tickers(_repair_results.values())
+        if _blocked:
             raise RuntimeError(
                 "Management prices require verification after provider repair: "
-                + examples + ". See management_price_issues.csv. No backtest or variant "
-                "is published from these prices; prices were not clipped or guessed.")
+                + ", ".join(_blocked[:8]) + ". See management_price_issues.csv. "
+                "Power-of-ten unit artifacts were repaired and logged; these remaining "
+                "discontinuities are not provably unit errors, so no backtest or "
+                "variant is published from them. Prices were not clipped or guessed.")
+        # The repaired series actually used, kept beside the raw download.
+        close.to_csv(config.ut_dir / "management_prices_close_repaired.csv",
+                     index_label="Date")
 
         # ATR20 = gjennomsnittlig True Range. Vi bruker den til volatilitetstilpassede
         # stoppnivåer, men selve exit-signalet er close-basert for å unngå antakelser
