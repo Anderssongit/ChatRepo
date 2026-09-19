@@ -129,7 +129,7 @@ minutter:
 ## Slik tar du det i bruk
 
 ```text
-python 2026-09-18/apply_patch.py          # patcher Only_260820.py og master.py
+python 2026-09-18/apply_patch.py          # patcher de tre filene i roten
 python 2026-09-18/preflight_data.py       # hva blokkerer akkurat nå?
 ```
 
@@ -150,9 +150,26 @@ Vil du gjøre det stegvis:
 Kjører du bare enkeltstrategier, husk at Step4 bygges av artikkelscorene:
 `run_strategy.py --strategy management` må ha kjørt skrapingen først.
 
-Bruk `portfolio_blend.py` fra denne mappen ved å legge den først i `PYTHONPATH`,
-eller kopier den over rotversjonen når du er fornøyd. Den består alle 15
-eksisterende tester i `test_portfolio_blend.py` uendret.
+---
+
+## Hvor koden ligger
+
+Ny kode ligger i denne mappen. Endringer i filer som allerede fantes gjøres
+**på plass i roten**, gjennom `apply_patch.py`:
+
+| Fil | Hvor | Hvorfor |
+|---|---|---|
+| `price_repair.py`, `freshness.py`, `data_acquisition.py`, `preflight_data.py` | `2026-09-18/` | ny kode, ingen konflikt |
+| `master.py` | roten, patchet | det er inngangspunktet `RUN_ALL.cmd` kaller |
+| `Only_260820.py` | roten, patchet | prisvakten ligger inne i `SentimentHendelseLab` |
+| `portfolio_blend.py` | roten, patchet | se under |
+
+`portfolio_blend.py` lå først som en **kopi** i denne mappen. Det var feil: to
+filer med samme modulnavn betyr at hvilken versjon du får avhenger av
+importrekkefølgen — og `_fikspakke()` legger denne mappen først i `sys.path`
+først når datahentingen kjører. Med `--ingen-datahent` fikk du rotversjonen,
+uten den fikk du kopien. Samme kommando, to kodeveier. Kopien er slettet, og
+endringene er patchet inn i rotfila som alt annet.
 
 ---
 
@@ -162,7 +179,8 @@ eksisterende tester i `test_portfolio_blend.py` uendret.
 
 - 58 tester i `tests/` passerer.
 - Repoets egne `test_portfolio_blend` (15), `test_insider_selection` (16),
-  `test_capital_mail` (3) og `test_master` (24) passerer uendret.
+  `test_capital_mail` (3) og `test_master` (24) passerer uendret — også mot den
+  patchede `portfolio_blend.py` i roten.
 - De beskyttede hashene til `PBROE_All3` og `SentimentMomentumV31` er uendret
   etter patchen, sjekket med repoets egen hash-logikk.
 - `Only_260820.py` parser, og diffen er 30 linjer inn / 5 ut. CRLF er bevart —
@@ -212,8 +230,7 @@ opplastede repoet.
 | `patches.json` | Selve redigeringene, én post per blokk — lesbare uten å lese patcheren. |
 | `price_repair.py` | Klassifiserer og retter tierpotens-artefakter. Ren Python. |
 | `freshness.py` | Ferskhetsport og månedsslutt-dekning. Ren Python. |
-| `portfolio_blend.py` | Som roten, men forkastede månedsslutter rapporteres og bindende strategi navngis. |
-| `apply_patch.py` | Patcher `Only_260820.py` og `master.py`. Verifisert, idempotent, reversibel. |
+| `apply_patch.py` | Patcher `Only_260820.py`, `master.py` og `portfolio_blend.py` (12 blokker). Verifisert, idempotent, reversibel. |
 | `preflight_data.py` | Sjekker alle fire strategier og oppstrømsfiler før en lang kjøring. |
 | `tests/` | 58 tester, kjører uten pandas og uten nett. |
 

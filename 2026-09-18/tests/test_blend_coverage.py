@@ -6,6 +6,10 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
+# portfolio_blend is patched in place in the repository root, not shadowed by a
+# copy in this folder: two files with one module name means the version you get
+# depends on import order.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from portfolio_blend import (PortfolioDataError, _monthly_observations,
