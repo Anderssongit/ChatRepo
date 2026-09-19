@@ -6,12 +6,7 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
-# portfolio_blend lives in the repository root and is never modified there. The
-# import hook applies the patches to its source in memory, so this imports the
-# corrected module without a second copy of it existing anywhere.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import patched_import
-patched_import.install()
 
 from portfolio_blend import (PortfolioDataError, _monthly_observations,
                              build_capital_portfolio)
