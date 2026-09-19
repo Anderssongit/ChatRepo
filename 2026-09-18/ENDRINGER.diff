@@ -1,0 +1,325 @@
+Diff mellom de originale filene i repo-roten og kopiene i 2026-09-18/.
+Dette er alt som skiller pakken fra den koden som lå der fra før.
+Linjeskift er normalisert til LF her for lesbarhet; filene selv beholder
+sine originale CRLF/LF.
+
+--- original/master.py
++++ 2026-09-18/master.py
+@@ -185,6 +185,104 @@
+ # andre med seg — da hadde en manglende Excel-fil i PB-ROE stoppet mailen om
+ # innsidehandel også, og det er ingen tjent med.
+ 
++def _fikspakke() -> bool:
++    """Put the dated fix package on sys.path without importing it eagerly."""
++    folder = SKRIPTMAPPE
++    if folder.is_dir() and str(folder) not in sys.path:
++        sys.path.insert(0, str(folder))
++    return folder.is_dir()
++
++
++def hent_grunnlagsdata(m: Master, logger, *, steg, force: bool = False) -> List[Rad]:
++    """Bygg grunnlagsfilene masteren tidligere bare KONTROLLERTE at fantes.
++
++    AllTickers_OSEBX_TW_*.xlsx, Stock_Prices_*.xlsx og
++    Step4_Sentiment_Changes_*.xlsx kom fra et annet program. Ingen hadde kjort
++    det siden 2026-08-19, og det er hele grunnen til at Sentiment Momentum
++    backtestet maned gamle kurser og likevel ble rapportert som OK.
++
++    Alt som trengs for a bygge dem lastes allerede ned av denne pakken:
++    aksjelista og kursene av innsidepipelinen, artikkelscorene av FinBERT-
++    skrapingen. Masteren bygger dem derfor selv. De hash-beskyttede
++    strategiene rores ikke - dette skriver filene de leser, i det formatet de
++    allerede forventer.
++    """
++    start = time.time()
++    if not _fikspakke():
++        return [{"Analyse": "Datahenting", "Status": "FEIL", "Minutter": 0.0,
++                 "Feil": "Fant ikke data_acquisition.py ved siden av master.py"}]
++    try:
++        from data_acquisition import build_all
++        rader = build_all(m.excel_dir, m.oppsett(), logger, steps=steg, force=force)
++    except KeyboardInterrupt:
++        raise
++    except Exception as e:
++        logger.exception("Datahenting feilet")
++        return [{"Analyse": "Datahenting", "Status": "OK", "Handling": "FEIL",
++                 "Minutter": round((time.time() - start) / 60.0, 1),
++                 "Feil": "feil - " + IP.feiltekst(e)[:180]}]
++    minutter = round((time.time() - start) / 60.0, 1)
++    ut: List[Rad] = []
++    for rad in rader:
++        logger.info("   %-9s %-22s %s", rad["Handling"], rad["Kilde"], rad["Merknad"])
++        # Status er alltid OK: henting som feiler skal ikke velte en kjoring
++        # der filene allerede ligger der og er ferske. Handling baerer utfallet,
++        # og bygg_sentimentendringer leser den.
++        ut.append({"Analyse": "Data: " + str(rad["Kilde"]), "Status": "OK",
++                   "Handling": rad["Handling"], "Minutter": minutter,
++                   "Feil": f'{rad["Handling"].lower()} - {rad["Merknad"]}'})
++        minutter = 0.0
++    return ut
++
++
++# Hvor gamle grunnlagsfilene faar vaere for de ikke lenger dokumenterer noe
++# ferskt. Tickerlista endrer seg langsomt; kursene gjor ikke det.
++DATA_MAKSALDER = {"Data_BT/AllTickers_OSEBX_TW_*.xlsx": 90,
++                  "Data_BT1/FinancialData/Stock_Prices_*.xlsx": 7,
++                  "DataNLP/Step4_Sentiment_Changes_*.xlsx": 14}
++
++
++def foreldede_grunnlagsdata(m: Master) -> List[str]:
++    """Filer som FINNES, men er for gamle til aa baere et ferskt resultat.
++
++    Dette er porten som manglet 2026-09-18: kursfila laa der, SentMom leste
++    den uten aa feile, og ingen sa at den stoppet 2026-08-19. En fil som
++    mangler fanges av protected_input_errors; denne fanger den som er gammel.
++    Henting som feilet er ikke i seg selv en feil - resultatet av den er det.
++    """
++    if not _fikspakke():
++        return []
++    from data_acquisition import latest, needs_refresh
++    from datetime import date as _date
++    feil = []
++    for monster, maksalder in DATA_MAKSALDER.items():
++        mappe, mal = monster.rsplit("/", 1)
++        funnet = latest(m.excel_dir / mappe, mal)
++        if funnet is None:
++            continue                      # manglende fil: protected_input_errors
++        gammel, hvorfor = needs_refresh(funnet, _date.today(), maksalder)
++        if gammel:
++            feil.append(f"Grunnlagsdata for gamle: {funnet.name} er {hvorfor}. "
++                        f"Resultatene bygget paa denne fila er ikke ferske. "
++                        f"Kjor uten --ingen-datahent, eller med --tving-datahent.")
++    return feil
++
++
++def bygg_sentimentendringer(m: Master, logger) -> int:
++    """Step4-endringene, bygget av FinBERT-scorene skrapingen nettopp skrev.
++
++    Ma kjore ETTER skrapingen og FOR SentimentMomentumV31, som leser fila.
++    """
++    rader = hent_grunnlagsdata(m, logger, steg=("step4",))
++    feil = [r["Feil"] for r in rader if r.get("Handling") == "FEIL"]
++    if feil:
++        # Her ER det fatalt: uten en fersk Step4-fil leser SentimentMomentumV31
++        # den forrige, og da er vi tilbake i 2026-09-18.
++        raise RuntimeError("; ".join(feil))
++    return 0
++
++
++
+ def kjor_alle(m: Master, logger) -> List[Rad]:
+     """Kjører de fire analysene. Én rad per analyse med status og tid."""
+     ut: List[Rad] = []
+@@ -227,6 +325,10 @@
+         analyser = [("PB-ROE-Momentum", O.PBROE_All3)]
+         if O._miljo_paa("AKSJE_NLP_HENT"):
+             analyser.append(("NLP-artikler — skraping", O.SentimentManagement))
++        # Step4 bygges av scorene skrapingen nettopp skrev, og maa ligge der
++        # foer SentimentMomentumV31 leser den. Derfor akkurat her.
++        analyser.append(("Sentimentendringer — Step4",
++                         lambda: bygg_sentimentendringer(m, logger)))
+         analyser += [("NLP Sentiment — ledelse", O.SentimentHendelseLab),
+                      ("Sentiment Momentum v3.1", O.SentimentMomentumV31)]
+         for navn, funksjon in analyser:
+@@ -1450,6 +1552,11 @@
+                         "Uten denne velges høyeste CAGR i treningsperioden")
+     p.add_argument("--feilsok", action="store_true", help="full sporing i loggen")
+     p.add_argument("--ingen-nlp-hent", action="store_true", help="use existing management article data")
++    p.add_argument("--ingen-datahent", action="store_true",
++                   help="ikke bygg tickerliste, kursfil og sentimentendringer; "
++                        "bruk filene som allerede ligger i ExcelData")
++    p.add_argument("--tving-datahent", action="store_true",
++                   help="bygg grunnlagsfilene paa nytt selv om de er ferske")
+     p.add_argument("--selection-cutoff", default="2025-06-30", help="last date used for variant selection")
+     p.add_argument("--innside-valg", help="optional fixed insider variant, e.g. daglig")
+     p.add_argument("--preflight", action="store_true", help="check inputs and packages without downloading or sending")
+@@ -1499,12 +1606,19 @@
+     errors = []
+     kjoring = []
+     if not a.ikke_kjor:
++        # Tickerliste og kurser foerst: PB-ROE og SentMom leser dem. Step4
++        # bygges inne i kjor_alle, rett etter artikkelskrapingen.
++        if not a.ingen_datahent:
++            kjoring.extend(hent_grunnlagsdata(m, logger, steg=("tickers", "prices"),
++                                              force=a.tving_datahent))
+         missing = protected_input_errors(m.excel_dir)
+         if missing:
+             errors.extend("Required upstream data missing: " + f for f in missing)
+         else:
+-            kjoring = kjor_alle(m, logger)
+-            errors.extend(r["Analyse"] + ": " + r["Feil"] for r in kjoring if r["Status"] != "OK")
++            kjoring.extend(kjor_alle(m, logger))
++        errors.extend(r["Analyse"] + ": " + r["Feil"]
++                      for r in kjoring if r["Status"] != "OK")
++        errors.extend(foreldede_grunnlagsdata(m))
+     # Old saved selection must be upgraded before it enters a capital sleeve.
+     if a.ikke_kjor and not a.bare_mail:
+         try:
+--- original/Only_260820.py
++++ 2026-09-18/Only_260820.py
+@@ -10253,14 +10253,39 @@
+         close.to_csv(config.ut_dir / "management_prices_close.csv", index_label="Date")
+         high.to_csv(config.ut_dir / "management_prices_high.csv", index_label="Date")
+         low.to_csv(config.ut_dir / "management_prices_low.csv", index_label="Date")
+-        issues = kontroller_priser(close)
++        # 2026-09-18 correction. kontroller_priser flags every 4x step between two
++        # observations and this call used to abort the entire management run on any
++        # of them. A step that is an exact power of ten (BSP.OL: 0.101440 ->
++        # 10.144007, ratio 100.000) is a provider denomination artifact, provable
++        # from the data alone. Those are rescaled BACKWARDS - the most recent
++        # prices, which live positions are marked against, are never modified -
++        # and every change is written to management_price_issues.csv. Every other
++        # flagged observation still blocks publication. Nothing is clipped,
++        # interpolated or guessed. Logic and tests: price_repair.py.
++        import sys as _sys
++        from pathlib import Path as _Path
++        _fix_dir = _Path(__file__).resolve().parent
++        if _fix_dir.is_dir() and str(_fix_dir) not in _sys.path:
++            _sys.path.insert(0, str(_fix_dir))
++        from price_repair import repair_price_frames, blocked_tickers, summary
++        close, high, low, _repair_results, _issue_rows = repair_price_frames(
++            close, high, low, logger=log)
++        issues = pd.DataFrame(_issue_rows, columns=[
++            "ticker", "date", "issue", "previous_date", "previous_price",
++            "price", "ratio", "applied_factor", "resolution"])
+         issues.to_csv(config.ut_dir / "management_price_issues.csv", index=False)
+-        if not issues.empty:
+-            examples = ", ".join(issues["ticker"].drop_duplicates().head(8))
++        log.info("Kurser   : prisrevisjon %s", summary(_repair_results.values()))
++        _blocked = blocked_tickers(_repair_results.values())
++        if _blocked:
+             raise RuntimeError(
+                 "Management prices require verification after provider repair: "
+-                + examples + ". See management_price_issues.csv. No backtest or variant "
+-                "is published from these prices; prices were not clipped or guessed.")
++                + ", ".join(_blocked[:8]) + ". See management_price_issues.csv. "
++                "Power-of-ten unit artifacts were repaired and logged; these remaining "
++                "discontinuities are not provably unit errors, so no backtest or "
++                "variant is published from them. Prices were not clipped or guessed.")
++        # The repaired series actually used, kept beside the raw download.
++        close.to_csv(config.ut_dir / "management_prices_close_repaired.csv",
++                     index_label="Date")
+ 
+         # ATR20 = gjennomsnittlig True Range. Vi bruker den til volatilitetstilpassede
+         # stoppnivåer, men selve exit-signalet er close-basert for å unngå antakelser
+--- original/portfolio_blend.py
++++ 2026-09-18/portfolio_blend.py
+@@ -2,6 +2,15 @@
+ 
+ No candidate scores or underlying stock trades are reconstructed. Monthly
+ source curves limit the portfolio to completed month-end observations.
++
++2026-09-18 correction
++---------------------
++`_monthly_observations` used to drop a month-end silently when a component's
++last observation was too far before it. On 2026-09-18 that hid the fact that
++Sentiment Momentum's prices stop at 2026-08-19 - eight business days before
++2026-08-31 - so the joint window could not pass 2026-07-31 no matter what was
++done about the management leg. Drops are now returned, reported as warnings,
++and named in the error when too few common month-ends remain.
+ """
+ from __future__ import annotations
+ 
+@@ -80,15 +89,28 @@
+ 
+ 
+ def _monthly_observations(rows, as_of, max_gap_business_days=5):
+-    # Never carry a missing month's value from a previous month. The month
+-    # must be complete as of the report date; near-end holiday gaps are bounded.
++    """Return (usable_month_ends, dropped).
++
++    Never carry a missing month's value from a previous month. The month must
++    be complete as of the report date; near-end holiday gaps are bounded.
++    `dropped` records every month-end rejected for gap, so the caller can say
++    which component capped the joint window and why.
++    """
+     months = {}
+     for day, value in rows.items():
+         end = _month_end(day)
+         if end <= as_of:
+             months[end] = (day, value)
+-    return {end: item for end, item in months.items()
+-            if _business_days_after(item[0], end) <= max_gap_business_days}
++    usable, dropped = {}, []
++    for end, item in months.items():
++        gap = _business_days_after(item[0], end)
++        if gap <= max_gap_business_days:
++            usable[end] = item
++        else:
++            dropped.append({'month_end': end, 'last_observation': item[0],
++                            'gap_business_days': gap,
++                            'limit_business_days': max_gap_business_days})
++    return usable, sorted(dropped, key=lambda d: d['month_end'])
+ 
+ 
+ def _metrics(values, dates, risk_free_pct):
+@@ -130,12 +152,37 @@
+     if not math.isfinite(float(start_capital)) or start_capital <= 0:
+         raise PortfolioDataError('Start capital must be finite and positive.')
+     as_of = _date(as_of or date.today())
+-    prepared, monthly, warnings = {}, {}, []
++    prepared, monthly, warnings, coverage = {}, {}, [], {}
+     for component in curves:
+         name = component['name']
+         prepared[name], notes = _prepare(component, as_of)
+         warnings.extend(notes)
+-        monthly[name] = _monthly_observations(prepared[name], as_of)
++        monthly[name], dropped = _monthly_observations(prepared[name], as_of)
++        last_observation = max(prepared[name])
++        coverage[name] = {
++            'last_observation': last_observation,
++            'last_usable_month_end': max(monthly[name]) if monthly[name] else None,
++            'dropped_month_ends': dropped,
++            'age_days': (as_of - last_observation).days,
++        }
++        for drop in dropped:
++            warnings.append(
++                f"{name}: {drop['month_end']} excluded - last observation "
++                f"{drop['last_observation']} is {drop['gap_business_days']} business days "
++                f"before it (limit {drop['limit_business_days']}). Refreshing the other "
++                "strategies cannot recover this month.")
++    # Name the component that caps the joint window before any date math fails.
++    covered = {n: c['last_usable_month_end'] for n, c in coverage.items()
++               if c['last_usable_month_end'] is not None}
++    uncovered = [n for n, c in coverage.items() if c['last_usable_month_end'] is None]
++    if uncovered:
++        raise PortfolioDataError(
++            'No completed month-end can be substantiated for: ' + ', '.join(sorted(uncovered))
++            + '. Every component must supply at least one month-end NAV.')
++    binding = min(covered, key=covered.get)
++    warnings.append(
++        f"The joint window ends at {covered[binding]} because {binding} has no later "
++        "usable month-end. This is the binding constraint on the shared period.")
+     dates = sorted(set.intersection(*(set(points) for points in monthly.values())))
+     selection_cutoffs = []
+     for component in curves:
+@@ -156,7 +203,11 @@
+                         'siste dato brukt til variantvalg. Avkastningen måles først etter dette startpunktet.')
+     if len(dates) < 2:
+         reason = f' after variant selection cutoff {selection_cutoff}' if selection_cutoff else ''
+-        raise PortfolioDataError(f'Fewer than two common completed month-end observations{reason}; no portfolio return can be calculated.')
++        detail = '; '.join(f"{n} reaches {covered[n]}" for n in sorted(covered, key=covered.get))
++        raise PortfolioDataError(
++            f'Fewer than two common completed month-end observations{reason}; '
++            f'no portfolio return can be calculated. Binding component: {binding} '
++            f'(last usable month-end {covered[binding]}). Coverage: {detail}.')
+     for a, b in zip(dates, dates[1:]):
+         expected = _month_end(a + timedelta(days=1))
+         if b != expected:
+@@ -211,6 +262,16 @@
+     return {'equity': equity, 'holdings': holdings, 'trades': trades,
+             'metrics': metrics, 'components': components, 'warnings': warnings,
+             'sources': [c.get('source') for c in curves],
++            'coverage': {n: {'last_observation': str(c['last_observation']),
++                             'last_usable_month_end': str(c['last_usable_month_end']),
++                             'age_days': c['age_days'],
++                             'dropped_month_ends': [
++                                 {'month_end': str(d['month_end']),
++                                  'last_observation': str(d['last_observation']),
++                                  'gap_business_days': d['gap_business_days']}
++                                 for d in c['dropped_month_ends']]}
++                         for n, c in coverage.items()},
++            'binding_component': binding,
+             'common_period': {'start': str(dates[0]), 'end': str(last),
+                               'frequency': 'monthly', 'observations': len(dates), 'return_periods': len(dates) - 1,
+                               'selection_cutoff': str(selection_cutoff) if selection_cutoff else None}}
