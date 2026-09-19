@@ -129,47 +129,59 @@ minutter:
 ## Slik tar du det i bruk
 
 ```text
-python 2026-09-18/apply_patch.py          # patcher de tre filene i roten
-python 2026-09-18/preflight_data.py       # hva blokkerer akkurat nå?
+2026-09-18\RUN.cmd                     full kjøring, sender mail
+2026-09-18\RUN.cmd --mail-kladd        bygg mailen, ikke send
+2026-09-18\RUN.cmd --tving-datahent    bygg alle tre grunnlagsfilene på nytt
+2026-09-18\RUN.cmd --preflight         hva blokkerer akkurat nå?
+2026-09-18\RUN.cmd --vis-patcher       list patchene, kjør ingenting
 ```
 
-`apply_patch.py` er nøyaktig, idempotent og reversibel: den nekter å kjøre hvis
-originalblokken ikke finnes ordrett, verifiserer at filen fortsatt parser og at
-de beskyttede hashene er uendret før den lagrer, og legger originalen i
-`2026-09-18/backup/`. `--revert` gir byte-identisk fil tilbake. `--check`
-rapporterer status uten å endre noe.
+Uten Windows: `python 2026-09-18/run.py` med de samme flaggene.
 
-Deretter er `RUN_ALL.cmd` nok: masteren bygger nå grunnlagsfilene selv før den
-kjører analysene. Første kjøring tar lengre tid, fordi kursene faktisk hentes.
+`RUN.cmd` bruker samme `.venv` som `SETUP.cmd` lagde, og alle flagg `master.py`
+tar virker. Masteren bygger nå grunnlagsfilene selv før analysene, så første
+kjøring tar lengre tid — kursene hentes faktisk. Kjører du enkeltstrategier,
+husk at Step4 bygges av artikkelscorene: skrapingen må ha kjørt først.
 
-Vil du gjøre det stegvis:
-
-1. `RUN_ALL.cmd --tving-datahent` — bygger alle tre grunnlagsfilene på nytt.
-2. `python 2026-09-18/preflight_data.py` — skal si OK.
-
-Kjører du bare enkeltstrategier, husk at Step4 bygges av artikkelscorene:
-`run_strategy.py --strategy management` må ha kjørt skrapingen først.
+`RUN_ALL.cmd` finnes fortsatt og gjør nøyaktig det den alltid har gjort —
+uten rettelsene.
 
 ---
 
-## Hvor koden ligger
+## Ingenting i repoet er endret
 
-Ny kode ligger i denne mappen. Endringer i filer som allerede fantes gjøres
-**på plass i roten**, gjennom `apply_patch.py`:
+Alt ligger i denne mappen. Ingen fil som fantes fra før er rørt:
 
-| Fil | Hvor | Hvorfor |
+```text
+git diff 7c21574 -- . ":!2026-09-18"      # tom
+```
+
+Tre av rettelsene gjelder likevel filer som allerede fantes:
+
+| Fil | Blokker | Hva |
 |---|---|---|
-| `price_repair.py`, `freshness.py`, `data_acquisition.py`, `preflight_data.py` | `2026-09-18/` | ny kode, ingen konflikt |
-| `master.py` | roten, patchet | det er inngangspunktet `RUN_ALL.cmd` kaller |
-| `Only_260820.py` | roten, patchet | prisvakten ligger inne i `SentimentHendelseLab` |
-| `portfolio_blend.py` | roten, patchet | se under |
+| `master.py` | 4 | bygger grunnlagsfilene i stedet for bare å kontrollere dem |
+| `Only_260820.py` | 1 | prisvakten retter enhetsavvik, blokkerer resten |
+| `portfolio_blend.py` | 7 | navngir strategien som binder felles periode |
 
-`portfolio_blend.py` lå først som en **kopi** i denne mappen. Det var feil: to
-filer med samme modulnavn betyr at hvilken versjon du får avhenger av
-importrekkefølgen — og `_fikspakke()` legger denne mappen først i `sys.path`
-først når datahentingen kjører. Med `--ingen-datahent` fikk du rotversjonen,
-uten den fikk du kopien. Samme kommando, to kodeveier. Kopien er slettet, og
-endringene er patchet inn i rotfila som alt annet.
+De endres **ikke på disk**. `patched_import.py` installerer en importkrok: når
+en av dem importeres, leses kildekoden fra roten, patchene i `patches.json`
+påføres **teksten i minnet**, og resultatet kompileres og kjøres som modulen.
+
+Kjør `run.py` og du får rettet oppførsel. Kjør `master.py` direkte og du får
+nøyaktig det som lå der før. Filene åpnes aldri for skriving.
+
+To ting dette gir som en kopi av filene ikke gir:
+
+- **ingen duplisering** — `Only_260820.py` er 628 KB for å endre 30 linjer;
+- **ingen drift** — patchen påføres det rotfila *faktisk sier nå*. Endrer du
+  den senere, tas endringen med, eller så feiler patchen høylytt fordi blokken
+  ikke lenger stemmer. En kopi ville tiet om begge deler.
+
+Det skrives ingen `.pyc` for en patchet modul — en bytekodefil nøklet til den
+originale kilden ville ellers blitt servert til et senere, upatchet import.
+`linecache` fylles med den patchede kilden, så tracebacks og
+`inspect.getsource()` viser koden som faktisk kjører.
 
 ---
 
@@ -177,7 +189,7 @@ endringene er patchet inn i rotfila som alt annet.
 
 **Verifisert her, kjørbart uten pandas eller nett:**
 
-- 58 tester i `tests/` passerer.
+- 67 tester i `tests/` passerer.
 - Repoets egne `test_portfolio_blend` (15), `test_insider_selection` (16),
   `test_capital_mail` (3) og `test_master` (24) passerer uendret — også mot den
   patchede `portfolio_blend.py` i roten.
@@ -186,10 +198,13 @@ endringene er patchet inn i rotfila som alt annet.
 - `Only_260820.py` parser, og diffen er 30 linjer inn / 5 ut. CRLF er bevart —
   filen har blandede linjeskift, og patcheren matcher konvensjonen lokalt der
   blokken står.
-- `apply_patch.py --revert` gir byte-identiske filer (tom `git diff`).
-- `master.py` parser, CRLF bevart, og de nye funksjonene er røykttestet med
-  `build_all` mocket: henting som feiler gir ikke fatal kjøring, mens Step4 som
-  feiler stopper analysen.
+- Rotfilene er byte-identiske med originalen: SHA-256 før og etter at de
+  patchede modulene er importert, og `git diff` mot `7c21574`.
+- Ingen `.pyc` skrives for en patchet modul.
+- Alle 12 patchblokker treffer de urørte rotfilene, og
+  `patch(patch(x)) == patch(x)`.
+- De nye masterfunksjonene er røyktestet med `build_all` mocket: henting som
+  feiler gir ikke fatal kjøring, mens Step4 som feiler stopper analysen.
 
 **Ikke verifisert — og det kan ikke verifiseres i dette miljøet:**
 
@@ -230,9 +245,10 @@ opplastede repoet.
 | `patches.json` | Selve redigeringene, én post per blokk — lesbare uten å lese patcheren. |
 | `price_repair.py` | Klassifiserer og retter tierpotens-artefakter. Ren Python. |
 | `freshness.py` | Ferskhetsport og månedsslutt-dekning. Ren Python. |
-| `apply_patch.py` | Patcher `Only_260820.py`, `master.py` og `portfolio_blend.py` (12 blokker). Verifisert, idempotent, reversibel. |
+| `run.py`, `RUN.cmd` | Inngangspunkt. Gjør det `RUN_ALL.cmd` gjør, med rettelsene. |
+| `patched_import.py` | Importkrok. Påfører de 12 blokkene i minnet, skriver aldri til disk. |
 | `preflight_data.py` | Sjekker alle fire strategier og oppstrømsfiler før en lang kjøring. |
-| `tests/` | 58 tester, kjører uten pandas og uten nett. |
+| `tests/` | 67 tester, kjører uten pandas og uten nett. |
 
 ```text
 python -m unittest discover -s 2026-09-18/tests -t 2026-09-18/tests

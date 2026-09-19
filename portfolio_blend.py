@@ -2,15 +2,6 @@
 
 No candidate scores or underlying stock trades are reconstructed. Monthly
 source curves limit the portfolio to completed month-end observations.
-
-2026-09-18 correction
----------------------
-`_monthly_observations` used to drop a month-end silently when a component's
-last observation was too far before it. On 2026-09-18 that hid the fact that
-Sentiment Momentum's prices stop at 2026-08-19 - eight business days before
-2026-08-31 - so the joint window could not pass 2026-07-31 no matter what was
-done about the management leg. Drops are now returned, reported as warnings,
-and named in the error when too few common month-ends remain.
 """
 from __future__ import annotations
 
@@ -89,28 +80,15 @@ def _prepare(component, as_of):
 
 
 def _monthly_observations(rows, as_of, max_gap_business_days=5):
-    """Return (usable_month_ends, dropped).
-
-    Never carry a missing month's value from a previous month. The month must
-    be complete as of the report date; near-end holiday gaps are bounded.
-    `dropped` records every month-end rejected for gap, so the caller can say
-    which component capped the joint window and why.
-    """
+    # Never carry a missing month's value from a previous month. The month
+    # must be complete as of the report date; near-end holiday gaps are bounded.
     months = {}
     for day, value in rows.items():
         end = _month_end(day)
         if end <= as_of:
             months[end] = (day, value)
-    usable, dropped = {}, []
-    for end, item in months.items():
-        gap = _business_days_after(item[0], end)
-        if gap <= max_gap_business_days:
-            usable[end] = item
-        else:
-            dropped.append({'month_end': end, 'last_observation': item[0],
-                            'gap_business_days': gap,
-                            'limit_business_days': max_gap_business_days})
-    return usable, sorted(dropped, key=lambda d: d['month_end'])
+    return {end: item for end, item in months.items()
+            if _business_days_after(item[0], end) <= max_gap_business_days}
 
 
 def _metrics(values, dates, risk_free_pct):
@@ -152,37 +130,12 @@ def build_capital_portfolio(curves, *, rebalance='monthly', as_of=None,
     if not math.isfinite(float(start_capital)) or start_capital <= 0:
         raise PortfolioDataError('Start capital must be finite and positive.')
     as_of = _date(as_of or date.today())
-    prepared, monthly, warnings, coverage = {}, {}, [], {}
+    prepared, monthly, warnings = {}, {}, []
     for component in curves:
         name = component['name']
         prepared[name], notes = _prepare(component, as_of)
         warnings.extend(notes)
-        monthly[name], dropped = _monthly_observations(prepared[name], as_of)
-        last_observation = max(prepared[name])
-        coverage[name] = {
-            'last_observation': last_observation,
-            'last_usable_month_end': max(monthly[name]) if monthly[name] else None,
-            'dropped_month_ends': dropped,
-            'age_days': (as_of - last_observation).days,
-        }
-        for drop in dropped:
-            warnings.append(
-                f"{name}: {drop['month_end']} excluded - last observation "
-                f"{drop['last_observation']} is {drop['gap_business_days']} business days "
-                f"before it (limit {drop['limit_business_days']}). Refreshing the other "
-                "strategies cannot recover this month.")
-    # Name the component that caps the joint window before any date math fails.
-    covered = {n: c['last_usable_month_end'] for n, c in coverage.items()
-               if c['last_usable_month_end'] is not None}
-    uncovered = [n for n, c in coverage.items() if c['last_usable_month_end'] is None]
-    if uncovered:
-        raise PortfolioDataError(
-            'No completed month-end can be substantiated for: ' + ', '.join(sorted(uncovered))
-            + '. Every component must supply at least one month-end NAV.')
-    binding = min(covered, key=covered.get)
-    warnings.append(
-        f"The joint window ends at {covered[binding]} because {binding} has no later "
-        "usable month-end. This is the binding constraint on the shared period.")
+        monthly[name] = _monthly_observations(prepared[name], as_of)
     dates = sorted(set.intersection(*(set(points) for points in monthly.values())))
     selection_cutoffs = []
     for component in curves:
@@ -203,11 +156,7 @@ def build_capital_portfolio(curves, *, rebalance='monthly', as_of=None,
                         'siste dato brukt til variantvalg. Avkastningen måles først etter dette startpunktet.')
     if len(dates) < 2:
         reason = f' after variant selection cutoff {selection_cutoff}' if selection_cutoff else ''
-        detail = '; '.join(f"{n} reaches {covered[n]}" for n in sorted(covered, key=covered.get))
-        raise PortfolioDataError(
-            f'Fewer than two common completed month-end observations{reason}; '
-            f'no portfolio return can be calculated. Binding component: {binding} '
-            f'(last usable month-end {covered[binding]}). Coverage: {detail}.')
+        raise PortfolioDataError(f'Fewer than two common completed month-end observations{reason}; no portfolio return can be calculated.')
     for a, b in zip(dates, dates[1:]):
         expected = _month_end(a + timedelta(days=1))
         if b != expected:
@@ -262,16 +211,6 @@ def build_capital_portfolio(curves, *, rebalance='monthly', as_of=None,
     return {'equity': equity, 'holdings': holdings, 'trades': trades,
             'metrics': metrics, 'components': components, 'warnings': warnings,
             'sources': [c.get('source') for c in curves],
-            'coverage': {n: {'last_observation': str(c['last_observation']),
-                             'last_usable_month_end': str(c['last_usable_month_end']),
-                             'age_days': c['age_days'],
-                             'dropped_month_ends': [
-                                 {'month_end': str(d['month_end']),
-                                  'last_observation': str(d['last_observation']),
-                                  'gap_business_days': d['gap_business_days']}
-                                 for d in c['dropped_month_ends']]}
-                         for n, c in coverage.items()},
-            'binding_component': binding,
             'common_period': {'start': str(dates[0]), 'end': str(last),
                               'frequency': 'monthly', 'observations': len(dates), 'return_periods': len(dates) - 1,
                               'selection_cutoff': str(selection_cutoff) if selection_cutoff else None}}

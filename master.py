@@ -185,104 +185,6 @@ def filalder(sti: Optional[Path]) -> str:
 # andre med seg — da hadde en manglende Excel-fil i PB-ROE stoppet mailen om
 # innsidehandel også, og det er ingen tjent med.
 
-def _fikspakke() -> bool:
-    """Put the dated fix package on sys.path without importing it eagerly."""
-    folder = SKRIPTMAPPE / "2026-09-18"
-    if folder.is_dir() and str(folder) not in sys.path:
-        sys.path.insert(0, str(folder))
-    return folder.is_dir()
-
-
-def hent_grunnlagsdata(m: Master, logger, *, steg, force: bool = False) -> List[Rad]:
-    """Bygg grunnlagsfilene masteren tidligere bare KONTROLLERTE at fantes.
-
-    AllTickers_OSEBX_TW_*.xlsx, Stock_Prices_*.xlsx og
-    Step4_Sentiment_Changes_*.xlsx kom fra et annet program. Ingen hadde kjort
-    det siden 2026-08-19, og det er hele grunnen til at Sentiment Momentum
-    backtestet maned gamle kurser og likevel ble rapportert som OK.
-
-    Alt som trengs for a bygge dem lastes allerede ned av denne pakken:
-    aksjelista og kursene av innsidepipelinen, artikkelscorene av FinBERT-
-    skrapingen. Masteren bygger dem derfor selv. De hash-beskyttede
-    strategiene rores ikke - dette skriver filene de leser, i det formatet de
-    allerede forventer.
-    """
-    start = time.time()
-    if not _fikspakke():
-        return [{"Analyse": "Datahenting", "Status": "FEIL", "Minutter": 0.0,
-                 "Feil": "Fant ikke mappen 2026-09-18 ved siden av master.py"}]
-    try:
-        from data_acquisition import build_all
-        rader = build_all(m.excel_dir, m.oppsett(), logger, steps=steg, force=force)
-    except KeyboardInterrupt:
-        raise
-    except Exception as e:
-        logger.exception("Datahenting feilet")
-        return [{"Analyse": "Datahenting", "Status": "OK", "Handling": "FEIL",
-                 "Minutter": round((time.time() - start) / 60.0, 1),
-                 "Feil": "feil - " + IP.feiltekst(e)[:180]}]
-    minutter = round((time.time() - start) / 60.0, 1)
-    ut: List[Rad] = []
-    for rad in rader:
-        logger.info("   %-9s %-22s %s", rad["Handling"], rad["Kilde"], rad["Merknad"])
-        # Status er alltid OK: henting som feiler skal ikke velte en kjoring
-        # der filene allerede ligger der og er ferske. Handling baerer utfallet,
-        # og bygg_sentimentendringer leser den.
-        ut.append({"Analyse": "Data: " + str(rad["Kilde"]), "Status": "OK",
-                   "Handling": rad["Handling"], "Minutter": minutter,
-                   "Feil": f'{rad["Handling"].lower()} - {rad["Merknad"]}'})
-        minutter = 0.0
-    return ut
-
-
-# Hvor gamle grunnlagsfilene faar vaere for de ikke lenger dokumenterer noe
-# ferskt. Tickerlista endrer seg langsomt; kursene gjor ikke det.
-DATA_MAKSALDER = {"Data_BT/AllTickers_OSEBX_TW_*.xlsx": 90,
-                  "Data_BT1/FinancialData/Stock_Prices_*.xlsx": 7,
-                  "DataNLP/Step4_Sentiment_Changes_*.xlsx": 14}
-
-
-def foreldede_grunnlagsdata(m: Master) -> List[str]:
-    """Filer som FINNES, men er for gamle til aa baere et ferskt resultat.
-
-    Dette er porten som manglet 2026-09-18: kursfila laa der, SentMom leste
-    den uten aa feile, og ingen sa at den stoppet 2026-08-19. En fil som
-    mangler fanges av protected_input_errors; denne fanger den som er gammel.
-    Henting som feilet er ikke i seg selv en feil - resultatet av den er det.
-    """
-    if not _fikspakke():
-        return []
-    from data_acquisition import latest, needs_refresh
-    from datetime import date as _date
-    feil = []
-    for monster, maksalder in DATA_MAKSALDER.items():
-        mappe, mal = monster.rsplit("/", 1)
-        funnet = latest(m.excel_dir / mappe, mal)
-        if funnet is None:
-            continue                      # manglende fil: protected_input_errors
-        gammel, hvorfor = needs_refresh(funnet, _date.today(), maksalder)
-        if gammel:
-            feil.append(f"Grunnlagsdata for gamle: {funnet.name} er {hvorfor}. "
-                        f"Resultatene bygget paa denne fila er ikke ferske. "
-                        f"Kjor uten --ingen-datahent, eller med --tving-datahent.")
-    return feil
-
-
-def bygg_sentimentendringer(m: Master, logger) -> int:
-    """Step4-endringene, bygget av FinBERT-scorene skrapingen nettopp skrev.
-
-    Ma kjore ETTER skrapingen og FOR SentimentMomentumV31, som leser fila.
-    """
-    rader = hent_grunnlagsdata(m, logger, steg=("step4",))
-    feil = [r["Feil"] for r in rader if r.get("Handling") == "FEIL"]
-    if feil:
-        # Her ER det fatalt: uten en fersk Step4-fil leser SentimentMomentumV31
-        # den forrige, og da er vi tilbake i 2026-09-18.
-        raise RuntimeError("; ".join(feil))
-    return 0
-
-
-
 def kjor_alle(m: Master, logger) -> List[Rad]:
     """Kjører de fire analysene. Én rad per analyse med status og tid."""
     ut: List[Rad] = []
@@ -325,10 +227,6 @@ def kjor_alle(m: Master, logger) -> List[Rad]:
         analyser = [("PB-ROE-Momentum", O.PBROE_All3)]
         if O._miljo_paa("AKSJE_NLP_HENT"):
             analyser.append(("NLP-artikler — skraping", O.SentimentManagement))
-        # Step4 bygges av scorene skrapingen nettopp skrev, og maa ligge der
-        # foer SentimentMomentumV31 leser den. Derfor akkurat her.
-        analyser.append(("Sentimentendringer — Step4",
-                         lambda: bygg_sentimentendringer(m, logger)))
         analyser += [("NLP Sentiment — ledelse", O.SentimentHendelseLab),
                      ("Sentiment Momentum v3.1", O.SentimentMomentumV31)]
         for navn, funksjon in analyser:
@@ -1552,11 +1450,6 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
                         "Uten denne velges høyeste CAGR i treningsperioden")
     p.add_argument("--feilsok", action="store_true", help="full sporing i loggen")
     p.add_argument("--ingen-nlp-hent", action="store_true", help="use existing management article data")
-    p.add_argument("--ingen-datahent", action="store_true",
-                   help="ikke bygg tickerliste, kursfil og sentimentendringer; "
-                        "bruk filene som allerede ligger i ExcelData")
-    p.add_argument("--tving-datahent", action="store_true",
-                   help="bygg grunnlagsfilene paa nytt selv om de er ferske")
     p.add_argument("--selection-cutoff", default="2025-06-30", help="last date used for variant selection")
     p.add_argument("--innside-valg", help="optional fixed insider variant, e.g. daglig")
     p.add_argument("--preflight", action="store_true", help="check inputs and packages without downloading or sending")
@@ -1606,19 +1499,12 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     errors = []
     kjoring = []
     if not a.ikke_kjor:
-        # Tickerliste og kurser foerst: PB-ROE og SentMom leser dem. Step4
-        # bygges inne i kjor_alle, rett etter artikkelskrapingen.
-        if not a.ingen_datahent:
-            kjoring.extend(hent_grunnlagsdata(m, logger, steg=("tickers", "prices"),
-                                              force=a.tving_datahent))
         missing = protected_input_errors(m.excel_dir)
         if missing:
             errors.extend("Required upstream data missing: " + f for f in missing)
         else:
-            kjoring.extend(kjor_alle(m, logger))
-        errors.extend(r["Analyse"] + ": " + r["Feil"]
-                      for r in kjoring if r["Status"] != "OK")
-        errors.extend(foreldede_grunnlagsdata(m))
+            kjoring = kjor_alle(m, logger)
+            errors.extend(r["Analyse"] + ": " + r["Feil"] for r in kjoring if r["Status"] != "OK")
     # Old saved selection must be upgraded before it enters a capital sleeve.
     if a.ikke_kjor and not a.bare_mail:
         try:
