@@ -2,6 +2,41 @@
 
 Denne mappen gjør fire ting du ba om, og retter to feil den fant på veien.
 
+**Dette er den eneste mappen du trenger.** Den erstatter `2026-09-18`, som er
+fjernet fra denne grenen — alt derfra som fortsatt gjelder ligger her, rettet.
+
+---
+
+## Slik bruker du den — kortversjonen
+
+```text
+1.  SETUP.cmd                          én gang: pakker og Chromium
+2.  CHECK_SETUP.cmd                    én gang: sjekk at oppsettet er på plass
+3.  2026-09-20\RUN.cmd --preflight     hva blokkerer akkurat nå? (sekunder)
+4.  2026-09-20\RUN.cmd --mail-kladd    full kjøring, men send ingen mail
+5.  2026-09-20\RUN.cmd                 full kjøring, sender mailen
+```
+
+Punkt 3 svarer på sekunder om dataene er på plass, så du slipper å oppdage det
+etter halvannen time. Punkt 4 er verdt å ta første gang: mailen bygges og
+lagres i `data\7_master\master_mail_*.html`, men sendes ikke.
+
+Vil du bare se hvordan mailen ser ut, uten å kjøre noe:
+
+```text
+python 2026-09-20\demo_mail.py
+```
+
+Den lager `demo_mail.html` av oppdiktede tall, merket som demonstrasjon.
+
+`RUN_ALL.cmd` i rotmappen finnes fortsatt og gjør nøyaktig det den alltid har
+gjort — **uten** rettelsene i denne mappen. Bruk `2026-09-20\RUN.cmd`.
+
+Sluttkoder: `0` fullført, `2` ufullstendig (se datastatus øverst i mailen),
+`3` mailen kunne ikke sendes (HTML-kopien ligger igjen lokalt).
+
+---
+
 1. **Masteren henter ned alt datagrunnlaget selv** — og skriver det med navnet
    strategiene faktisk leser.
 2. **Mailen begynner med datastatus per strategi.** Kom dataene ned? Hvor
@@ -249,10 +284,16 @@ nøyaktig det den alltid har gjort, uten rettelsene.
 
 ## Ingenting i repoet er endret
 
-Alt ligger i denne mappen. Ingen fil som fantes fra før er rørt:
+Alt ligger i denne mappen. Ingen kildefil som fantes fra før er endret.
+
+Den eneste endringen utenfor mappen er at `2026-09-18` er **fjernet** fra denne
+grenen. Den er erstattet, ikke bare supplert: alt derfra som fortsatt gjelder
+ligger her — `price_repair.py`, `freshness.py`, importkroken og alle
+patchblokkene — og to av rettelsene derfra var feil (se avsnitt 0). Den gamle
+mappen ligger fortsatt i historikken og på `main`.
 
 ```text
-git diff c4fb146 -- . ":!2026-09-20"      # tom
+git diff c4fb146 -- . ":!2026-09-20" ":!2026-09-18"     # tom
 ```
 
 Fem av rettelsene gjelder likevel filer som allerede fantes:
