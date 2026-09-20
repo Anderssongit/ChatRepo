@@ -304,6 +304,35 @@ det i klartekst i stedet for å kaste en stakksporing.
 
 ---
 
+## 4b. Delvis nedlasting kaster ikke lenger hele innsidestrategien
+
+Kjøringen 2026-09-20 hentet **3879 artikler** på 2,2 timer. 197 av 294
+selskaper manglet minst én artikkeltekst, så steg 1 meldte `DELVIS` — og
+driveren stanset steg 2 til 6. Hele innsidestrategien ble kastet, etter at
+dataene var hentet.
+
+`try/except` per selskap fantes allerede og virket: et selskap som feilet ble
+merket for ny henting, og løkka gikk videre til neste. Det var **porten over**
+den som gjorde den meningsløs:
+
+| | Før | Nå |
+|---|---|---|
+| Steg 1 er `OK` når | **null** av 294 selskaper feilet | uendret |
+| Steg 1 er `DELVIS` når | minst ett feilet | minst ett feilet, men noe ligger på disk |
+| Steg 1 er `FEIL` når | aldri | **ingenting** ligger på disk |
+| Steg 2-6 stanser på | alt som ikke er `OK` | bare `FEIL` og `AVBRUTT` |
+
+Et nettskrap av 294 selskaper er aldri feilfritt. «OK bare hvis null feilet»
+betydde i praksis at innsidestrategien aldri kunne fullføre.
+
+Loggmeldingen var i tillegg villedende: den skyldte på `--stopp-ved-feil`, men
+det var den andre betingelsen som utløste stoppen. Den sier nå hvilket steg og
+hvilken status som faktisk stanset kjøringen — og når den fortsetter på delvise
+data, står det en advarsel i loggen og en merknad i mailen.
+
+Strategien blir fortsatt **med** i fellestallene ved delvis nedlasting; den er
+bare merket. Utelatelse er forbeholdt data som ikke er ferske i det hele tatt.
+
 ## 5. To eldre feil som følger med
 
 **Ledelsessentimentets prisvakt** (fra 2026-09-18, uendret her).
@@ -361,14 +390,15 @@ mappen ligger fortsatt i historikken og på `main`.
 git diff c4fb146 -- . ":!2026-09-20" ":!2026-09-18"     # tom
 ```
 
-Fem av rettelsene gjelder likevel filer som allerede fantes:
+Seks av rettelsene gjelder likevel filer som allerede fantes:
 
 | Fil | Blokker | Hva |
 |---|---|---|
-| `master.py` | 12 | henter grunnlagsdata, bygger datastatus, lar én strategi feile alene |
+| `master.py` | 13 | henter grunnlagsdata, bygger datastatus, lar én strategi feile alene |
 | `portfolio_blend.py` | 13 | lik vekt til N strategier, ikke alltid fire |
 | `capital_mail.py` | 7 | datastatus øverst; all tekst teller strategiene |
 | `insider_selection.py` | 6 | valg uten kostnader, uendret horisont |
+| `innsidehandel_pipeline.py` | 3 | delvis nedlasting stanser ikke steg 2-6 |
 | `Only_260820.py` | 1 | prisvakten retter enhetsavvik, blokkerer resten |
 
 De endres **ikke på disk**. `patched_import.py` installerer en importkrok: når
@@ -416,8 +446,8 @@ python 2026-09-20/build_patches.py --frys     frys ankerlinjene på nytt
 
 ### Verifisert her, uten pandas og uten nett
 
-* **174 tester i `tests/` passerer.**
-* Alle 39 patchblokker treffer de urørte rotfilene; ankerlinjene stemmer;
+* **193 tester i `tests/` passerer.**
+* Alle 43 patchblokker treffer de urørte rotfilene; ankerlinjene stemmer;
   `patch(patch(x)) == patch(x)`; hver patchet fil parser.
 * `patches.json` er nøyaktig det `build_patches.py` lager av dagens rotfiler.
 * **`PBROE_All3` og `SentimentMomentumV31` har identiske abstrakte syntakstrær
@@ -493,7 +523,7 @@ faktisk kom ned.
 | `patched_import.py` | Importkrok. Påfører blokkene i minnet, skriver aldri til disk. |
 | `run.py`, `RUN.cmd` | Inngangspunkt. |
 | `SJEKK.cmd` | Dobbeltklikk: ligger mappen riktig, og virker rettelsene? |
-| `tests/` | 174 tester, kjører uten pandas og uten nett. |
+| `tests/` | 193 tester, kjører uten pandas og uten nett. |
 
 ```text
 python -m unittest discover -s 2026-09-20/tests -t 2026-09-20/tests

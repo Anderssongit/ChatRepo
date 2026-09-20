@@ -190,6 +190,13 @@ edit("master.py", "master.py :: Step4 mellom skraping og SentMom",
         analyser += [("NLP Sentiment — ledelse", O.SentimentHendelseLab),
                      ("Sentiment Momentum v3.1", O.SentimentMomentumV31)]'''.lstrip("\n"))
 
+edit("master.py", "master.py :: si tydelig at innsidedata er delvis",
+     "Delvis: minst ett steg i innsidepipelinen", 199, 200, """
+            status, feil = "OK", (
+                "Delvis: minst ett steg i innsidepipelinen ga ufullstendige "
+                "data. Resultatet bygger på det som faktisk ble hentet — se "
+                "steglisten i loggen." if code == 2 else "")""".lstrip("\n"))
+
 edit("master.py", "master.py :: finn mail_strategier i flat mappe",
      "mail_strategier ligger flatt i roten", 859, 859, '''
     # mail_strategier.py ligger flatt i roten i dette repoet, ikke i en mail/-
@@ -743,6 +750,63 @@ edit("insider_selection.py", "insider_selection.py :: politikk uten kostnadsrege
 edit("insider_selection.py", "insider_selection.py :: forbehold uten kostnadsstress",
      "LIMITATIONS)", 284, 289, '''
         "limitations": list(_zero_cost().LIMITATIONS),'''.lstrip("\n"))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# innsidehandel_pipeline.py  —  delvis er ikke mislykket
+# ══════════════════════════════════════════════════════════════════════════
+
+edit("innsidehandel_pipeline.py", "innsidehandel_pipeline.py :: delvis stanser ikke kjoringen",
+     "def steg_er_fatalt", 8871, 8871, '''
+# ── 2026-09-20: delvis er ikke mislykket ──────────────────────────────────
+#
+# Steg 1 hentet 3879 artikler og meldte DELVIS fordi 197 av 294 selskaper
+# manglet minst én artikkeltekst. Driveren stanset da steg 2-6, og hele
+# innsidestrategien ble kastet. Try/except per selskap finnes allerede og
+# virker — det var porten over den som gjorde den meningsløs.
+FATALE_STEGSTATUSER = ("FEIL", "AVBRUTT")
+
+
+def steg_er_fatalt(status) -> bool:
+    """Skal et steg med denne statusen stanse hele kjøringen?
+
+    Nei for DELVIS og HOPPET. Delvis betyr at noe faktisk ble hentet, og de
+    neste stegene kan arbeide på det. Ja for FEIL og AVBRUTT: da finnes det
+    ikke noe å arbeide videre på.
+    """
+    return str(status) in FATALE_STEGSTATUSER
+
+
+def steg1_status(feilede: int, artikler: int) -> str:
+    """Status for nedlastingssteget.
+
+    Et nettskrap av 294 selskaper er aldri feilfritt, så «OK bare hvis null
+    feilet» gjorde innsidestrategien umulig å fullføre. Delvis meldes fortsatt
+    som delvis — men det er bare FEIL når ingenting i det hele tatt ligger på
+    disk etterpå.
+    """
+    if feilede == 0:
+        return "OK"
+    return "DELVIS" if artikler else "FEIL"
+
+
+def main(argv: Optional[List[str]] = None) -> int:'''.lstrip("\n"))
+
+edit("innsidehandel_pipeline.py", "innsidehandel_pipeline.py :: steg 1 er FEIL bare uten artikler",
+     "steg1_status(feil, len(lagret))", 3850, 3850, '''
+    status = steg1_status(feil, len(lagret))'''.lstrip("\n"))
+
+edit("innsidehandel_pipeline.py", "innsidehandel_pipeline.py :: stans bare paa FEIL og AVBRUTT",
+     "steg_er_fatalt(_status)", 8926, 8928, '''
+        _status = resultater[plass[n]].status
+        _fatalt = steg_er_fatalt(_status)
+        if not _fatalt and _status != "OK" and n in (1, 4, 5):
+            logger.warning(
+                f"   ⚠️  Steg {n} er {_status}. Kjøringen fortsetter på det som "
+                "faktisk ble hentet — resultatet bygger på ufullstendige data.")
+        if ((args.stopp_ved_feil and _fatalt)
+                or (n in (1, 4, 5) and _fatalt)):
+            logger.error(f"\\n⏹️  Stanser etter steg {n}: status {_status}.")'''.lstrip("\n"))
 
 
 # ══════════════════════════════════════════════════════════════════════════

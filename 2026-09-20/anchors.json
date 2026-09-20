@@ -1,6 +1,7 @@
 {
   "master.py :: hente- og statushjelpere": "def kjor_alle(m: Master, logger) -> List[Rad]:",
   "master.py :: Step4 mellom skraping og SentMom": "analyser = [(\"PB-ROE-Momentum\", O.PBROE_All3)]",
+  "master.py :: si tydelig at innsidedata er delvis": "status, feil = \"OK\", (\"Parsing partly classified; see insider stage status\"",
   "master.py :: finn mail_strategier i flat mappe": "mappe = SKRIPTMAPPE / \"mail\"",
   "master.py :: validate_sources per strategi": "def validate_sources(m, since_ns=None):",
   "master.py :: datastatus også i feilrapporten": "def failure_report(errors):",
@@ -37,5 +38,8 @@
   "insider_selection.py :: treningshalvdeler uten kostnad": "\"Train_Turnover_Per_Year_Pst\": 100 * turnover / mean_capital / years",
   "insider_selection.py :: politikk uten kostnadsregel": "\"policy\": {",
   "insider_selection.py :: forbehold uten kostnadsstress": "\"limitations\": [",
+  "innsidehandel_pipeline.py :: delvis stanser ikke kjoringen": "def main(argv: Optional[List[str]] = None) -> int:",
+  "innsidehandel_pipeline.py :: steg 1 er FEIL bare uten artikler": "status = \"OK\" if feil == 0 else \"DELVIS\"",
+  "innsidehandel_pipeline.py :: stans bare paa FEIL og AVBRUTT": "if ((args.stopp_ved_feil and resultater[plass[n]].status == \"FEIL\")",
   "Only_260820.py :: prisvakten retter enhetsavvik": "issues = kontroller_priser(close)"
 }

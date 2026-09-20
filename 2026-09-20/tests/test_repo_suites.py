@@ -38,7 +38,7 @@ FORVENTET_ERSTATTET = {
 }
 
 PATCHEDE = ("master", "capital_mail", "portfolio_blend", "insider_selection",
-            "Only_260820")
+            "innsidehandel_pipeline", "Only_260820")
 
 
 def _kjor(navn):

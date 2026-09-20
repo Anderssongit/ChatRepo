@@ -23,6 +23,17 @@
   },
   {
     "file": "master.py",
+    "name": "master.py :: si tydelig at innsidedata er delvis",
+    "marker": "Delvis: minst ett steg i innsidepipelinen",
+    "lines": [
+      199,
+      200
+    ],
+    "original_text": "            status, feil = \"OK\", (\"Parsing partly classified; see insider stage status\"\r\n                                   if code == 2 else \"\")\r",
+    "replacement_text": "            status, feil = \"OK\", (\r\n                \"Delvis: minst ett steg i innsidepipelinen ga ufullstendige \"\r\n                \"data. Resultatet bygger på det som faktisk ble hentet — se \"\r\n                \"steglisten i loggen.\" if code == 2 else \"\")\r"
+  },
+  {
+    "file": "master.py",
     "name": "master.py :: finn mail_strategier i flat mappe",
     "marker": "mail_strategier ligger flatt i roten",
     "lines": [
@@ -416,6 +427,39 @@
     ],
     "original_text": "        \"limitations\": [\r\n            \"En forhåndsdefinert robusthetsheuristikk er ikke bevis for MOAT eller fremtidig meravkastning.\",\r\n            \"Senere testdata er holdt utenfor dette valget, men eksisterende varianter var tidligere utviklet på deler av samme historikk; testen er ikke uberørt forskning.\",\r\n            \"Kostnadsstress modellerer prosentkostnader, ikke ordrebok, markedspåvirkning eller garantert utførelse.\",\r\n            \"Fullhistorisk kurve for den valgte varianten er tilbakeberegnet; et historisk porteføljeresultat basert på dette valget må begynne etter treningsslutt.\",\r\n        ],\r",
     "replacement_text": "        \"limitations\": list(_zero_cost().LIMITATIONS),\r"
+  },
+  {
+    "file": "innsidehandel_pipeline.py",
+    "name": "innsidehandel_pipeline.py :: delvis stanser ikke kjoringen",
+    "marker": "def steg_er_fatalt",
+    "lines": [
+      8871,
+      8871
+    ],
+    "original_text": "def main(argv: Optional[List[str]] = None) -> int:",
+    "replacement_text": "# ── 2026-09-20: delvis er ikke mislykket ──────────────────────────────────\n#\n# Steg 1 hentet 3879 artikler og meldte DELVIS fordi 197 av 294 selskaper\n# manglet minst én artikkeltekst. Driveren stanset da steg 2-6, og hele\n# innsidestrategien ble kastet. Try/except per selskap finnes allerede og\n# virker — det var porten over den som gjorde den meningsløs.\nFATALE_STEGSTATUSER = (\"FEIL\", \"AVBRUTT\")\n\n\ndef steg_er_fatalt(status) -> bool:\n    \"\"\"Skal et steg med denne statusen stanse hele kjøringen?\n\n    Nei for DELVIS og HOPPET. Delvis betyr at noe faktisk ble hentet, og de\n    neste stegene kan arbeide på det. Ja for FEIL og AVBRUTT: da finnes det\n    ikke noe å arbeide videre på.\n    \"\"\"\n    return str(status) in FATALE_STEGSTATUSER\n\n\ndef steg1_status(feilede: int, artikler: int) -> str:\n    \"\"\"Status for nedlastingssteget.\n\n    Et nettskrap av 294 selskaper er aldri feilfritt, så «OK bare hvis null\n    feilet» gjorde innsidestrategien umulig å fullføre. Delvis meldes fortsatt\n    som delvis — men det er bare FEIL når ingenting i det hele tatt ligger på\n    disk etterpå.\n    \"\"\"\n    if feilede == 0:\n        return \"OK\"\n    return \"DELVIS\" if artikler else \"FEIL\"\n\n\ndef main(argv: Optional[List[str]] = None) -> int:"
+  },
+  {
+    "file": "innsidehandel_pipeline.py",
+    "name": "innsidehandel_pipeline.py :: steg 1 er FEIL bare uten artikler",
+    "marker": "steg1_status(feil, len(lagret))",
+    "lines": [
+      3850,
+      3850
+    ],
+    "original_text": "    status = \"OK\" if feil == 0 else \"DELVIS\"\r",
+    "replacement_text": "    status = steg1_status(feil, len(lagret))\r"
+  },
+  {
+    "file": "innsidehandel_pipeline.py",
+    "name": "innsidehandel_pipeline.py :: stans bare paa FEIL og AVBRUTT",
+    "marker": "steg_er_fatalt(_status)",
+    "lines": [
+      8926,
+      8928
+    ],
+    "original_text": "        if ((args.stopp_ved_feil and resultater[plass[n]].status == \"FEIL\")\r\n                or (n in (1, 4, 5) and resultater[plass[n]].status != \"OK\")):\r\n            logger.error(f\"\\n⏹️  --stopp-ved-feil: stanser etter steg {n}.\")\r",
+    "replacement_text": "        _status = resultater[plass[n]].status\r\n        _fatalt = steg_er_fatalt(_status)\r\n        if not _fatalt and _status != \"OK\" and n in (1, 4, 5):\r\n            logger.warning(\r\n                f\"   ⚠️  Steg {n} er {_status}. Kjøringen fortsetter på det som \"\r\n                \"faktisk ble hentet — resultatet bygger på ufullstendige data.\")\r\n        if ((args.stopp_ved_feil and _fatalt)\r\n                or (n in (1, 4, 5) and _fatalt)):\r\n            logger.error(f\"\\n⏹️  Stanser etter steg {n}: status {_status}.\")\r"
   },
   {
     "file": "Only_260820.py",

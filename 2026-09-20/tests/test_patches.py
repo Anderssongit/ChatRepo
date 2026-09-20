@@ -16,7 +16,7 @@ import build_patches as bp                                           # noqa: E40
 import patched_import as pi                                          # noqa: E402
 
 FILER = ("master", "capital_mail", "portfolio_blend", "insider_selection",
-         "Only_260820")
+         "innsidehandel_pipeline", "Only_260820")
 
 
 class Patchene(unittest.TestCase):
