@@ -35,6 +35,15 @@ ChatRepo\
    (Alternativt: miljøvariabelen `AKSJE_MAIL_APP_PASSWORD`.)
 4. **`.venv`** — lages av `SETUP.cmd`. Ikke rør den.
 
+### Sjekk at mappen ligger riktig
+
+Dobbeltklikk **`SJEKK.cmd`** i denne mappen. Den sier med rene ord om mappen
+ligger ved siden av `master.py`, om `.venv` finnes, og om rettelsene kan
+påføres. Den laster ikke ned noe og sender ingenting.
+
+Ligger mappen feil, leser `master.py` aldri rettelsene, og du får den gamle
+oppførselen uten at noe sier fra.
+
 ### Én gang, på en ny maskin
 
 ```text
@@ -483,6 +492,7 @@ faktisk kom ned.
 | `build_patches.py` | Bygger `patches.json` av rotfilene, med fire kontroller. |
 | `patched_import.py` | Importkrok. Påfører blokkene i minnet, skriver aldri til disk. |
 | `run.py`, `RUN.cmd` | Inngangspunkt. |
+| `SJEKK.cmd` | Dobbeltklikk: ligger mappen riktig, og virker rettelsene? |
 | `tests/` | 174 tester, kjører uten pandas og uten nett. |
 
 ```text
