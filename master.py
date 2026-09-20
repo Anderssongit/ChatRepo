@@ -13,6 +13,43 @@ og månedlig rebalansering over felles fullførte måneder, etter variantvalg.
 portfolio_blend.py beregner kapitalen; capital_mail.py bygger rapporten.
 De eldre scoreverktøyene beholdes for kompatibilitet og regresjonstester,
 men brukes ikke av standardkjøringen. Se README.md for krav og metode.
+
+RETTELSER I DENNE UTGAVEN — ALT LIGGER I DENNE FILA
+---------------------------------------------------
+Denne master.py er eneste fil du trenger å bytte. Ingen egen mappe, ingen
+importkrok, ingenting som stilltiende gjør ingenting hvis det ligger feil sted.
+
+1. LEDELSESSENTIMENT KJØRER IGJEN. Prisvakten i Only_260820.py stanset hele
+   strategien når én ticker hadde en kurs den ikke kunne kontrollere — åtte av
+   rundt to hundre selskaper kostet alle fire tallene. Nå utelates de tickerne
+   fra universet, navngis i loggen og i management_price_issues.csv, og resten
+   handles. Ingen kurs klippes, interpoleres eller gjettes. Forsvinner mer enn
+   halve universet, stopper den fortsatt — da er det nedlastingen som feiler.
+   Vakten ligger som en nestet funksjon og kan ikke byttes utenfra, så kilden
+   endres i MINNET ved import. Fila på disk åpnes aldri for skriving, og
+   PBROE_All3 og SentimentMomentumV31 er byte-identiske etterpå.
+
+2. ET STEG SOM HENTET NOE STANSER IKKE DE NESTE. Innsidepipelinen kastet hele
+   strategien når steg 1, 4 eller 5 meldte noe annet enn OK — og steg 1 melder
+   OK bare når NULL av 294 selskaper feilet. En kjøring som hadde hentet 3879
+   artikler på 2,2 timer ble derfor forkastet i sin helhet. Delvis behandles nå
+   som delvis: kjøringen fortsetter på det som faktisk ble hentet, og at det var
+   delvis står i steglista og i mailen.
+
+3. INGEN HANDELSKOSTNADER, HELLER IKKE I VALGET. Motoren handler allerede uten
+   kostnader. Valget mellom de fem innsidevariantene brukte likevel en
+   kostnadsregel, og optimaliserte dermed for et regime som ikke gjelder.
+   Kriteriet er nå høyest trenings-CAGR uten kostnader. Horisonten er uendret:
+   bare data til og med treningsslutt inngår, så valget ser ikke fremover.
+
+4. MAILEN BEGYNNER MED DATASTATUS. Én linje per strategi: kom dataene ned, hvor
+   ferske er de, teller strategien i fellestallene. En strategi uten ferske data
+   utelates og navngis i stedet for å velte hele mailen, og de øvrige blandes
+   med lik vekt — fire gir 25 % hver, tre gir 33 %. En utelatt strategi
+   erstattes ikke med null avkastning, og forrige verdi videreføres ikke som om
+   den var dagens.
+
+Tester: test_master_standalone.py (kjører uten pandas, numpy og nett).
 """
 
 from __future__ import annotations
@@ -36,6 +73,654 @@ sys.path.insert(0, str(SKRIPTMAPPE))
 import innsidehandel_pipeline as IP          # noqa: E402  (stien må settes først)
 
 Rad = Dict[str, Any]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RETTELSER — ALT LIGGER I DENNE FILA
+# ══════════════════════════════════════════════════════════════════════════
+#
+# master.py er eneste fil du trenger å bytte. Ingen egen mappe, ingen
+# importkrok, ingenting som stilltiende gjør ingenting hvis det ligger feil
+# sted. Fire rettelser:
+#
+#   1. Ledelsessentiment: en ticker med ukontrollerbare kurser utelates, i
+#      stedet for å stanse hele strategien. Det var denne som gjorde 3 av 4.
+#   2. Innsidepipelinen: et steg som hentet NOE stanser ikke de neste.
+#   3. Innsidevalget bruker ingen handelskostnader — motoren gjør det heller
+#      ikke.
+#   4. Mailen begynner med datastatus per strategi, og en strategi uten
+#      ferske data utelates fra fellestallene i stedet for å velte mailen.
+#
+# Rettelse 1 må endre kildekoden til Only_260820.py, fordi vakten ligger som
+# en nestet funksjon inne i SentimentHendelseLab og ikke kan byttes utenfra.
+# Endringen gjøres i MINNET. Fila på disk åpnes aldri for skriving. Treffer
+# den ikke, sies det høyt i loggen og i mailen — den later aldri som.
+
+FIKS_VERSJON = "standalone-2026-09-20"
+
+
+# ── 1. Prisvakten: utelat tickeren, ikke hele strategien ──────────────────
+
+_PRISVAKT_GAMMEL = '''        issues = kontroller_priser(close)
+        issues.to_csv(config.ut_dir / "management_price_issues.csv", index=False)
+        if not issues.empty:
+            examples = ", ".join(issues["ticker"].drop_duplicates().head(8))
+            raise RuntimeError(
+                "Management prices require verification after provider repair: "
+                + examples + ". See management_price_issues.csv. No backtest or variant "
+                "is published from these prices; prices were not clipped or guessed.")'''
+
+_PRISVAKT_NY = '''        issues = kontroller_priser(close)
+        issues.to_csv(config.ut_dir / "management_price_issues.csv", index=False)
+        if not issues.empty:
+            # En ticker med ukontrollerbare kurser skal koste DEN tickeren,
+            # ikke hele strategien. For aatte av rundt to hundre selskaper
+            # stanset dette foer alt: ingen backtest, ingen variant, ingen tall
+            # i mailen. Tickerne utelates naa fra universet og navngis i
+            # loggen og i management_price_issues.csv. Ingen kurs klippes,
+            # interpoleres eller gjettes - de utelatte selskapene handles bare
+            # ikke.
+            _uten_kurs = sorted({str(t) for t in issues["ticker"]})
+            _alle = [str(c) for c in close.columns]
+            _beholdt = [c for c in close.columns if str(c) not in _uten_kurs]
+            log.warning("Kurser   : utelater %d av %d tickere med "
+                        "ukontrollerbare kurser: %s", len(_uten_kurs),
+                        len(_alle), ", ".join(_uten_kurs[:12])
+                        + (" ..." if len(_uten_kurs) > 12 else ""))
+            if len(_beholdt) < max(10, 0.5 * len(_alle)):
+                # Naar halve universet er borte er det ikke enkelttickere som
+                # er problemet, det er nedlastingen. Da skal den stoppe.
+                raise RuntimeError(
+                    "For faa tickere igjen etter prisvalidering: "
+                    + str(len(_beholdt)) + " av " + str(len(_alle)) + ". "
+                    "Se management_price_issues.csv. Ingen kurs ble klippet "
+                    "eller gjettet.")
+            close = close[_beholdt].copy()
+            high = high.reindex(index=close.index, columns=_beholdt)
+            low = low.reindex(index=close.index, columns=_beholdt)'''
+
+
+def _les_tekst(sti: Path) -> str:
+    with Path(sti).open(encoding="utf-8", newline="") as fil:
+        return fil.read()
+
+
+def _bytt_blokk(kilde: str, gammel: str, ny: str) -> Tuple[str, str]:
+    """Bytt blokken uansett linjeskiftkonvensjon. (ny kilde, melding)."""
+    for skift in ("\r\n", "\n"):
+        behov = gammel.replace("\n", skift)
+        if kilde.count(behov) == 1:
+            return kilde.replace(behov, ny.replace("\n", skift), 1), ""
+        if kilde.count(behov) > 1:
+            return kilde, "blokken finnes flere steder i fila"
+    return kilde, "blokken ble ikke funnet — fila er en annen utgave"
+
+
+def last_only_med_rettelser(logger) -> Tuple[Any, str]:
+    """Importer Only_260820 med prisvakten rettet. Skriver aldri til disk.
+
+    Returnerer (modul, merknad). Merknaden er tom naar rettelsen traff.
+    Treffer den ikke, importeres fila som den er og merknaden sier hvorfor —
+    da er du tilbake til at aatte tickere stanser ledelsessentimentet, og det
+    skal staa i mailen og ikke oppdages tre maaneder senere.
+    """
+    import importlib
+    import linecache
+
+    if "Only_260820" in sys.modules:
+        return sys.modules["Only_260820"], ""
+    sti = SKRIPTMAPPE / "Only_260820.py"
+    if not sti.is_file():
+        raise ImportError(f"Fant ikke {sti}")
+    try:
+        kilde = _les_tekst(sti)
+    except OSError as e:
+        raise ImportError(f"Kunne ikke lese {sti}: {e}") from e
+
+    if "_uten_kurs = sorted(" in kilde:
+        merknad = ""                         # rettelsen ligger allerede i fila
+    else:
+        kilde, feil = _bytt_blokk(kilde, _PRISVAKT_GAMMEL, _PRISVAKT_NY)
+        merknad = ("Prisvakten i Only_260820.py kunne ikke rettes: " + feil
+                   + ". Ledelsessentimentet stanser da fortsatt paa tickere "
+                     "med ukontrollerbare kurser." if feil else "")
+        if feil:
+            logger.error("❌ %s", merknad)
+
+    modul = importlib.util.module_from_spec(
+        importlib.util.spec_from_loader("Only_260820", loader=None))
+    modul.__file__ = str(sti)
+    # Uten dette viser tracebacks linjer fra fila paa disk, som ikke er de
+    # som kjoerer.
+    linecache.cache[str(sti)] = (len(kilde), None, kilde.splitlines(True), str(sti))
+    sys.modules["Only_260820"] = modul
+    try:
+        exec(compile(kilde, str(sti), "exec"), modul.__dict__)
+    except BaseException:
+        sys.modules.pop("Only_260820", None)
+        raise
+    if not merknad:
+        logger.info("   ✓ Prisvakten rettet i minnet — Only_260820.py er urørt "
+                    "på disk.")
+    return modul, merknad
+
+
+# ── 2. Et steg som hentet noe stanser ikke de neste ───────────────────────
+
+def tillat_delvise_steg(logger) -> None:
+    """Delvis er ikke mislykket.
+
+    Innsidepipelinen stanser steg 2-6 naar steg 1, 4 eller 5 melder noe annet
+    enn OK — og steg 1 melder OK bare naar NULL av 294 selskaper feilet. Et
+    nettskrap av 294 selskaper er aldri feilfritt, saa en kjoering som hentet
+    3879 artikler kunne bli kastet i sin helhet.
+
+    Stegfunksjonene ligger som modulglobaler og kalles av lambdaer i main(),
+    saa de kan byttes her — ingen kildekode roeres. Delvis blir OK, og at det
+    var delvis staar i detaljteksten, i steglista og i mailen.
+    """
+    for navn in ("steg1_nedlasting", "steg4_kurser", "steg5_merge"):
+        original = getattr(IP, navn, None)
+        if original is None or getattr(original, "_delvis_tillatt", False):
+            continue
+
+        def lag(_orig=original, _navn=navn):
+            def kall(*args, **kwargs):
+                svar = _orig(*args, **kwargs)
+                if isinstance(svar, dict) and svar.get("status") == "DELVIS":
+                    svar = dict(svar, status="OK", delvis=True,
+                                detaljer="DELVIS, kjøringen fortsetter — "
+                                         + str(svar.get("detaljer") or ""))
+                    logger.warning("   ⚠️  %s er delvis. Kjøringen fortsetter på "
+                                   "det som faktisk ble hentet.", _navn)
+                return svar
+            kall._delvis_tillatt = True
+            kall.__name__ = _navn
+            return kall
+
+        setattr(IP, navn, lag())
+
+
+# ── 3. Variantvalg uten handelskostnader ──────────────────────────────────
+
+MIN_TRENINGSDAGER, MIN_INNGANGER, MIN_TICKERE = 252, 20, 5
+
+
+def _tall(verdi):
+    try:
+        verdi = float(verdi)
+    except (TypeError, ValueError):
+        return None
+    return verdi if verdi == verdi and abs(verdi) != float("inf") else None
+
+
+def velg_uten_kostnader(rader, baseline="daglig"):
+    """Hoeyest trenings-CAGR uten kostnader, blant varianter med nok historikk.
+
+    Motoren handler allerede uten kostnader (spread_pst = kurtasje_pst = 0).
+    Kostnadene levde bare i VALGET, som dermed optimaliserte for et regime
+    som ikke gjelder. Horisonten er uendret: bare data til og med
+    treningsslutt inngaar, saa valget ser fortsatt ikke fremover.
+    """
+    rader = list(rader)
+    base = next((r for r in rader if r.get("Variant") == baseline), None)
+    if base is None:
+        raise ValueError("Innsidebaselinen mangler; kan ikke velge trygt.")
+
+    def nok_historikk(rad):
+        try:
+            return (int(rad.get("Train_Days", 0)) >= MIN_TRENINGSDAGER
+                    and int(rad.get("Train_Entries", 0)) >= MIN_INNGANGER
+                    and int(rad.get("Train_Tickers", 0)) >= MIN_TICKERE)
+        except (TypeError, ValueError):
+            return False
+
+    kvalifiserte = [r for r in rader if nok_historikk(r)
+                    and (_tall(r.get("Train_CAGR_Pst")) or 0) > 0]
+    if not kvalifiserte:
+        return base, ("Daglig baseline beholdes: ingen variant har baade nok "
+                      "treningshistorikk og positiv trenings-CAGR uten "
+                      "handelskostnader. Dette dokumenterer ingen varig fordel.")
+    rekkefolge = {str(r.get("Variant")): n for n, r in enumerate(rader)}
+    valgt = min(kvalifiserte, key=lambda r: (
+        -(_tall(r.get("Train_CAGR_Pst")) or 0.0),
+        _tall(r.get("Train_Turnover_Per_Year_Pst")) or float("inf"),
+        rekkefolge.get(str(r.get("Variant")), 10 ** 6)))
+    return valgt, ("Valgt paa treningsdata alene: hoeyest CAGR uten "
+                   "handelskostnader, blant varianter med minst "
+                   f"{MIN_TRENINGSDAGER} treningsdager, {MIN_INNGANGER} nye "
+                   f"innganger og {MIN_TICKERE} forskjellige aksjer. Ved likhet "
+                   "vinner lavere treningsomsetning. Handelskostnader er null i "
+                   "hele kjoeringen. Fullhistorikk og senere testresultater "
+                   "paavirker ikke valget.")
+
+
+def bruk_nullkostnadsvalg(logger) -> None:
+    """Bytt ut den kostnadsbaserte velgeren. Ren monkey-patch, ingen kildekode."""
+    try:
+        import insider_selection
+    except Exception as e:                                   # noqa: BLE001
+        logger.warning("   ⚠️  Fant ikke insider_selection: %s", IP.feiltekst(e))
+        return
+    if getattr(insider_selection.select_robust_variant, "_nullkostnad", False):
+        return
+    velg_uten_kostnader._nullkostnad = True
+    insider_selection.select_robust_variant = velg_uten_kostnader
+    insider_selection.POLICY_VERSION = "insider-zero-cost-v1"
+
+
+# ── 4. Datastatus per strategi ────────────────────────────────────────────
+
+STRATEGIER = ("PB-ROE-Momentum", "NLP Sentiment — ledelse",
+              "Sentiment Momentum v3.1", "Innsidehandel — Oslo Børs")
+
+# PB-ROE eksporterer bare maanedsverdier, saa en hale paa et par uker er
+# normal der. De tre andre er daglige og skal vaere innenfor en uke.
+MAKSALDER_DAGER = {"PB-ROE-Momentum": 45, "NLP Sentiment — ledelse": 7,
+                   "Sentiment Momentum v3.1": 7, "Innsidehandel — Oslo Børs": 7}
+
+ANALYSE_TIL_STRATEGI = {
+    "PB-ROE-Momentum": "PB-ROE-Momentum",
+    "NLP-artikler — skraping": "NLP Sentiment — ledelse",
+    "NLP Sentiment — ledelse": "NLP Sentiment — ledelse",
+    "Sentiment Momentum v3.1": "Sentiment Momentum v3.1",
+    "Innsidehandel Oslo Børs": "Innsidehandel — Oslo Børs",
+}
+
+
+def _som_dato(verdi) -> Optional[date]:
+    """Tolerant datotolkning: str, date, datetime og pandas Timestamp."""
+    if verdi is None or verdi == "":
+        return None
+    if isinstance(verdi, datetime):
+        return verdi.date()
+    if isinstance(verdi, date):
+        return verdi
+    for navn in ("to_pydatetime", "date"):
+        handler = getattr(verdi, navn, None)
+        if callable(handler):
+            try:
+                svar = handler()
+                return svar.date() if isinstance(svar, datetime) else svar
+            except Exception:                                # noqa: BLE001
+                pass
+    try:
+        return date.fromisoformat(str(verdi)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _siste_observasjon(observasjoner) -> Tuple[int, Optional[date]]:
+    dager = []
+    for rad in observasjoner or ():
+        try:
+            dag = _som_dato(rad[0])
+        except (TypeError, IndexError):
+            continue
+        if dag is not None:
+            dager.append(dag)
+    return len(dager), (max(dager) if dager else None)
+
+
+def vurder_strategi(navn, feil=(), observasjoner=(), as_of=None):
+    """Én strategis datastatus. Ren funksjon — ingen IO.
+
+    OK bare naar eksporten kan leses, er gyldig og siste observasjon er fersk
+    nok. En fremtidsdatert rad er en merkelapp, ikke en observert kurs.
+    """
+    as_of = as_of or date.today()
+    grense = MAKSALDER_DAGER.get(navn, 7)
+    antall, siste = _siste_observasjon(observasjoner)
+    problemer = [str(f) for f in feil if f]
+    if problemer:
+        status, hvorfor = "FEIL", "; ".join(problemer)
+    elif antall == 0:
+        status, hvorfor = "MANGLER", "eksporten har ingen brukbare observasjoner"
+    else:
+        alder = (as_of - siste).days
+        if alder < 0:
+            status = "FORELDET"
+            hvorfor = (f"siste observasjon {siste} ligger ETTER rapportdatoen "
+                       f"{as_of}; en fremtidsdatert rad er en merkelapp, ikke "
+                       "en kurs")
+        elif alder > grense:
+            status = "FORELDET"
+            hvorfor = (f"siste observasjon {siste} er {alder} dager gammel "
+                       f"(grense {grense}). Å kjøre modellen på nytt gjør ikke "
+                       "kildekursene ferskere")
+        else:
+            status, hvorfor = "OK", f"ferske data til og med {siste} ({alder} dager)"
+    return {"Strategi": navn, "Status": status, "Begrunnelse": hvorfor,
+            "Observasjoner": antall, "Siste": None if siste is None else str(siste),
+            "Alder_Dager": None if siste is None else (as_of - siste).days,
+            "Maksalder_Dager": grense, "I_Portefolje": status == "OK",
+            "Konsekvens": ("Inngår i samlet portefølje" if status == "OK"
+                           else "Utelatt fra samlet portefølje")}
+
+
+def bygg_datastatus(kurver, kjoring=(), per_komponent=None, as_of=None,
+                    merknader=()):
+    """Status for alle fire strategiene, og hvem som blir med i fellestallene."""
+    as_of = as_of or date.today()
+    per_komponent = dict(per_komponent or {})
+    for rad in kjoring or ():
+        if str(rad.get("Status") or "").upper() == "OK":
+            continue
+        navn = ANALYSE_TIL_STRATEGI.get(str(rad.get("Analyse") or ""))
+        if navn:
+            per_komponent.setdefault(navn, []).append(
+                f"{rad.get('Analyse')} feilet: {rad.get('Feil') or 'ukjent årsak'}")
+
+    etter_navn = {str(k.get("name")): k for k in (kurver or ())}
+    rader = []
+    for navn in STRATEGIER:
+        komponent = etter_navn.get(navn)
+        if komponent is None:
+            rader.append(vurder_strategi(
+                navn, feil=["eksporten ble ikke funnet"] + per_komponent.get(navn, []),
+                as_of=as_of))
+            continue
+        feil = list(komponent.get("errors") or []) + per_komponent.get(navn, [])
+        if komponent.get("valid") is False and not feil:
+            feil.append(str(komponent.get("error") or "kilden er erklært ugyldig"))
+        rad = vurder_strategi(navn, feil=feil,
+                              observasjoner=komponent.get("observations") or (),
+                              as_of=as_of)
+        kilde = komponent.get("source") or {}
+        rad["Fil"] = kilde.get("path") or ""
+        rader.append(rad)
+
+    med = [r["Strategi"] for r in rader if r["I_Portefolje"]]
+    uten = [r["Strategi"] for r in rader if not r["I_Portefolje"]]
+    if not uten:
+        sammendrag = (f"Alle {len(rader)} strategiene har ferske data. "
+                      "Samlet portefølje bruker alle fire.")
+    elif len(med) < 2:
+        sammendrag = (f"{len(uten)} av {len(rader)} strategier mangler ferske "
+                      f"data: {', '.join(uten)}. Færre enn to strategier har "
+                      "brukbare data, så ingen samlet portefølje kan beregnes.")
+    else:
+        sammendrag = (f"{len(uten)} av {len(rader)} strategier mangler ferske "
+                      f"data: {', '.join(uten)}. Samlet portefølje beregnes på "
+                      f"de {len(med)} som har det, med {100.0 / len(med):.0f} % "
+                      "kapital til hver.")
+    return {"rows": rader, "included": med, "excluded": uten,
+            "all_ok": not uten, "as_of": str(as_of), "summary": sammendrag,
+            "curves": list(kurver or ()),
+            "notes": [str(n) for n in merknader if n]}
+
+
+_FARGE = {"OK": "#2e7d32", "FORELDET": "#ef6c00",
+          "MANGLER": "#c62828", "FEIL": "#c62828"}
+
+
+def statusblokk_html(status) -> str:
+    """Datastatusblokken som legges ØVERST i mailen."""
+    import html as _html
+
+    def t(v):
+        return "" if v is None else _html.escape(str(v), quote=True)
+
+    if not status or not status.get("rows"):
+        return ('<div class="kort"><h2>Datastatus</h2><p>Datastatus kunne ikke '
+                'bygges for denne kjøringen.</p></div>')
+    rader = status["rows"]
+    alle_ok = bool(status.get("all_ok"))
+    hode = ("Datastatus: alle fire strategier har ferske data" if alle_ok
+            else "Datastatus: ikke alle strategier har ferske data")
+    linjer = "".join(
+        "<tr>"
+        f"<td style='font-weight:600'>{t(r['Strategi'])}</td>"
+        f"<td>{t(r.get('Siste') or '—')}</td>"
+        f"<td>{'—' if r.get('Alder_Dager') is None else t(str(r['Alder_Dager']) + ' dager')}</td>"
+        f"<td style='color:{_FARGE.get(r['Status'], '')};font-weight:600'>{t(r['Status'])}</td>"
+        f"<td>{t(r['Konsekvens'])}</td></tr>" for r in rader)
+    darlige = [r for r in rader if not r["I_Portefolje"]]
+    punkter = ""
+    if darlige:
+        punkter = ("<h3>Hva som mangler, og hva det betyr</h3><ul>" + "".join(
+            f"<li><b>{t(r['Strategi'])}</b> — {t(r['Status'])}: "
+            f"{t(r['Begrunnelse'])}.</li>" for r in darlige)
+            + "</ul><p>En strategi uten ferske data utelates fra den samlede "
+              "porteføljen. Den erstattes ikke med null avkastning, og den "
+              "gamle verdien videreføres ikke som om den var dagens.</p>")
+    notater = ""
+    if status.get("notes"):
+        notater = ("<h3>Merknader om kjøringen</h3><ul>"
+                   + "".join(f"<li>{t(n)}</li>" for n in status["notes"]) + "</ul>")
+    return (
+        '<div class="kort">'
+        f"<h2 style='color:{'#2e7d32' if alle_ok else '#c62828'}'>{t(hode)}</h2>"
+        f"<p style='font-weight:600'>{t(status.get('summary'))}</p>"
+        f"<p>Vurdert mot rapportdato {t(status.get('as_of'))}. En strategi er OK "
+        "bare når eksporten kan leses, er gyldig og siste observasjon er innenfor "
+        "grensen for den strategien — 45 dager for den månedlige PB-ROE-kurven, "
+        "7 dager for de tre daglige.</p>"
+        "<table><tr><th>Strategi</th><th>Siste observasjon</th><th>Alder</th>"
+        f"<th>Status</th><th>Følge for fellestallene</th></tr>{linjer}</table>"
+        + punkter + notater + "</div>")
+
+
+# ── 5. Lik vekt til de strategiene som faktisk har ferske data ────────────
+#
+# portfolio_blend.build_capital_portfolio krever noeyaktig fire kurver og
+# stanser ellers. Det betyr at én foreldet kursfil koster deg ALLE fellestall.
+# Denne gjoer det samme regnestykket, men med lik vekt til de N som er igjen:
+# fire gir 25 % hver, tre gir 33 %. Reglene er de samme - fullfoerte
+# maanedsslutter, felles datoer, ingen maaned funnet paa.
+
+import calendar as _kalender
+import math as _matte
+import statistics as _statistikk
+
+MAKS_HULL_BORSDAGER = 5
+
+
+def _manedsslutt(dag: date) -> date:
+    return dag.replace(day=_kalender.monthrange(dag.year, dag.month)[1])
+
+
+def _borsdager_etter(start: date, slutt: date) -> int:
+    if slutt <= start:
+        return 0
+    return sum((start + timedelta(days=i)).weekday() < 5
+               for i in range(1, (slutt - start).days + 1))
+
+
+def _klargjor(komponent, as_of: date):
+    """(dato -> NAV) for én kurve. Fremtidsdaterte rader utelates."""
+    navn = komponent["name"]
+    rader, fremtid = {}, 0
+    for ra_dato, ra_verdi in komponent.get("observations", ()):
+        dag = _som_dato(ra_dato)
+        try:
+            verdi = float(ra_verdi)
+        except (TypeError, ValueError):
+            raise ValueError(f"{navn}: ugyldig NAV {ra_verdi!r}")
+        if dag is None:
+            raise ValueError(f"{navn}: ugyldig dato {ra_dato!r}")
+        if dag > as_of:
+            fremtid += 1
+            continue
+        if not _matte.isfinite(verdi) or verdi <= 0:
+            raise ValueError(f"{navn}: NAV er null eller negativ {dag}")
+        rader[dag] = verdi
+    if len(rader) < 2:
+        raise ValueError(f"{navn}: færre enn to brukbare observasjoner")
+    return dict(sorted(rader.items())), fremtid
+
+
+def _manedspunkter(rader, as_of: date):
+    """Siste observasjon i hver fullfoerte maaned, naar hullet er lite nok."""
+    maaneder = {}
+    for dag, verdi in rader.items():
+        slutt = _manedsslutt(dag)
+        if slutt <= as_of:
+            maaneder[slutt] = (dag, verdi)
+    brukbare, forkastet = {}, []
+    for slutt, (dag, verdi) in maaneder.items():
+        hull = _borsdager_etter(dag, slutt)
+        if hull <= MAKS_HULL_BORSDAGER:
+            brukbare[slutt] = (dag, verdi)
+        else:
+            forkastet.append((slutt, dag, hull))
+    return brukbare, sorted(forkastet)
+
+
+def _nokkeltall(verdier, datoer, risikofri_pst):
+    avkastninger = [b / a - 1 for a, b in zip(verdier, verdier[1:])]
+    dager = (datoer[-1] - datoer[0]).days
+    total = verdier[-1] / verdier[0] - 1
+    cagr = ((verdier[-1] / verdier[0]) ** (365.25 / dager) - 1
+            if dager >= 180 else None)
+    topp, fall = verdier[0], 0.0
+    for verdi in verdier:
+        topp = max(topp, verdi)
+        fall = min(fall, verdi / topp - 1)
+    vol = (_statistikk.stdev(avkastninger) * _matte.sqrt(12)
+           if len(avkastninger) >= 2 else 0.0)
+    rf = (1 + risikofri_pst / 100) ** (1 / 12) - 1
+    sharpe = ((_statistikk.mean(avkastninger) - rf) * 12 / vol) if vol else None
+    return {"CAGR_Pst": None if cagr is None else cagr * 100,
+            "MaxDD_Pst": fall * 100, "Sharpe": sharpe,
+            "Periode": f"{datoer[0]} → {datoer[-1]}",
+            "Startkapital": verdier[0], "Sluttverdi": verdier[-1],
+            "Total_Pst": total * 100, "Volatilitet_Pst": vol * 100,
+            "frequency": "monthly", "Observasjoner": len(verdier),
+            "drawdown_basis": "fullførte månedsslutter; fall inne i måneden "
+                              "er ikke observerbare"}
+
+
+def bland_likevektet(kurver, as_of=None, startkapital=1_000_000.0,
+                     risikofri_pst=3.0, utelatte=()):
+    """Samlet portefølje med lik vekt til hver kurve som sendes inn."""
+    kurver = list(kurver)
+    antall = len(kurver)
+    if antall < 2:
+        raise RuntimeError(
+            "Færre enn to strategier har ferske data — ingen samlet portefølje "
+            "kan beregnes. Se datastatus øverst i mailen.")
+    navn_liste = [k["name"] for k in kurver]
+    if len(set(navn_liste)) != antall:
+        raise RuntimeError("To kurver har samme navn.")
+    as_of = _som_dato(as_of) or date.today()
+    andel = 100.0 / antall
+
+    klargjort, manedlig, advarsler = {}, {}, []
+    for komponent in kurver:
+        navn = komponent["name"]
+        klargjort[navn], fremtid = _klargjor(komponent, as_of)
+        if fremtid:
+            advarsler.append(f"{navn}: {fremtid} observasjoner etter {as_of} "
+                             "er utelatt.")
+        manedlig[navn], forkastet = _manedspunkter(klargjort[navn], as_of)
+        for slutt, dag, hull in forkastet:
+            advarsler.append(
+                f"{navn}: {slutt} forkastet — siste observasjon {dag} er {hull} "
+                f"børsdager før månedsslutt (grense {MAKS_HULL_BORSDAGER}).")
+        if not manedlig[navn]:
+            raise RuntimeError(f"{navn}: ingen fullført månedsslutt kan belegges.")
+
+    dekning = {n: max(p) for n, p in manedlig.items()}
+    bindende = min(dekning, key=dekning.get)
+    advarsler.append(f"Felles periode slutter {dekning[bindende]} fordi "
+                     f"{bindende} ikke har noen senere brukbar månedsslutt.")
+
+    datoer = sorted(set.intersection(*(set(p) for p in manedlig.values())))
+    grenser = []
+    for komponent in kurver:
+        metadata = komponent.get("metadata") or {}
+        valg = komponent.get("selection") or {}
+        grense = metadata.get("selection_cutoff") or valg.get("Selection_Cutoff")
+        if grense and _som_dato(grense):
+            grenser.append(_som_dato(grense))
+    valggrense = max(grenser) if grenser else None
+    if valggrense:
+        datoer = [d for d in datoer if d >= valggrense]
+        advarsler.append(
+            f"Porteføljen starter ved første felles månedsslutt på eller etter "
+            f"{valggrense}, siste dato brukt til variantvalg.")
+    if len(datoer) < 2:
+        raise RuntimeError(
+            "Færre enn to felles fullførte månedsslutter — ingen samlet "
+            f"avkastning kan beregnes. {bindende} rekker bare til "
+            f"{dekning[bindende]}.")
+    for a, b in zip(datoer, datoer[1:]):
+        if b != _manedsslutt(a + timedelta(days=1)):
+            raise RuntimeError(
+                f"Felles månedsslutt mangler mellom {a} og {b}; nekter å finne "
+                "opp en månedlig rebalansering.")
+
+    andeler = {n: startkapital / antall / manedlig[n][datoer[0]][1]
+               for n in navn_liste}
+    equity, overforinger = [], []
+    for nr, dag in enumerate(datoer):
+        for_rebalansering = {n: andeler[n] * manedlig[n][dag][1] for n in navn_liste}
+        total = sum(for_rebalansering.values())
+        mal = total / antall
+        equity.append({"Dato": str(dag), "Verdi_NOK": total,
+                       "Antall_Strategier": antall})
+        for n in navn_liste:
+            flytt = mal if nr == 0 else mal - for_rebalansering[n]
+            if abs(flytt) > 1e-8:
+                overforinger.append({
+                    "Dato": str(dag), "Strategi": n,
+                    "Type": ("INITIAL_ALLOCATION" if nr == 0
+                             else ("ALLOCATE" if flytt > 0 else "WITHDRAW")),
+                    "Verdi_NOK": abs(flytt), "Transfer_NOK": flytt,
+                    "Kostnad_NOK": 0.0, "Level": "strategy capital allocation"})
+            andeler[n] = mal / manedlig[n][dag][1]
+
+    siste = datoer[-1]
+    beholdning = [{"Strategi": n, "Dato": str(siste),
+                   "Verdi_NOK": equity[-1]["Verdi_NOK"] / antall,
+                   "Andel_Pst": andel, "Target_Pst": andel,
+                   "Antall": andeler[n], "NAV": manedlig[n][siste][1],
+                   "Observation_Date": str(manedlig[n][siste][0]),
+                   "Type": "strategy sleeve"} for n in navn_liste]
+    komponenter = []
+    for kilde in kurver:
+        n = kilde["name"]
+        ra = [manedlig[n][d][1] for d in datoer]
+        normalisert = [startkapital / antall * v / ra[0] for v in ra]
+        komponenter.append({"Strategi": n,
+                            **_nokkeltall(normalisert, datoer, risikofri_pst),
+                            "source": kilde.get("source"),
+                            "source_frequency": kilde.get("frequency"),
+                            "variant": kilde.get("variant"), "valid": True})
+
+    advarsler += [
+        f"Alle {antall} strategiene måles over den samme felles perioden av "
+        "fullførte månedsslutter. Ingen daglig PB-ROE-verdi blir funnet på.",
+        "Ingen handelskostnader er modellert noe sted i denne kjøringen. Det er "
+        "en forutsetning, ikke en observasjon.",
+        "Risiko er målt på månedspunkter og kan overse fall inne i måneden.",
+        f"Den samlede perioden slutter {siste}; dette er et historisk "
+        "øyeblikksbilde, ikke dagens beholdning.",
+    ]
+    if antall != 4:
+        advarsler.append(
+            f"Kapitalen er delt likt på {antall} strategier ({andel:.0f} % hver), "
+            f"ikke fire. Utelatt: {', '.join(utelatte) or 'ukjent'}. "
+            "Se datastatus øverst i mailen.")
+
+    nokkeltall = _nokkeltall([r["Verdi_NOK"] for r in equity], datoer, risikofri_pst)
+    nokkeltall.update({
+        "Rebalance": "monthly", "Andel_Per_Strategi_Pst": andel,
+        "N_Strategier": antall, "As_Of": str(as_of),
+        "Utelatte_Strategier": list(utelatte),
+        "Selection_Cutoff": str(valggrense) if valggrense else None,
+        "Cost_Basis": "eksporterte strategikurver, modellert uten "
+                      "handelskostnader; kapitaloverføringer koster 0"})
+    return {"equity": equity, "holdings": beholdning, "trades": overforinger,
+            "metrics": nokkeltall, "components": komponenter,
+            "warnings": advarsler,
+            "sources": [k.get("source") for k in kurver],
+            "binding_component": bindende,
+            "strategies": sorted(navn_liste),
+            "common_period": {"start": str(datoer[0]), "end": str(siste),
+                              "frequency": "monthly", "observations": len(datoer),
+                              "return_periods": len(datoer) - 1}}
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -185,9 +870,10 @@ def filalder(sti: Optional[Path]) -> str:
 # andre med seg — da hadde en manglende Excel-fil i PB-ROE stoppet mailen om
 # innsidehandel også, og det er ingen tjent med.
 
-def kjor_alle(m: Master, logger) -> List[Rad]:
+def kjor_alle(m: Master, logger, notater: Optional[List[str]] = None) -> List[Rad]:
     """Kjører de fire analysene. Én rad per analyse med status og tid."""
     ut: List[Rad] = []
+    notater = notater if notater is not None else []
 
     def kjor(navn: str, handling) -> None:
         logger.info(f"\n{'━' * 74}\n{navn.upper()}\n{'━' * 74}")
@@ -210,7 +896,9 @@ def kjor_alle(m: Master, logger) -> List[Rad]:
     def de_tre() -> None:
         # Importeres først her: Only-filen krever pandas, numpy og matplotlib,
         # og masteren skal kunne lese og sende mail uten dem.
-        import Only_260820 as O
+        O, _merknad = last_only_med_rettelser(logger)
+        if _merknad:
+            notater.append(_merknad)
         configure_paths(O.__dict__, m.excel_dir)
 
         # Ledelses-sentiment kommer fra hendelseslaben, ikke fra den månedlige
@@ -242,6 +930,10 @@ def kjor_alle(m: Master, logger) -> List[Rad]:
             ut.append({"Analyse": navn, "Status": "FEIL", "Minutter": 0.0,
                        "Feil": "Only_260820 kunne ikke importeres"})
 
+    # Et steg som hentet NOE skal ikke stanse de neste, og variantvalget
+    # skal ikke bruke en kostnadsregel når motoren handler uten kostnader.
+    tillat_delvise_steg(logger)
+    bruk_nullkostnadsvalg(logger)
     kjor("Innsidehandel Oslo Børs",
          lambda: IP.main(["--steg", "1-6", "--ingen-mail",
                           "--mappe", str(m.innside_dir),
@@ -856,7 +1548,12 @@ def strategisammendrag(m: Master, logger) -> Dict[str, Any]:
     """
     tomt: Dict[str, Any] = {"stil": "", "html": "", "kort": {},
                             "strategier": [], "ekstra": ""}
+    # mail_strategier.py ligger flatt i roten her, ikke i en mail/-undermappe.
+    # Før falt de tre enkeltstrategiene ut av mailen av den grunnen alene.
     mappe = SKRIPTMAPPE / "mail"
+    if not (mappe / "mail_strategier.py").exists() and (
+            SKRIPTMAPPE / "mail_strategier.py").exists():
+        mappe = SKRIPTMAPPE
     if not (mappe / "mail_strategier.py").exists():
         logger.warning(f"   ⚠️  Fant ikke mail/mail_strategier.py i {mappe} — "
                        f"de tre enkeltstrategiene blir utelatt fra mailen.")
@@ -1360,17 +2057,35 @@ def bygg_mail(m: Master, kjoring: Sequence[Rad], kilder: Sequence[Rad],
 # ══════════════════════════════════════════════════════════════════════════
 
 def validate_sources(m, since_ns=None):
-    errors, files = [], []
+    """(errors, files, per_strategi, kurver).
+
+    Feil som kan tilskrives ÉN strategi havner i per_strategi, ikke i errors.
+    Da kan den strategien utelates fra fellestallene i stedet for å velte hele
+    mailen. Kurvene gis videre slik at eksportene ikke leses to ganger.
+    """
+    errors, files, per_strategi = [], [], {}
     from portfolio_blend import load_production_curves
-    for component in load_production_curves(m.excel_dir, m.innside_dir):
+    try:
+        kurver = load_production_curves(m.excel_dir, m.innside_dir)
+    except Exception as exc:                                 # noqa: BLE001
+        kurver = [{"name": n, "observations": [], "valid": False,
+                   "errors": [f"eksportene kunne ikke leses: {IP.feiltekst(exc)}"]}
+                  for n in STRATEGIER]
+
+    def _per(navn, tekst):
+        per_strategi.setdefault(navn, []).append(str(tekst))
+
+    for component in kurver:
         name = component['name']
-        errors.extend(name + ': ' + str(e) for e in component.get('errors', []))
+        for e in component.get('errors', []):
+            _per(name, e)
         source = component.get('source')
         if source:
             files.append({'source': name, **source})
             if since_ns is not None and source['mtime_ns'] < since_ns:
-                errors.append(f"{name}: output was not refreshed by this run")
+                _per(name, "eksporten ble ikke oppdatert av denne kjøringen")
     opp = m.oppsett()
+    _innside = "Innsidehandel — Oslo Børs"
     for path in (opp.strategier_csv, opp.strategi_equity_csv,
                  opp.beholdning_csv, opp.strategi_handler_csv,
                  opp.s6_dir / "selected_variant.json"):
@@ -1379,24 +2094,37 @@ def validate_sources(m, since_ns=None):
             files.append({"source": "Insider report", "path": str(path.resolve()),
                           "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
             if since_ns is not None and stat.st_mtime_ns < since_ns:
-                errors.append(f"Insider report was not refreshed: {path.name}")
+                _per(_innside, f"innsiderapporten ble ikke oppdatert: {path.name}")
         except OSError:
-            errors.append(f"Insider report missing: {path.name}")
-    return errors, files
+            _per(_innside, f"innsiderapporten mangler: {path.name}")
+    return errors, files, per_strategi, kurver
 
 
-def failure_report(errors):
+def failure_report(errors, statusblokk=""):
+    """Selv en mislykket kjøring skal lede med hva som kom ned og hva som ikke."""
     return ('<html><meta charset="utf-8"><body><h1>Analysis incomplete</h1>'
-            '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'
+            + (statusblokk or '')
+            + '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'
             + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')
 
 
-def calculate_capital_portfolio(m, rebalance="monthly"):
-    """Blend exported strategy NAVs; raw scores are not allocations."""
-    from portfolio_blend import build_from_files
-    return build_from_files(m.excel_dir, m.innside_dir, rebalance=rebalance,
-                            as_of=date.today(), start_capital=m.startkapital,
-                            risk_free_pct=m.oppsett().risikofri_pst)
+def calculate_capital_portfolio(m, datastatus, rebalance="monthly"):
+    """Bland de eksporterte strategikurvene med lik vekt til hver som er fersk.
+
+    Fire gir 25 % hver, tre gir 33 %. En strategi uten ferske data erstattes
+    ikke med null avkastning, og forrige verdi videreføres ikke som om den var
+    dagens — den utelates, og datastatusen øverst i mailen sier hvem og hvorfor.
+    """
+    if rebalance != "monthly":
+        raise RuntimeError("Bare månedlig rebalansering kan belegges av den "
+                           "månedlige PB-ROE-kurven.")
+    med = set(datastatus.get("included") or ())
+    kurver = [k for k in datastatus.get("curves") or ()
+              if str(k.get("name")) in med]
+    return bland_likevektet(kurver, as_of=date.today(),
+                            startkapital=m.startkapital,
+                            risikofri_pst=m.oppsett().risikofri_pst,
+                            utelatte=datastatus.get("excluded") or ())
 
 
 def ensure_robust_insider_selection(m, logger):
@@ -1496,15 +2224,18 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     logger.info(f"   ExcelData   : {m.excel_dir}")
 
     started = time.time_ns()
-    errors = []
-    kjoring = []
+    errors: List[str] = []
+    notater: List[str] = []
+    kjoring: List[Rad] = []
     if not a.ikke_kjor:
         missing = protected_input_errors(m.excel_dir)
         if missing:
-            errors.extend("Required upstream data missing: " + f for f in missing)
-        else:
-            kjoring = kjor_alle(m, logger)
-            errors.extend(r["Analyse"] + ": " + r["Feil"] for r in kjoring if r["Status"] != "OK")
+            # Ikke lenger fatalt for HELE kjøringen. En manglende grunnlagsfil
+            # rammer de strategiene som leser den; de øvrige skal fortsatt
+            # kjøre, og datastatusen sier hvem som mangler hva.
+            logger.warning("   ⚠️  Grunnlagsdata mangler: %s", "; ".join(missing))
+            notater.append("Grunnlagsdata mangler: " + "; ".join(missing))
+        kjoring = kjor_alle(m, logger, notater)
     # Old saved selection must be upgraded before it enters a capital sleeve.
     if a.ikke_kjor and not a.bare_mail:
         try:
@@ -1512,8 +2243,16 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:
             logger.exception("Insider selection failed")
             errors.append(str(exc))
-    source_errors, source_files = validate_sources(m, None if a.ikke_kjor else started)
+    source_errors, source_files, per_strategi, kurver = validate_sources(
+        m, None if a.ikke_kjor else started)
     errors.extend(source_errors)
+    # Hver strategi vurderes for seg. En uten ferske data utelates fra
+    # fellestallene og navngis øverst i mailen — den stopper ikke de andre.
+    datastatus = bygg_datastatus(kurver, kjoring, per_strategi,
+                                 as_of=date.today(), merknader=notater)
+    for _rad in datastatus["rows"]:
+        logger.info("   Datastatus  %-26s %-9s %s", _rad["Strategi"],
+                    _rad["Status"], _rad["Begrunnelse"])
     portfolio = None
     manifest_path = m.ut_dir / "completed_run.json"
     if not errors:
@@ -1526,7 +2265,8 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
                     raise RuntimeError("Saved results refer to different source files; rerun calculation")
                 portfolio = saved["portfolio"]
             else:
-                portfolio = calculate_capital_portfolio(m, rebalance=a.rebalance)
+                portfolio = calculate_capital_portfolio(
+                    m, datastatus, rebalance=a.rebalance)
                 if not portfolio.get("equity") or not portfolio.get("metrics"):
                     raise RuntimeError("Capital portfolio did not produce a usable result")
                 IP.skriv_csv(m.ut_dir / "samlet_equity.csv", portfolio["equity"])
@@ -1545,10 +2285,14 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     except Exception as exc:
         insider = {}
         errors.append("Insider report: " + str(exc))
-    if portfolio and (len(sections.get("strategier", [])) != 3
-                      or any(x.get("mangler") for x in sections["strategier"])):
+    # Datastatusen sier allerede hvilke strategier som mangler data, og de er
+    # da utelatt fra fellestallene. Da skal en manglende seksjon ikke i tillegg
+    # gjøre hele kjøringen ufullstendig.
+    alle_med = bool(datastatus.get("all_ok"))
+    if portfolio and alle_med and (len(sections.get("strategier", [])) != 3
+                                   or any(x.get("mangler") for x in sections["strategier"])):
         errors.append("One or more strategy report sections are missing or invalid")
-    if portfolio and not insider:
+    if portfolio and alle_med and not insider:
         errors.append("Insider results missing")
     if portfolio and not errors:
         payload = {"format_version": 2, "method": "capital_25_each",
@@ -1561,19 +2305,36 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
             logger.exception("Could not save completed portfolio")
             errors.append("Could not save completed portfolio: " + str(exc))
     try:
+        statusblokk = statusblokk_html(datastatus)
+    except Exception as exc:                                 # noqa: BLE001
+        logger.warning("Datastatusblokken kunne ikke bygges: %s", exc)
+        statusblokk = ""
+    try:
         if sections.get("kort") or insider:
             from capital_mail import render_capital_mail
             html = render_capital_mail(m, kjoring, portfolio, sections, insider, errors)
+            # capital_mail er urørt; blokken settes inn rett etter <body>, så
+            # datastatus står først uansett hvordan resten av mailen ser ut.
+            if statusblokk and "<body>" in html:
+                html = html.replace("<body>", "<body>" + statusblokk, 1)
+            elif statusblokk:
+                html = statusblokk + html
         else:
-            html = failure_report(errors or ["No strategy reports are available"])
+            html = failure_report(errors or ["No strategy reports are available"],
+                                  statusblokk)
     except Exception as exc:
         logger.exception("Email rendering failed")
         errors.append("Email rendering failed: " + str(exc))
-        html = failure_report(errors)
+        html = failure_report(errors, statusblokk)
     if errors:
         subject = "Analysis incomplete — ufullstendig beregning"
     else:
-        subject = "Samlet aksjeanalyse — 25 % i hver strategi"
+        _antall = int(((portfolio or {}).get("metrics") or {}).get("N_Strategier", 4) or 4)
+        subject = ("Samlet aksjeanalyse — 25 % i hver strategi" if _antall == 4
+                   else f"Samlet aksjeanalyse — {100.0 / _antall:.0f} % i hver "
+                        f"av {_antall} strategier")
+        if not datastatus.get("all_ok"):
+            subject += f" · {len(datastatus.get('excluded') or ())} uten ferske data"
         cagr = (portfolio or {}).get("metrics", {}).get("CAGR_Pst")
         if cagr not in (None, ""):
             subject += f" · samlet CAGR {float(cagr):.2f} %"
