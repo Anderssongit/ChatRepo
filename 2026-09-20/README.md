@@ -7,33 +7,89 @@ fjernet fra denne grenen — alt derfra som fortsatt gjelder ligger her, rettet.
 
 ---
 
-## Slik bruker du den — kortversjonen
+## Slik bruker du den
+
+### Før du kjører noe som helst: fire ting må ligge på plass
+
+Alt dette ligger i **rotmappen** — der `master.py` ligger, altså mappen over
+denne:
 
 ```text
-1.  SETUP.cmd                          én gang: pakker og Chromium
-2.  CHECK_SETUP.cmd                    én gang: sjekk at oppsettet er på plass
-3.  2026-09-20\RUN.cmd --preflight     hva blokkerer akkurat nå? (sekunder)
+ChatRepo\
+├── master.py, Only_260820.py, ...      koden som fulgte med
+├── 2026-09-20\                         denne mappen
+├── ExcelData\                          DINE data  (1)
+├── data\                               innsidedata (2)
+├── mail_passord.txt                    Gmail-app-passord (3)
+└── .venv\                              lages av SETUP.cmd (4)
+```
+
+1. **`ExcelData`** — kopier den inn hit, eller oppgi hvor den ligger med
+   `--excel-dir "D:\Din\Sti\ExcelData"`. På den opprinnelige PC-en finnes den
+   fortsatt automatisk. En lokal `ExcelData` har forrang.
+2. **`data`** — innsidedataene. Lages av kjøringen hvis den ikke finnes, men
+   har du den fra før, spar deg selv for en lang nedlasting og kopier den inn.
+3. **`mail_passord.txt`** — hele fila er Gmail-app-passordet, de fire gruppene
+   med mellomrom limt rett inn. Ikke ditt vanlige Gmail-passord; et app-passord
+   lages under Google-kontoen din. Uten den bygges mailen, men sendes ikke.
+   (Alternativt: miljøvariabelen `AKSJE_MAIL_APP_PASSWORD`.)
+4. **`.venv`** — lages av `SETUP.cmd`. Ikke rør den.
+
+### Én gang, på en ny maskin
+
+```text
+1.  SETUP.cmd          installerer Python-pakkene og Chromium. Tar noen minutter.
+2.  CHECK_SETUP.cmd    sier om oppsettet er på plass.
+```
+
+`SETUP.cmd` trenger **Python 3.12 med Python Launcher** («py») installert
+først. Uten den sier den fra og stopper.
+
+### Hver gang du vil ha en rapport
+
+```text
+3.  2026-09-20\RUN.cmd --preflight     hva mangler akkurat nå?  (sekunder)
 4.  2026-09-20\RUN.cmd --mail-kladd    full kjøring, men send ingen mail
 5.  2026-09-20\RUN.cmd                 full kjøring, sender mailen
 ```
 
-Punkt 3 svarer på sekunder om dataene er på plass, så du slipper å oppdage det
-etter halvannen time. Punkt 4 er verdt å ta første gang: mailen bygges og
-lagres i `data\7_master\master_mail_*.html`, men sendes ikke.
+Du kan **dobbeltklikke** på `RUN.cmd` i Utforsker — da blir vinduet stående
+åpent til slutt så du rekker å lese svaret. Vil du ha med et flagg, åpne
+Ledetekst i rotmappen og skriv kommandoen.
 
-Vil du bare se hvordan mailen ser ut, uten å kjøre noe:
+**Punkt 3 er den du bør venne deg til.** Den bruker nøyaktig samme vurdering som
+datastatusblokken i mailen, og svarer på sekunder. Uten den oppdager du først
+etter halvannen time at en kursfil var gammel.
+
+**Punkt 4 er verdt å ta første gang.** Mailen bygges og lagres som
+`data\7_master\master_mail_<dato>_<klokkeslett>.html` — åpne den i nettleseren
+— men ingenting sendes.
+
+**Punkt 5 tar tid.** Første kjøring laster faktisk ned kurser, skraper artikler
+og kjører språkmodellen. Regn med over en time. La vinduet stå.
+
+### Bare se hvordan mailen ser ut, uten å kjøre noe
 
 ```text
-python 2026-09-20\demo_mail.py
+.venv\Scripts\python.exe 2026-09-20\demo_mail.py
 ```
 
-Den lager `demo_mail.html` av oppdiktede tall, merket som demonstrasjon.
+Lager `demo_mail.html` av **oppdiktede** tall, merket som demonstrasjon øverst
+i selve mailen.
+
+### Hva sluttkoden betyr
+
+| Kode | Betyr | Hva du gjør |
+|---|---|---|
+| `0` | fullført uten feil | ingenting |
+| `1` | rettelsene kunne ikke påføres | les meldingen; rotfilene er endret |
+| `2` | ufullstendig | les datastatus øverst i mailen |
+| `3` | mailen kunne ikke sendes | HTML-kopien ligger i `data\7_master` |
+
+### Én ting å passe på
 
 `RUN_ALL.cmd` i rotmappen finnes fortsatt og gjør nøyaktig det den alltid har
 gjort — **uten** rettelsene i denne mappen. Bruk `2026-09-20\RUN.cmd`.
-
-Sluttkoder: `0` fullført, `2` ufullstendig (se datastatus øverst i mailen),
-`3` mailen kunne ikke sendes (HTML-kopien ligger igjen lokalt).
 
 ---
 
