@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Apply the 2026-09-18 patches at import time, leaving the files on disk alone.
+"""Apply the 2026-09-20 patches at import time, leaving the files on disk alone.
 
 WHY
 ---
@@ -53,17 +53,21 @@ def _read(path: Path) -> str:
         return handle.read()
 
 
-def _locate(text: str, original: List[str]):
-    """Find the block and the newline convention used AT THE MATCH.
+def _needle(patch: dict) -> str:
+    """Den eksakte teksten patchen erstatter.
 
-    Only_260820.py mixes 12373 CRLF lines with 150 bare LF ones, so the
-    convention is taken from the match site rather than from the file.
+    Blokken er hentet byte for byte ut av rotfila da patchen ble bygget, saa
+    den baerer filas egne linjeskift. Det er noedvendig: Only_260820.py blander
+    12373 CRLF-linjer med 151 rene LF, og insider_selection.py 269 mot 37. Aa
+    sette blokken sammen igjen med EN konvensjon ville ikke ha truffet.
     """
-    for newline in ("\r\n", "\n"):
-        needle = newline.join(original)
-        if text.count(needle) == 1:
-            return needle, newline
-    return None, None
+    needle = patch.get("original_text")
+    if needle is None:
+        raise PatchError(
+            f"{patch.get('name', 'ukjent patch')}: mangler original_text. "
+            "patches.json er fra et eldre format; bygg den paa nytt med "
+            "build_patches.py.")
+    return needle
 
 
 def load_patches() -> Dict[str, List[dict]]:
@@ -86,13 +90,18 @@ def patch_source(text: str, patches: List[dict], filename: str) -> str:
     for patch in patches:
         if patch["name"] in present:
             continue                      # already present on disk
-        needle, newline = _locate(text, patch["original"])
-        if needle is None:
+        needle = _needle(patch)
+        found = text.count(needle)
+        if found != 1:
+            where = "" if not patch.get("lines") else (
+                f" (line {patch['lines'][0]}-{patch['lines'][1]} when the patch "
+                "was built)")
             raise PatchError(
-                f"{filename}: the block for '{patch['name']}' was not found "
-                "verbatim. The file differs from the version this patch was "
-                "written against; refusing to run a half-patched module.")
-        text = text.replace(needle, newline.join(patch["replacement"]), 1)
+                f"{filename}: the block for '{patch['name']}' was found {found} "
+                f"times{where}, expected exactly once. The file differs from the "
+                "version this patch was written against; refusing to run a "
+                "half-patched module.")
+        text = text.replace(needle, patch["replacement_text"], 1)
     return text
 
 
