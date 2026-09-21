@@ -23,8 +23,6 @@ def data_root(explicit=None):
         return Path(explicit or os.environ["AKSJE_BASE_DIR"]).expanduser().resolve()
     if (ROOT / "ExcelData").is_dir():
         return ROOT / "ExcelData"
-    if Path(LEGACY).is_dir():
-        return Path(LEGACY)
     return ROOT / "ExcelData"
 
 
@@ -112,11 +110,81 @@ def choose_variant(rows, baseline, min_trades=20):
     return best, "Highest training CAGR among existing variants; test period was not used for selection."
 
 
+def capped_weights(raw_weights, cap):
+    """Redistribute only into spare capacity; unallocatable capital stays cash."""
+    if not 0 < cap <= 1:
+        raise ValueError("Position cap must be in (0, 1].")
+    raw = {str(k): max(0.0, float(v)) for k, v in raw_weights.items()
+           if math.isfinite(float(v))}
+    result = dict.fromkeys(raw, 0.0)
+    remaining = min(1.0, cap * len(raw))
+    active = {k for k, v in raw.items() if v > 0}
+    while active and remaining > 1e-12:
+        total = sum(raw[k] for k in active)
+        overflowing = {k for k in active if remaining * raw[k] / total >= cap}
+        if not overflowing:
+            for k in active:
+                result[k] = remaining * raw[k] / total
+            break
+        for k in overflowing:
+            result[k] = cap
+            remaining -= cap
+        active -= overflowing
+    return result
+
+
+def observed_month_ends(daily, as_of=None):
+    """Completed month observations with actual session dates, never future labels."""
+    import pandas as pd
+    cutoff = pd.Timestamp(as_of or pd.Timestamp.now()).normalize()
+    values = daily.loc[daily.index < cutoff.replace(day=1)].copy()
+    if values.empty:
+        return values
+    last_sessions = values.index.to_series().groupby(values.index.to_period("M")).max()
+    return values.loc[last_sessions.to_list()].copy()
+
+
+def historical_fundamentals(frame, decision_date):
+    """Only use versions observed before the decision, without revision lookahead."""
+    import pandas as pd
+    if "AvailableDate" not in frame.columns:
+        raise ValueError("Fundamental records require their actual observation date.")
+    known = frame.loc[pd.to_datetime(frame["AvailableDate"]) < pd.Timestamp(decision_date)]
+    known = known.loc[known.index < pd.Timestamp(decision_date)]
+    known = known.sort_values("AvailableDate")
+    return known.loc[~known.index.duplicated(keep="last")].sort_index()
+
+
+def validate_price_frame(frame, expected=(), context="Prices"):
+    """Fail on missing series or suspicious scale jumps; never silently rescale."""
+    import numpy as np
+    import pandas as pd
+    if frame.empty:
+        raise RuntimeError(context + ": provider returned no prices.")
+    missing = [str(t) for t in expected
+               if t not in frame.columns or frame[t].dropna().empty]
+    if missing:
+        raise RuntimeError(context + ": missing tickers: " + ", ".join(missing))
+    problems = []
+    for ticker in frame.columns:
+        original = frame[ticker]
+        series = pd.to_numeric(original, errors="coerce")
+        bad = original.notna() & (~np.isfinite(series) | (series <= 0))
+        if bad.any():
+            problems.append(str(ticker) + " invalid price")
+        observed = series.dropna()
+        ratio = observed.div(observed.shift(1))
+        if ((ratio >= 5) | (ratio <= .2)).any():
+            problems.append(str(ticker) + " extreme jump needs source verification")
+    if problems:
+        raise RuntimeError(context + ": " + "; ".join(problems))
+
+
 def protected_input_errors(base):
     """Check required inputs without fetching or changing the protected models."""
     base = Path(base)
     required = [
-        (base / "Data_BT", "AllTickers_OSEBX_TW_260428.xlsx"),
+        (base / "Data_BT", "AllTickers_OSEBX_TW_current.xlsx"),
         (base / "DataNLP", "Step4_Sentiment_Changes_*.xlsx"),
         (base / "Data_BT1" / "FinancialData", "Stock_Prices_*.xlsx"),
     ]

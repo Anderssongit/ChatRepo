@@ -362,17 +362,17 @@ def MailAlleStrategier(send=False, open_in_browser=False, base_dir=None,
                   "dette er et markedsplassfilter, ikke et inntjeningsvekstfilter."),
                  ("Rangering", "Persentilscore: 25 % lav P/B + 25 % høy ROE + 20 % 12–1-momentum "
                   "+ 10 % 52-ukersmomentum + 12 % ROE-trend over 4 kvartaler + 8 % ROE-stabilitet."),
-                 ("Kapital", "Invers volatilitet over 63 handledager. Vekter avkortes først ved 25 %, "
-                  "deretter normaliseres de; endelig enkeltvekt kan derfor overstige 25 %. "
+                 ("Kapital", "Invers volatilitet over 63 tidligere handledager. Enkeltvekten er maksimalt 25 %; "
+                  "kapital som ikke kan fordeles innenfor taket beholdes som kontanter. "
                   "OSEBX over SMA200 gir 100 % investeringsramme, ellers 50 %. "
                   "Manglende benchmark gir ordinær ramme i den eksisterende motoren."),
                  ("Salg", "Vurderes på månedsslutt, ikke intradag: mer enn 20 % fall fra høyeste "
                   "kurs i de siste 126 kursobservasjonene utløser stoppsalg. "
                   "Rangering og vekter rebalanseres ved månedsslutt; septemberraden selger alt til kontanter. "
                   "Det finnes ikke en daglig garantert stoppris i denne simuleringen."),
-                 ("Timing og kostnad", "Handler og trendfiltre bruker månedens tilgjengelige sluttkurser; "
-                  "motoren legger ikke inn en ekstra handledags forsinkelse. Kostnad er satt til 0 %. "
-                  "Reglene ovenfor beskriver den uendrede PB-ROE-motoren."),
+                 ("Timing og kostnad", "Handler bruker observert sluttkurs på fullført månedsslutt; "
+                  "beslutninger bruker tidligere observerte kurser og kjente finansielle versjoner. Kostnad er satt til 0 %. "
+                  "Finansielle tall er ikke tilgjengelige før sin registrerte innsamlingsdato."),
              ],
              "lager": "PBROE_All3() → DETAILED_BACKTEST_v3()",
              "kilder": [], "n": tom_metrikk(), "posisjoner": [],
@@ -971,10 +971,10 @@ def MailAlleStrategier(send=False, open_in_browser=False, base_dir=None,
                   "kalenderdager siden kjøp. Deretter selges navn som er ute av dagens toppliste "
                   "når en ikke-tom ny kandidatliste utløser rebalansering. Tomt signalutvalg "
                   "gir ikke automatisk salg; risikostopp og tidsgrense gjelder fortsatt."),
-                 ("Timing og kostnad", "Evaluering og handler skjer på dagens tilgjengelige sluttkurs, "
-                  "uten ekstra forsinkelse for prisfiltrene. Et solgt navn kan kjøpes igjen samme dag "
+                 ("Timing og kostnad", "Prisbaserte beslutninger bruker forrige observerte sluttkurs og utføres ved neste tilgjengelige sluttkurs, "
+                  "med prisfiltre basert på tidligere observasjoner. Et solgt navn kan kjøpes igjen samme dag "
                   "hvis det fortsatt kvalifiserer. Kostnad 0 %; risikofri rente i Sharpe er 4 %. "
-                  "Den eksisterende motoren og datainnhentingen er uendret."),
+                  "Signaler må være kjent før handelsdagen; lange hull i beholdningens priser blokkerer resultatet."),
              ],
              "lager": "SentimentMomentumV31()",
              "kilder": [], "n": tom_metrikk(), "posisjoner": [],

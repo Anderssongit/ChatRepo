@@ -1,75 +1,130 @@
-# Fire strategier — 17. september 2026
+# Fire strategier — korrigert 20. september 2026
 
-Denne utgaven fordeler **25 % kapital til hver strategi**, justerer vektene ved månedsslutt og sender én samlet mail når analysene er ferdige. Mailen forklarer kjøp, salg, posisjonsstørrelse og variantvalg. PB-ROE og Sentiment Momentum sine beregnings- og hentefunksjoner er uendret.
+Automatisk datanedlasting, **simulerte handler** og én samlet e-post.
+PB-ROE/Momentum, ledelsessentiment, Sentiment Momentum og innsidehandel får
+**25 % kapital hver**, med månedlig rebalansering. Ingen meglerordre sendes.
+Alle aktive standardberegninger bruker **0 % kurtasje, spread og slippage**.
 
-## Start
+## Start fra en ny kopi
 
-1. Pakk ut hele mappen. Behold undermappen `mail` og alle Python-filene sammen. Legg `mail_passord.txt` ved siden av `master.py`. Eksisterende mailinnstillinger og legitimasjon i kildekoden er beholdt.
-2. Installer Python 3.12 med Python Launcher. Kjør `SETUP.cmd` én gang. Dette installerer pakkene og Chromium. Språkmodellen lastes ned når den først trengs.
-3. Kopier eksisterende `ExcelData` inn i denne mappen, eller oppgi plasseringen: `RUN_ALL.cmd --excel-dir "D:\DinMappe\ExcelData"`. På den opprinnelige PC-en kan eksisterende ExcelData fortsatt finnes automatisk. En lokal ExcelData-mappe har forrang.
-4. Kopier eventuelt eksisterende innsidedata som `data` i denne mappen. Kjør `CHECK_SETUP.cmd`, deretter `RUN_ALL.cmd`.
+1. Installer Python 3.12 med Python Launcher på Windows.
+2. Kjør `SETUP.cmd`: Python-pakker, Chromium og NLTK-data installeres.
+   FinBERT-modellen lastes ned ved første sentimentkjøring.
+3. Sett `AKSJE_MAIL_USER`, `AKSJE_MAIL_TO` og `AKSJE_MAIL_APP_PASSWORD`, eller
+   legg app-passordet i `mail_passord.txt` ved siden av `master.py`.
+   Eksisterende avsender/mottaker brukes hvis miljøvariablene ikke er satt.
+4. Kjør `CHECK_SETUP.cmd`, så `RUN_ALL.cmd --mail-kladd` for lokal forhåndsvisning.
+   `RUN_ALL.cmd` beregner og sender samlet e-post.
 
-Normal kjøring oppdaterer analysene og sender mail etter beregningen. Nedlasting, teksttolking og 384 varianter av ledelsessentiment kan ta tid. En mislykket del gir en tydelig ufullstendig rapport med tilgjengelige delresultater. Mislykket maillevering gir en feilkode og beholder HTML-kopien lokalt.
+En eksisterende ExcelData-mappe er **ikke nødvendig for å starte nedlastingen**.
+Manglende inputfiler bygges automatisk. Historiske arkiver kan beholdes i
+`ExcelData` og `data`, eller velges med `--excel-dir` og `--mappe`.
+ExcelData velges ikke automatisk fra gamle Desktop-mapper.
 
-Pakken skriver normalt innsidedata og masterrapporter i sin egen `data`-mappe og strategiresultater i valgt ExcelData. På en annen maskin trengs også dataene, Python-pakkene, nettforbindelse og gyldig mailtilgang. ZIP-filen inneholder ikke passordfilen eller datamappene. De gamle kodefilene er ikke endret.
+På macOS/Linux: opprett og aktiver et Python 3.12-miljø, installer
+`requirements.txt`, kjør `python -m playwright install chromium`,
+`python -m nltk.downloader punkt punkt_tab`, så `python master.py --mail-kladd`.
 
-## Eksisterende dataflyt
+## Data som hentes
 
-For å bevare de to fungerende strategiene må deres eksisterende dataflyt fortsatt levere følgende under ExcelData før masteren kjøres:
+| Strategi | Kilder |
+|---|---|
+| PB-ROE/Momentum | Euronext-aksjeliste, TradingView-statistikk og observerte finansielle versjoner, Yahoo-kurser og referanseindeks. |
+| Ledelsessentiment | Finansielle Euronext-meldinger, tilgjengelig artikkel/PDF-tekst, FinBERT og Yahoo-kurser. |
+| Sentiment Momentum | Samme artikkelarkiv, avledede sentimentendringer og justert Yahoo-kurshistorikk. |
+| Innsidehandel | Euronext-meldinger, tekstuttrekk/klassifisering, Yahoo-kurser, volum og referanse. |
 
-- `Data_BT/AllTickers_OSEBX_TW_260428.xlsx`
-- `DataNLP/Step4_Sentiment_Changes_*.xlsx`
-- `Data_BT1/FinancialData/Stock_Prices_*.xlsx`
+Normal kjøring forsøker nye nedlastinger selv om gamle filer finnes.
+Sentimentendringer bygges **etter** artikkelhentingen. Selskapsidentiteter bruker
+samme ticker i tickerlisten, sentimentfilen og kursfilen. `Close` i den felles
+kursfilen er justert kurs; opprinnelig kurs beholdes som `RawClose`.
+Inneværende ufullstendige handelsdag tas ikke med i denne filen.
 
-Masteren kontrollerer at filene finnes. Den erstatter ikke den separate produsenten av de to siste filene. Behold planen som lager dem først. `protected_strategy_hashes.json` og testene bekrefter at `PBROE_All3` og `SentimentMomentumV31` har uendrede funksjonskropper; faste mappeplasseringer flyttes ved kjøring når det er nødvendig.
+«Alle data» betyr tilgjengelige data for det konfigurerte universet og
+historikkvinduet. Kildene kan mangle eldre meldinger, avnoterte selskaper eller
+en ticker. Mangler og eksplisitte artikkel-/pagineringgrenser skal rapporteres.
+Stor førstegangsnedlasting og språkmodellkjøring kan ta flere timer.
 
-## Samlet portefølje
+## Først i e-posten: nedlastingsstatus
 
-Den gamle masteren blandet aksjescorer og laget en ny aksjeportefølje. Det var ikke fire delporteføljer med 25 % kapital hver. Den nye kombinerer de fire eksporterte verdikurvene over samme periode. Hver måneds avkastning er gjennomsnittet av de fire månedsavkastningene; månedene forrentes etter hverandre. Kontanter beholdes i den strategien som holder dem. CAGR beregnes fra den samlede kurven, ikke som gjennomsnitt av CAGR-er fra forskjellige perioder.
+Hver strategi får en egen rad helt først, også når resten feiler:
 
-PB-ROE eksporterer månedlige verdier. Samlet portefølje bruker derfor fullførte månedsslutter og månedlig rebalansering. Fremtidsdaterte og ufullstendige sluttmåneder utelates. Manglende måneder fylles ikke kunstig. Perioden begynner tidligst etter treningen som valgte variantene. Risiko måles på månedspunkter og kan overse fall inne i måneden. Den historiske kapitalfordelingen merkes med sluttdato; enkeltstrategiene viser sine egne siste beholdninger.
+- **JA — lastet ned og kontrollert:** nødvendige nedlastinger er bekreftet.
+- **DELVIS:** minst én kilde er mangelfull eller bare delvis oppdatert.
+- **NEI — lagrede data:** gjenbruk; ingen ny nedlasting påstås.
+- **NEI — feilet / ikke bekreftet:** datagrunnlaget kunne ikke bekreftes.
 
-## Ledelsessentiment
+Tabellen viser kilder, dekning, siste observerte dato når kjent, og forklaringer.
+Detaljene lagres i `data/7_master/download_status.json`. En ferdig backtest eller
+nylig skrevet Excel-fil teller ikke i seg selv som vellykket nedlasting.
+Ufullstendige nødvendige data blokkerer en ny samlet avkastningsrapport;
+tilgjengelige historiske delresultater merkes.
 
-En feil brukte kursendringen to ganger ved verdsetting av åpne posisjoner. Nå er verdien antall aksjer × siste observerte kurs. Salg utløser ikke et kunstig hopp tilbake i verdikurven. Korte kurshull beholder siste observerte verdi; lengre hull blokkerer publisering. Kurshentingen ber Yahoo om reparerte priser og kontrollerer fortsatt ekstreme prishopp. Den gjetter ikke en korreksjon av mistenkelige kurser.
+## Handelsregler og realisme
 
-**Kjør analysen på nytt:** gamle ledelsessentimentfiler mangler den nye regnskapsversjonen og kan ikke brukes til ny samlet avkastning. Lagrede BSP.OL-kurser hadde også et separat, nøyaktig 100-gangers prishopp. Dersom ny nedlasting ikke løser det, viser `management_price_issues.csv` hvilket kursgrunnlag som må avklares. Kjøringen gir da en ufullstendig rapport fremfor å presentere kursfeilen som avkastning.
+- De fire strategifamiliene og kapitalfordelingen beholdes. Ledelsessentiment
+  sammenligner de eksisterende 384 variantene, innsidehandel de eksisterende fem.
+  Kvalifiserte varianter velges på høyest **trenings-CAGR uten handelskostnader**,
+  med krav til historikk og handler. Senere resultater brukes bare til evaluering.
+  Dette maksimerer det valgte historiske målet, ikke garantert fremtidig profitt.
+- Standard treningsslutt er `2025-06-30`. Bruk `--selection-cutoff YYYY-MM-DD`
+  bare når datoen er bestemt før senere resultater vurderes.
+- Nyheter må være tilgjengelige før handelsdagen. Prisbaserte signaler bruker
+  tidligere observerte kurser; handler bruker senere tilgjengelig sluttkurs.
+  Stopper har ingen garantert utførelseskurs ved store kursgap.
+- PB-ROE bruker finansielle versjoner fra deres faktiske innsamlingsdato.
+  Regnskapsperiodens sluttdato beviser ikke når tallene ble publisert.
+  En ny installasjon kan mangle nok verifiserbar PB-ROE-historikk til en samlet
+  backtest. Programmet lager ikke historiske publiseringsdatoer eller profitt.
+- PB-ROE bruker fullførte måneder med faktiske observasjonsdatoer, håndhever
+  vekttaket, selger før kjøp finansieres, og holder kontanter uten kvalifiserte aksjer.
+- Manglende kurser og ekstreme sprang krever kontroll. Historikk omskaleres
+  ikke bare fordi et sprang er nær 10 eller 100 ganger.
+- Samlet kurve bruker felles fullførte månedsslutter etter variantvalg.
+  Månedsmålt risiko kan overse tap inne i måneden. Hver beholdning har egen dato.
+- Null handelskostnader er en modellforenkling. Historisk selskapsutvalg,
+  likviditet, revisjoner, utførelse og datadekning kan endre faktisk avkastning.
 
-Automatikken sammenligner fortsatt de eksisterende 384 inngangs-/utgangskombinasjonene og velger høyest kvalifisert trenings-CAGR, med krav til historikk og handler. Senere resultater brukes ikke til dette valget. Mailen viser faktisk valgt inngangs- og salgsregel, konsistente risikotall og samlet beholdning for aksjer med flere innganger.
-
-## Innsidehandel
-
-Mailen viser de tre høyeste historiske CAGR-ene, presise regler for hver og varianten som brukes videre. Automatisk valg krever minst 252 treningsobservasjoner, 20 nye innganger og fem forskjellige aksjer. Kvalifiserte varianter må ha positiv trenings-CAGR med 0,15 % kostnad per kjøp/salg. Blant dem velges høyest CAGR i den svakeste treningshalvdelen med 0,80 % per kjøp/salg; lavere omsetning avgjør ved likhet. Hvis ingen kvalifiserer, brukes daglig baseline med tydelig forbehold. Topp-tre-rangeringen over hele historikken bestemmer ikke valget.
-
-På siste lagrede datagrunnlag ble scorevektet valgt. Alle variantene tapte under den høye kostnadsantakelsen. Dette opplyses i mailen og dokumenterer ingen bevist MOAT. Neste normale kjøring kan velge annerledes hvis datagrunnlaget endres. De originale kostnadene beholdes i verdikurvene som kombineres; kostnadsstressen vises separat. Ekstra kapitaloverføringer mellom strategiene har ingen modellerte kostnader.
-
-Gjennomsnittlig inngangskurs ved påfyll er rettet, slik at beholdningen viser faktisk avkastning. Tidligere rettelser for ufullstendige nedlastinger, kronologiske signaler og faktisk sluttbeholdning er beholdt.
-
-## Kjøring og filer
+## Kommandoer og filer
 
 ```text
 RUN_ALL.cmd
 RUN_ALL.cmd --mail-kladd
-RUN_ALL.cmd --ingen-nlp-hent
+RUN_ALL.cmd --excel-dir "D:\ExcelData" --mappe "D:\Innsidedata"
 RUN_ALL.cmd --ikke-kjor --mail-kladd
-RUN_ALL.cmd --bare-mail
+RUN_ALL.cmd --bare-mail --mail-kladd
 ```
 
-`--mail-kladd` lagrer mail uten å sende. `--ingen-nlp-hent` bruker lagrede ledelsesartikler, men gjennomfører den øvrige analysen. `--ikke-kjor` beregner samlet portefølje fra gyldige lagrede resultater. `--bare-mail` bruker siste fullførte kapitalberegning når kildefilene fortsatt stemmer. Gamle beregninger basert på scoreblanding avvises.
+`--ingen-nlp-hent` og `--ingen-datahent` er eksplisitte forskningsvalg for
+gjenbruk; dette merkes og kan gi ufullstendig status. `--ikke-kjor` og
+`--bare-mail` krever resultater validert med denne utgavens utførelsespolicy.
+Eldre resultater må kjøres på nytt. `--innside-valg` og `--sent-valg` er
+manuelle overstyringer og merkes som det.
 
-Standard treningsslutt er `2025-06-30`. `--selection-cutoff YYYY-MM-DD` endrer den; fastsett datoen før du vurderer senere resultater. `--innside-valg daglig` og `--sent-valg "S1|F21"` overstyrer variantvalg manuelt og merkes som overstyring.
+`master.py`, `RUN_ALL.cmd` og `2026-09-18/RUN.cmd` starter samme implementasjon.
+Importpatcher brukes ikke. De gamle patchfilene er historisk referanse.
 
-Rapport og kapitalhistorikk: `data/7_master`. Innsidevalg, kostnadstester og regler: `data/6_backtest/selected_variant.json`, `insider_selection.json` og `variant_comparison.csv`. Ledelsessentimentets sammenligning og kursdiagnostikk: `ExcelData/StrategyResults_v5_Sentiment_Exit`.
+- `data/7_master/master_mail_*.html`: lokal e-postkopi.
+- `data/7_master/download_status.json`: denne kjøringens datakontroller.
+- `data/7_master/completed_run.json`: siste komplette porteføljerapport.
+- `data/7_master/validated_outputs.json`: policy og kildefiler for gjenbruk.
+- `data/7_master/samlet_*.csv`: kapitalhistorikk og sammenligning.
+- `data/6_backtest/selected_variant.json`: innsidevalg og treningsgrunnlag.
+- `ExcelData/StrategyResults_v5_Sentiment_Exit`: variant- og kursdiagnostikk.
 
-Enkeltstrategier kan kjøres fra samme mappe:
+Masterens returkoder: **0** fullført, **2** ufullstendig, **3** e-postfeil.
+Lokal HTML beholdes ved leveringsfeil.
+
+## Tester og legitimasjon
 
 ```text
-.venv\Scripts\python.exe run_strategy.py --strategy management
-.venv\Scripts\python.exe run_strategy.py --strategy insider
-.venv\Scripts\python.exe run_strategy.py --strategy pbroe
-.venv\Scripts\python.exe run_strategy.py --strategy sentmom
+python -m pip install -r requirements-test.txt
+python -m playwright install chromium
+python run_tests.py
 ```
 
-Bruk `RUN_ALL.cmd` for samlet mail. Innsidepipelinen kan sende sin egen rapport; de øvrige enkeltinngangene kjører analysefunksjonene. `Only_260820.py` starter masterløpet når den kjøres direkte, men starter ingenting ved import.
-
-Masterens feilkoder: `0` fullført, `2` ufullstendig beregning, `3` mislykket maillevering. Se `VALIDATION.md` for tester og begrensninger.
+Testkjøreren blokkerer eksterne Python-socketforbindelser og ekte SMTP.
+Nettlesertesten bruker lokale testsider. Se `VALIDATION.md`.
+Gamle credential-lignende kommentarer er fjernet. Gyldige nøkler derfra må
+tilbakekalles/roteres, siden tidligere Git-historikk fortsatt kan inneholde dem.
+Passord og genererte data er utelukket fra nye commits med `.gitignore`.

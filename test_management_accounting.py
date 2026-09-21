@@ -11,8 +11,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "tests"))
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
 from management_test_helpers import _hent, _md_av
 
 
@@ -122,7 +122,7 @@ class ManagementAccounting(unittest.TestCase):
         from typing import Dict, List, Optional, Tuple
         from datetime import datetime
         from collections import defaultdict
-        source = (ROOT / "mail" / "mail_strategier.py").read_text(encoding="utf-8")
+        source = (ROOT / "mail_strategier.py").read_text(encoding="utf-8")
         outer = next(n for n in ast.parse(source).body if isinstance(n, ast.FunctionDef)
                      and n.name == "MailAlleStrategier")
         functions = [n for n in outer.body if isinstance(n, ast.FunctionDef)]

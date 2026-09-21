@@ -6,15 +6,16 @@ from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import innsidehandel_pipeline as ip
 from insider_selection import (_entry_counts, _split, select_robust_variant,
                                strategy_rules, variant_rules, resolve_choice)
 
 
-class RobustSelectionTests(unittest.TestCase):
+class ZeroCostSelectionTests(unittest.TestCase):
     def rows(self):
         return [{"Variant": name, "Train_Days": 400, "Train_Entries": 30,
+                 "Train_CAGR_Pst": stress * 10.0,
                  "Train_Tickers": 10, "Train_Moderate_CAGR_Pst": 15.0,
                  "Train_Stress_Worst_Half_CAGR_Pst": stress,
                  "Train_Turnover_Per_Year_Pst": turnover,
@@ -31,15 +32,17 @@ class RobustSelectionTests(unittest.TestCase):
             row["Full_CAGR_Pst"] = -row["Test_CAGR_Pst"]
         self.assertEqual(select_robust_variant(rows)[0]["Variant"], "forfall-60")
 
-    def test_cost_sensitivity_beats_gross_return(self):
+    def test_cost_diagnostics_do_not_change_zero_cost_selection(self):
         rows = self.rows()
-        rows[1]["Train_Stress_Worst_Half_CAGR_Pst"] = -10
-        self.assertEqual(select_robust_variant(rows)[0]["Variant"], "scorevektet")
+        rows[1]["Train_Stress_Worst_Half_CAGR_Pst"] = -1_000_000
+        rows[1]["Train_Moderate_CAGR_Pst"] = -1_000_000
+        self.assertEqual(select_robust_variant(rows)[0]["Variant"], "forfall-60")
 
-    def test_tie_uses_lower_training_turnover(self):
+    def test_tie_keeps_fixed_variant_order(self):
         rows = self.rows()
-        rows[1]["Train_Stress_Worst_Half_CAGR_Pst"] = 2
-        self.assertEqual(select_robust_variant(rows)[0]["Variant"], "scorevektet")
+        rows[1]["Train_CAGR_Pst"] = rows[2]["Train_CAGR_Pst"]
+        rows[1]["Train_Turnover_Per_Year_Pst"] = 1_000_000
+        self.assertEqual(select_robust_variant(rows)[0]["Variant"], "forfall-60")
 
     def test_insufficient_training_retains_baseline(self):
         rows = self.rows()
@@ -47,19 +50,26 @@ class RobustSelectionTests(unittest.TestCase):
             row["Train_Days"] = 120
         self.assertEqual(select_robust_variant(rows)[0]["Variant"], "daglig")
 
-    def test_no_positive_moderate_return_retains_baseline(self):
+    def test_no_positive_gross_return_selects_best_eligible_training_return(self):
         rows = self.rows()
         for row in rows:
-            row["Train_Moderate_CAGR_Pst"] = -1
-        self.assertEqual(select_robust_variant(rows)[0]["Variant"], "daglig")
+            row["Train_CAGR_Pst"] -= 100
+        self.assertEqual(select_robust_variant(rows)[0]["Variant"], "forfall-60")
 
-    def test_negative_stress_is_explicitly_disclosed(self):
+    def test_zero_cost_policy_is_explicitly_disclosed(self):
         rows = self.rows()
-        for row in rows:
-            row["Train_Stress_Worst_Half_CAGR_Pst"] -= 10
         chosen, reason = select_robust_variant(rows)
         self.assertEqual(chosen["Variant"], "forfall-60")
-        self.assertIn("ingen nettofordel", reason)
+        self.assertIn("uten handelskostnader", reason.lower())
+
+    def test_nonfinite_or_insufficient_training_is_ineligible(self):
+        for column, value in [("Train_CAGR_Pst", float("nan")),
+                              ("Train_CAGR_Pst", float("inf")),
+                              ("Train_Entries", 19), ("Train_Tickers", 4)]:
+            with self.subTest(column=column, value=value):
+                rows = self.rows()
+                rows[1][column] = value
+                self.assertEqual(select_robust_variant(rows)[0]["Variant"], "scorevektet")
 
     def test_manual_override_preserves_automatic_recommendation_in_audit(self):
         chosen, reason, recommendation, manual = resolve_choice(self.rows(), "daglig")

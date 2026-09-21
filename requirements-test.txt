@@ -1,0 +1,8 @@
+# Offline synthetic regression suite; no FinBERT/model weights needed.
+numpy>=1.26,<3
+pandas>=2.2,<3
+openpyxl>=3.1,<4
+xlsxwriter>=3.2,<4
+requests>=2.32,<3
+yfinance>=0.2.54,<1
+playwright>=1.49,<2

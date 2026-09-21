@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 import innsidehandel_pipeline as ip
 import master
@@ -143,7 +143,9 @@ class IntegrityAndReporting(unittest.TestCase):
             sections={'strategier':[{}]*3,'stil':'','html':'','kort':{},'ekstra':''}
             portfolio=dict(equity=equity,metrics=stats,trades=[],holdings=[],components=[])
             events=[]
-            with patch.object(master,'protected_input_errors',return_value=[]), \
+            with patch('data_acquisition.build_all',return_value=[]), \
+                 patch.object(master.downloads,'strategy_rows',return_value=[]), \
+                 patch.object(master,'protected_input_errors',return_value=[]), \
                  patch.object(master,'kjor_alle',side_effect=lambda *a: events.append('models') or []), \
                  patch.object(master,'validate_sources',return_value=([],[])), \
                  patch.object(master,'backtest_samlet') as legacy_backtest, \
@@ -157,7 +159,7 @@ class IntegrityAndReporting(unittest.TestCase):
                 self.assertEqual(events,['models','capital','email'])
                 self.assertTrue((m.ut_dir/'completed_run.json').exists())
                 saved=json.loads((m.ut_dir/'completed_run.json').read_text(encoding='utf-8'))
-                self.assertEqual(saved['format_version'],2)
+                self.assertEqual(saved['format_version'],3)
                 self.assertEqual(saved['method'],'capital_25_each')
                 calculate.reset_mock()
                 self.assertEqual(master.kjor(['--mappe',directory,'--excel-dir',directory,'--bare-mail','--mail-kladd']),0)

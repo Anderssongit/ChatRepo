@@ -13,10 +13,10 @@ import os
 from datetime import date
 from pathlib import Path
 
-POLICY_VERSION = "insider-robustness-v1"
+POLICY_VERSION = "insider-zero-cost-training-v2"
 BASELINE = "daglig"
-MODERATE_ONE_WAY_PCT = 0.15
-STRESS_ONE_WAY_PCT = 0.80
+MODERATE_ONE_WAY_PCT = 0.0  # Compatibility constants; no stress replay is run.
+STRESS_ONE_WAY_PCT = 0.0
 MIN_TRAIN_DAYS = 252
 MIN_ENTRIES = 20
 MIN_TICKERS = 5
@@ -74,32 +74,25 @@ def select_robust_variant(rows, baseline=BASELINE):
         raise ValueError("Baseline insider variant is missing; cannot select safely.")
     eligible = []
     for row in rows:
-        moderate = _number(row.get("Train_Moderate_CAGR_Pst"))
-        worst = _number(row.get("Train_Stress_Worst_Half_CAGR_Pst"))
-        turnover = _number(row.get("Train_Turnover_Per_Year_Pst"))
+        gross = _number(row.get("Train_CAGR_Pst"))
         if (int(row.get("Train_Days", 0)) >= MIN_TRAIN_DAYS
                 and int(row.get("Train_Entries", 0)) >= MIN_ENTRIES
                 and int(row.get("Train_Tickers", 0)) >= MIN_TICKERS
-                and moderate is not None and moderate > 0
-                and worst is not None and turnover is not None):
+                and gross is not None):
             eligible.append(row)
     if not eligible:
         return base, ("Daglig baseline beholdes: ingen variant har både tilstrekkelig "
-                      "treningshistorikk og positiv treningsavkastning ved 0,15 % "
-                      "kostnad per handelsside. Dette dokumenterer ingen varig fordel.")
+                      "treningshistorikk og bredde. Alle simulerte handelskostnader er null.")
     # Input order is the predefined VARIANTER order; used only for exact ties.
     order = {row["Variant"]: n for n, row in enumerate(rows)}
     selected = min(eligible, key=lambda row: (
-        -float(row["Train_Stress_Worst_Half_CAGR_Pst"]),
-        float(row["Train_Turnover_Per_Year_Pst"]), order[row["Variant"]]))
-    reason = ("Valgt på tidligere treningsdata: høyest CAGR i den svakeste av "
-              "to treningshalvdeler etter 0,80 % kostnad per handelsside, blant "
-              "varianter med positiv samlet trenings-CAGR ved 0,15 %. Ved likhet "
-              "vinner lavere treningsomsetning, deretter fast variantrekkefølge. "
+        -float(row["Train_CAGR_Pst"]), order[row["Variant"]]))
+    reason = ("Valgt på tidligere treningsdata: høyest CAGR uten handelskostnader "
+              "blant varianter med tilstrekkelig historikk, innganger og selskaper. "
+              "Ved likhet brukes fast variantrekkefølge. "
               "Fullhistorikk og senere testresultater påvirker ikke valget.")
-    if float(selected["Train_Stress_Worst_Half_CAGR_Pst"]) <= 0:
-        reason += (" Den valgte varianten taper i minst én treningshalvdel under "
-                   "kostnadsstress: ingen nettofordel er dokumentert under dette stresset.")
+    if float(selected["Train_CAGR_Pst"]) <= 0:
+        reason += " Ingen kvalifisert variant har positiv samlet treningsavkastning."
     return selected, reason
 
 
@@ -115,10 +108,7 @@ def resolve_choice(rows, manual=""):
     reason = (f"Manuelt valg: {manual}. Den automatiske robusthetsregelen anbefalte "
               f"{recommended['Variant']}; det manuelle valget er ikke resultat av "
               "denne regelen og dokumenterer ingen MOAT. "
-              "Sammenligningen og kostnadsstresset vises fortsatt uendret.")
-    if (_number(selected.get("Train_Stress_Worst_Half_CAGR_Pst")) is None
-            or float(selected["Train_Stress_Worst_Half_CAGR_Pst"]) <= 0):
-        reason += " Ingen positiv nettofordel er dokumentert i begge treningshalvdeler under kostnadsstress."
+              "Alle beregninger bruker null handelskostnader.")
     return selected, reason, recommended["Variant"], True
 
 
@@ -157,7 +147,7 @@ def strategy_rules(strategy, opp):
         exit_rule = ("Vurder og rebalanser hver børsdag, også når navnesettet er uendret. "
                      "Selg når signalet utløper, redusert score faller under grensen, "
                      "navnet faller utenfor topplisten, eller porteføljen har for få navn.")
-    exit_rule += " Ingen stop-loss i disse fem variantene. Manglende pris utover tillatt fyll skrives ned til null."
+    exit_rule += " Ingen stop-loss i disse fem variantene. Handler krever faktisk kurs den dagen; verdsetting kan bruke siste kurs i inntil fem sesjoner. Lengre kursmangler stopper beregningen som ufullstendig."
     return {
         "Signal": ("Meldepliktige kjøp med høy/middels tolkingstillit; kjent beløp minst "
                    f"{opp.min_verdi_nok:,.0f} NOK (ukjent beløp beholdes). " + cluster
@@ -167,7 +157,7 @@ def strategy_rules(strategy, opp):
             "daglig": "Enkel respons på offentlig kjent innsideinformasjon; ingen ekstra forfallsparameter, men hyppige handler.",
             "hendelse-20": "Fast holdeperiode kan redusere unødvendige daglige omvektinger, men etterfylling og gjenkjøp påvirker faktisk holdetid.",
             "forfall-60": "Ferske signaler prioriteres og lik vekting begrenser avhengighet av presis scorekalibrering.",
-            "scorevektet": "Mer kapital til sterkere signaler, med posisjonstak; avhenger av at styrken i scoren betyr noe og tåler kostnader.",
+            "scorevektet": "Mer kapital til sterkere signaler, med posisjonstak; avhenger av at styrken i scoren betyr noe.",
             "konsentrert": "Færre navn øker eksponering mot topprangerte signaler, men også enkeltselskapsrisiko og utskifting."
         }.get(strategy.navn, strategy.hvorfor),
     }
@@ -190,8 +180,8 @@ def build_insider_selection(opp, logger=None, *, market=None, stats=None,
     """Replay cached inputs only; return selected_variant/top3/rules/rationale.
 
     Step 6 supplies its already calculated full-history results. Calling this
-    directly replays them from local merged events and price files. Cost stress
-    changes spread/commission only, never the five strategy definitions.
+    directly replays them from local merged events and price files. Every run
+    uses zero commission, spread and slippage, including variant selection.
     """
     import innsidehandel_pipeline as ip
     cutoff = str(opp.inn_utvalg_slutt)
@@ -238,18 +228,9 @@ def build_insider_selection(opp, logger=None, *, market=None, stats=None,
                "Full_Calendar_CAGR_Pst": _cagr(curve),
                "Train_Turnover_Per_Year_Pst": 100 * turnover / mean_capital / years
                if mean_capital > 0 and years > 0 else None}
-        for label, cost in (("Moderate", MODERATE_ONE_WAY_PCT), ("Stress", STRESS_ONE_WAY_PCT)):
-            cost_opp = copy.copy(opp)
-            # 0.80% = half of 1.5% spread + 0.05% commission per side.
-            cost_opp.spread_pst, cost_opp.kurtasje_pst = 2 * cost, 0.0
-            stress_curve, _, _, _ = ip.kjor_strategi(market, strategy, cost_opp)
-            train_c, test_c, first_c, second_c = _split(stress_curve, cutoff)
-            row[f"Train_{label}_CAGR_Pst"] = _cagr(train_c)
-            row[f"Test_{label}_CAGR_Pst"] = _cagr(test_c)
-            if label == "Stress":
-                halves = [_cagr(first_c), _cagr(second_c)]
-                row["Train_Stress_First_Half_CAGR_Pst"], row["Train_Stress_Second_Half_CAGR_Pst"] = halves
-                row["Train_Stress_Worst_Half_CAGR_Pst"] = min(halves) if all(v is not None for v in halves) else None
+        row["Transaction_Cost_Pct"] = 0.0
+        halves = [_cagr(first), _cagr(second)]
+        row["Train_First_Half_CAGR_Pst"], row["Train_Second_Half_CAGR_Pst"] = halves
         comparison.append(row)
     selected, reason, recommendation, manual_override = resolve_choice(
         comparison, os.environ.get("AKSJE_INNSIDE_VALG", ""))
@@ -274,17 +255,16 @@ def build_insider_selection(opp, logger=None, *, market=None, stats=None,
         "period_end": curves[BASELINE][-1]["Dato"] if curves[BASELINE] else None,
         "policy": {
             "minimum_training_days": MIN_TRAIN_DAYS, "minimum_new_entries": MIN_ENTRIES,
-            "minimum_tickers": MIN_TICKERS, "moderate_cost_per_side_pct": MODERATE_ONE_WAY_PCT,
-            "stress_cost_per_side_pct": STRESS_ONE_WAY_PCT,
-            "objective": "Highest worst-half training CAGR under stress; lower turnover breaks ties.",
-            "eligibility": "Positive full-training CAGR at moderate cost; minimum history/breadth met.",
-            "annualization": "Full table retains the engine's 252-trading-day convention. Training/test and cost stress use actual calendar dates (365.25 days/year).",
+            "minimum_tickers": MIN_TICKERS, "transaction_cost_per_side_pct": 0.0,
+            "objective": "Highest zero-cost training CAGR; fixed variant order breaks exact ties.",
+            "eligibility": "Finite training CAGR; minimum history, entries and ticker breadth met.",
+            "annualization": "Full table retains the engine's 252-trading-day convention. Training/test use actual calendar dates (365.25 days/year).",
         },
         "ranking_note": "Topp 3 rangeres på hele historikkens CAGR kun for sammenligning; denne rangeringen velger ikke porteføljekomponenten.",
         "limitations": [
             "En forhåndsdefinert robusthetsheuristikk er ikke bevis for MOAT eller fremtidig meravkastning.",
             "Senere testdata er holdt utenfor dette valget, men eksisterende varianter var tidligere utviklet på deler av samme historikk; testen er ikke uberørt forskning.",
-            "Kostnadsstress modellerer prosentkostnader, ikke ordrebok, markedspåvirkning eller garantert utførelse.",
+            "Handelskostnader, spread og slippage er null etter brukerens ønske; dette er simulering og garanterer ikke utførelse eller fremtidig profitt.",
             "Fullhistorisk kurve for den valgte varianten er tilbakeberegnet; et historisk porteføljeresultat basert på dette valget må begynne etter treningsslutt.",
         ],
     }

@@ -1,3 +1,5 @@
+> **Historisk dokumentasjon.** Denne grenen har rettelsene integrert i rotfilene. `RUN.cmd` starter samme `master.py` som `RUN_ALL.cmd`; importpatcher brukes ikke. Se [gjeldende README](../README.md) og [validering](../VALIDATION.md).
+
 # Rettelse 2026-09-18 — de to feilende strategiene, og datahentingen
 
 Denne mappen retter tre ting: ledelsessentimentet som stoppet på prisvalidering,

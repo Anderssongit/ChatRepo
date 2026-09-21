@@ -1,4 +1,5 @@
 from runtime_config import LazyImport, configure_paths
+from download_status import record_source
 #Only working code - 26.08.18
 
 # =========================
@@ -159,21 +160,7 @@ pytz = LazyImport('pytz')
 
 ## Hvordan installere nye packages - C:/Users/ander/Desktop/Python_K4/venv/Scripts/python.exe -m pip install pyautogui
 
-### APIS - #Vantage alpha api code - W2O0LGUOYKFKU9YJ
-### FRED API - fred = Fred(api_key='25621c83de82dbd1ad261b72b2398591') 
-# #Welcome to Alpha Vantage! Your API key is: 660IWVEEO83VJASJ. Please record this API key at a safe place for future data access.
-#TwelveData api = 230ca54246be439c8d08f99364a3a630
-# Finnage - API_KEY27TFHPNOE5HZNWCRF5UXI4JEDDDRSQ6Q
-
-#Alpacca
-## key - PKGKMXAAJ6HMEUSMUVDFKUB5YX
-## secret - 56NsvCDuLaETV4xruAaiLmSd5ddLWdXQ1UeRNrtUzJee
-
-#Alphacca keys 2 - recovery code - 6868c86b-d0a1-4814-af3c-58085e74908b 
-## key - PKGKMXAAJ6HMEUSMUVDFKU
-## secret - 56NsvCDuLaETV4xruAaiL52532
-
-#Cron - eier1charging -  56NsvCDuLaETV4xruAaiL525323232233r1
+# Credentials belong in environment variables, never in source control.
 
 # ══════════════════════════════════════════════════════════════════════════
 # APP-PASSORDET TIL MAILEN
@@ -275,7 +262,7 @@ def PBROE_All3():
         # CONFIGURATION
         # ──────────────────────────────────────────────────────
 
-        TICKER_FILE = r"C:\Users\ander\Desktop\Python_K4\ExcelData\Data_BT\AllTickers_OSEBX_TW_260428.xlsx"
+        TICKER_FILE = r"C:\Users\ander\Desktop\Python_K4\ExcelData\Data_BT\AllTickers_OSEBX_TW_current.xlsx"
         #TICKER_FILE = r"C:\Users\ander\Desktop\Python_K4\ExcelData\Data_BT\AllTickers_OSEBX_Norbit.xlsx"
 
         BASE_DIR   = r"C:\Users\ander\Desktop\Python_K4\ExcelData\DataPB_ROE"
@@ -352,7 +339,7 @@ def PBROE_All3():
             if text in (None, "N/A", "", "—", "-"):
                 return None
             try:
-                return round(float(str(text).replace(",", ".")), 4)
+                return round(float(str(text).replace("%", "").replace("\u2212", "-").replace("\u00a0", "").replace(" ", "").replace(",", ".")), 4)
             except (ValueError, TypeError):
                 return None
 
@@ -1450,6 +1437,9 @@ def PBROE_All3():
             momentum_rows = []
             all_hist_rows = []
             scraper       = make_scraper()
+            failed_tickers = []
+            record_source("pbroe_data", status="FAILED", detail="Download started; not yet validated",
+                          network_attempted=True, expected_count=len(tickers))
 
             try:
                 for i, ticker in enumerate(tickers):
@@ -1457,6 +1447,7 @@ def PBROE_All3():
                     try:
                         if not scraper.open_company(ticker, first=(i == 0)):
                             log.warning("Skipping %s (open_company failed)", ticker)
+                            failed_tickers.append(ticker)
                             continue
                         ov = scraper.scrape_overview(ticker)
                         overview_rows.append(ov)
@@ -1470,7 +1461,9 @@ def PBROE_All3():
                             save_txt(ROE_DIR, "ROE", ticker, st["ROE Number"])
                         else:
                             log.warning("Could not reach Statistics for %s", ticker)
+                            failed_tickers.append(ticker)
                     except Exception as exc:
+                        failed_tickers.append(ticker)
                         log.error("Error on %s: %s", ticker, exc)
             finally:
                 scraper.quit()
@@ -1493,7 +1486,18 @@ def PBROE_All3():
                 try:
                     save_history(all_hist_rows)
                 except Exception as exc:
-                    log.error("save_history feilet (%s) — fortsetter pipeline", exc)
+                    raise RuntimeError("PB-ROE history could not be saved") from exc
+            usable = [r for r in stats_rows if safe_float(r.get("PB Number")) is not None
+                      and safe_float(r.get("ROE Number")) is not None]
+            usable_tickers = {str(r.get("Company Name", "")) for r in usable}
+            failed_tickers = sorted(set(failed_tickers) | (set(tickers) - usable_tickers))
+            record_source("pbroe_data", status="PARTIAL" if failed_tickers or not all_hist_rows else "DOWNLOADED",
+                          detail="Fundamental observations downloaded; historical availability starts at observation date",
+                          network_attempted=True, expected_count=len(tickers), usable_count=len(usable),
+                          downloaded_count=len(usable), cached_count=0, issues=failed_tickers)
+            if failed_tickers or not all_hist_rows:
+                raise RuntimeError("PB-ROE fundamental download incomplete: " + ", ".join(failed_tickers)
+                                   + ("; no history rows" if not all_hist_rows else ""))
             for d in (PB_DIR, ROE_DIR, MCAP_DIR, IND_DIR, MOM_DIR):
                 archive_txt_files(d)
 
@@ -1664,8 +1668,11 @@ def PBROE_All3():
             if ticker not in prices.columns:
                 return None
             p = prices[ticker].dropna()
-            p = p[p.index <= dt]
-            return float(p.iloc[-1]) if not p.empty else None
+            # Orders and valuations require this session's actual observation.
+            if dt not in p.index:
+                return None
+            value = float(p.loc[dt])
+            return value if np.isfinite(value) and value > 0 else None
 
         def compute_roe_trend(roe_series: pd.Series) -> float:
             vals = roe_series.dropna().values
@@ -1689,6 +1696,8 @@ def PBROE_All3():
             if ticker not in monthly_prices.columns:
                 return None
             p = monthly_prices[ticker].dropna()
+            # The explicit skip below excludes this month's execution close.
+            # Excluding it twice would silently change 12-minus-1 momentum.
             p = p[p.index <= as_of_date]
             need = MOM_LOOKBACK_MONTHS + MOM_SKIP_MONTHS
             if len(p) < need:
@@ -1703,7 +1712,7 @@ def PBROE_All3():
             if ticker not in daily_prices.columns:
                 return None
             p = daily_prices[ticker].dropna()
-            p = p[p.index <= as_of_date]
+            p = p[p.index < as_of_date]
             if len(p) < 252:
                 if len(p) < 60:
                     return None
@@ -1720,7 +1729,7 @@ def PBROE_All3():
                 if t not in daily_prices.columns:
                     continue
                 p = daily_prices[t].dropna()
-                p = p[p.index <= as_of_date]
+                p = p[p.index < as_of_date]
                 if len(p) < 20:
                     continue
                 window = p.iloc[-vol_window:]
@@ -1733,7 +1742,7 @@ def PBROE_All3():
 
             if not vols:
                 n = len(tickers)
-                return {t: 1.0 / n for t in tickers}
+                return {t: min(1.0 / n, MAX_WEIGHT_CAP) for t in tickers} if n else {}
 
             med_vol = float(np.median(list(vols.values())))
             for t in tickers:
@@ -1744,16 +1753,14 @@ def PBROE_All3():
             total_inv = sum(inv_vols.values())
             raw_weights = {t: inv_vols[t] / total_inv for t in tickers}
 
-            capped = {t: min(w, MAX_WEIGHT_CAP) for t, w in raw_weights.items()}
-            total_capped = sum(capped.values())
-            final = {t: w / total_capped for t, w in capped.items()}
-            return final
+            from runtime_config import capped_weights
+            return capped_weights(raw_weights, MAX_WEIGHT_CAP)
 
         def check_drawdown_stop(daily_prices, ticker, as_of_date, lookback_days=126):
             if ticker not in daily_prices.columns:
                 return False
             p = daily_prices[ticker].dropna()
-            p = p[p.index <= as_of_date]
+            p = p[p.index < as_of_date]
             if len(p) < lookback_days:
                 return False
             window = p.iloc[-lookback_days:]
@@ -1770,7 +1777,7 @@ def PBROE_All3():
                 return None
             col = BENCHMARK_TICKER if BENCHMARK_TICKER in daily_prices.columns else bname
             p = daily_prices[col].dropna()
-            p = p[p.index <= as_of_date]
+            p = p[p.index < as_of_date]
             if len(p) < BENCHMARK_SMA_DAYS:
                 return None
             current = float(p.iloc[-1])
@@ -1781,7 +1788,7 @@ def PBROE_All3():
             if ticker not in daily_prices.columns:
                 return False
             p = daily_prices[ticker].dropna()
-            p = p[p.index <= as_of_date]
+            p = p[p.index < as_of_date]
             if p.empty:
                 return False
             days_since_last = (as_of_date - p.index[-1]).days
@@ -1839,12 +1846,17 @@ def PBROE_All3():
             df["period_date"] = df.apply(
                 lambda r: period_to_date(r["Period"], r["Scraped_date"]), axis=1)
             df = df[df["period_date"].notna()].copy()
-            df.sort_values("Scraped_date", inplace=True)
-            df.drop_duplicates(subset=["Company Name", "period_date"], keep="last", inplace=True)
+            # A scraped accounting period is not its publication timestamp.
+            # Keep every observed version, so later revisions cannot rewrite the past.
+            df["AvailableDate"] = df["Scraped_date"]
+            df = df.dropna(subset=["AvailableDate"])
+            df.sort_values(["AvailableDate", "period_date"], inplace=True)
+            df.drop_duplicates(subset=["Company Name", "period_date", "AvailableDate"],
+                               keep="last", inplace=True)
 
             fund = {}
             for t, g in df.groupby("Company Name"):
-                g2 = g.set_index("period_date")[["PB", "ROE"]].sort_index()
+                g2 = g.set_index("period_date")[["PB", "ROE", "AvailableDate"]].sort_index()
                 if g2["PB"].notna().any() or g2["ROE"].notna().any():
                     fund[t] = g2
             log.info("Fundamentals loaded: %d tickers", len(fund))
@@ -1856,6 +1868,7 @@ def PBROE_All3():
             start = end - timedelta(days=500 + 365 * 3)
             yft   = [t + ".OL" for t in tickers] + [BENCHMARK_TICKER]
             log.info("Downloading prices for %d tickers ...", len(tickers))
+            record_source("pbroe_prices", "FAILED", "Price download started; not yet validated", network_attempted=True)
             raw = yf.download(
                 yft,
                 start=start.strftime("%Y-%m-%d"),
@@ -1871,9 +1884,13 @@ def PBROE_All3():
             daily.rename(columns={t + ".OL": t for t in tickers}, inplace=True)
             daily.index = pd.to_datetime(daily.index)
             daily.sort_index(inplace=True)
-            monthly = daily.resample("ME").last()
-            monthly.sort_index(inplace=True)
-            log.info("Daily: %d rows | Monthly: %d rows", len(daily), len(monthly))
+            from runtime_config import validate_price_frame, observed_month_ends
+            validate_price_frame(daily, tickers + [BENCHMARK_TICKER], "PB-ROE prices")
+            record_source("pbroe_prices", "DOWNLOADED", "All required PB-ROE and benchmark prices validated",
+                          network_attempted=True, expected_count=len(yft), usable_count=len(yft),
+                          downloaded_count=len(yft), latest_observation=str(daily.index.max().date()))
+            monthly = observed_month_ends(daily, end)
+            log.info("Daily: %d rows | Completed monthly sessions: %d rows", len(daily), len(monthly))
             return daily, monthly
 
         # =========================================================================
@@ -1894,8 +1911,8 @@ def PBROE_All3():
                 if t.upper() in growth_excl:
                     continue
 
-                ff = fund[t]
-                ff = ff[ff.index < dt]
+                from runtime_config import historical_fundamentals
+                ff = historical_fundamentals(fund[t], dt)
                 if ff.empty:
                     continue
 
@@ -2075,7 +2092,9 @@ def PBROE_All3():
 
         all_dates = []
         for f in fund.values():
-            all_dates.extend(f.index.tolist())
+            all_dates.extend(pd.to_datetime(f["AvailableDate"]).tolist())
+        if not all_dates:
+            raise RuntimeError("PB-ROE has no dated observed fundamentals.")
         bt_start = min(all_dates)
         bt_end   = pd.Timestamp(TODAY_STR)
 
@@ -2086,9 +2105,13 @@ def PBROE_All3():
                 (monthly.index.year  == dt.year) &
                 (monthly.index.month == dt.month)
             ]
-            if len(idx) > 0:
+            if len(idx) > 0 and idx[0] > bt_start:
                 rdates.append(idx[0])
             dt += pd.offsets.MonthBegin(1)
+        if not rdates:
+            raise RuntimeError("PB-ROE: no completed monthly execution session after the first "
+                               "observed fundamentals. Historical publication dates cannot "
+                               "be inferred from today's scraped ratios.")
         log.info("Rebalance dates: %d", len(rdates))
 
         bn = pd.Series(dtype=float)
@@ -2108,6 +2131,10 @@ def PBROE_All3():
         stop_log      = []
 
         for rebal_dt in rdates:
+            missing_held = [t for t in holdings if price_at(monthly, t, rebal_dt) is None]
+            if missing_held:
+                raise RuntimeError("PB-ROE held prices missing on " + str(rebal_dt.date())
+                                   + ": " + ", ".join(missing_held))
 
             # ── Seasonal filter: hold cash i September ────────────────────────────
             if AVOID_SEPTEMBER and rebal_dt.month == 9:
@@ -2175,9 +2202,18 @@ def PBROE_All3():
 
             target_tickers, sel_df = select_at(
                 fund, ind_map, growth_excl, monthly, daily, tickers, rebal_dt)
+            target_tickers = [t for t in target_tickers
+                              if t not in stopped_out and price_at(monthly, t, rebal_dt) is not None]
 
             if not target_tickers:
-                equity_curve.append({"date": rebal_dt, "value": pv_before})
+                for tkr in list(holdings):
+                    p = price_at(monthly, tkr, rebal_dt)
+                    proceeds = holdings.pop(tkr) * p
+                    cash += proceeds
+                    trade_log.append({"date": rebal_dt.strftime("%Y-%m-%d"),
+                                      "ticker": tkr, "action": "SELL_NO_SIGNAL",
+                                      "price": p, "value": proceeds})
+                equity_curve.append({"date": rebal_dt, "value": cash})
                 monthly_log.append({
                     "date": rebal_dt.strftime("%Y-%m"), "portfolio_value": round(pv_before, 0),
                     "cash": round(cash, 0), "n_holdings": len(holdings),
@@ -2209,11 +2245,14 @@ def PBROE_All3():
 
             weights = compute_inv_vol_weights(daily, target_tickers, rebal_dt)
 
+            # Reduce positions before funding buys; no borrowing or negative cash.
+            target_tickers = sorted(target_tickers, key=lambda t:
+                investable * weights.get(t, 0) - holdings.get(t, 0) * price_at(monthly, t, rebal_dt))
             for tkr in target_tickers:
                 p = price_at(monthly, tkr, rebal_dt)
                 if not p or p <= 0:
                     continue
-                w  = weights.get(tkr, 1.0 / len(target_tickers))
+                w  = weights.get(tkr, 0.0)
                 tv = investable * w
                 cs = holdings.get(tkr, 0)
                 ts = tv / p
@@ -2223,8 +2262,11 @@ def PBROE_All3():
                     continue
 
                 if diff > 0:
+                    diff = min(diff, max(0.0, cash) / p)
+                    if diff * p < 1:
+                        continue
                     cost = diff * p
-                    txn  = cost * BT_TRANSACTION_COST
+                    txn  = 0.0
                     cash -= cost + txn
                     holdings[tkr] = cs + diff
                     action = "BUY" if tkr in buys_set else "REBAL_BUY"
@@ -3045,7 +3087,7 @@ def SentimentManagement():
         class Config:
             base_dir: Path          = Path(r"C:\Users\ander\Desktop\Python_K4\ExcelData")
             #tickers_file: str       = r"Data_BT\AllTickers_OSEBX_.xlsx"
-            tickers_file: str       = r"Data_BT\AllTickers_OSEBX_TW_260428.xlsx"
+            tickers_file: str       = r"Data_BT\AllTickers_OSEBX_TW_current.xlsx"
             nlp_output_dir: str     = "DataNLP"
             working_data_dir: str   = r"DataNLP\WorkingData"
             screenshots_dir: str    = r"DataNLP\Screenshots"
@@ -3313,7 +3355,7 @@ def SentimentManagement():
             path = config.tickers_path
             if not path.exists():
                 log.error(f"Fil ikke funnet: {path}")
-                sys.exit(1)
+                raise FileNotFoundError(path)
             df = pd.read_excel(path)
             #df = df.loc[:, ~df.columns.str.contains("^Unnamed")]
             df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", na=False)]
@@ -4217,7 +4259,7 @@ def SentimentManagement():
             def analyze(self, text: str) -> dict:
                 default = {"positive": 0.33, "neutral": 0.34, "negative": 0.33}
                 if not self.pipe or not text or len(text) < 50:
-                    return default
+                    raise RuntimeError("Article text/model unavailable; no sentiment score was produced")
                 try:
                     import nltk
                     try:
@@ -4246,12 +4288,13 @@ def SentimentManagement():
                                     if lbl in scores:
                                         scores[lbl] += r["score"]
                                         n += 1
-                                except Exception:
-                                    continue
-                    return {k: v / n for k, v in scores.items()} if n else default
+                                except Exception as exc:
+                                    raise RuntimeError("FinBERT sentence scoring failed") from exc
+                    if not n:
+                        raise RuntimeError("FinBERT returned no recognised scores")
+                    return {k: v / n for k, v in scores.items()}
                 except Exception as e:
-                    log.error(f"Sentimentfeil: {e}")
-                    return default
+                    raise RuntimeError("Sentiment scoring failed") from e
 
 
         # ─────────────────────────────────────────────────────────────────────────────
@@ -4544,7 +4587,7 @@ def SentimentManagement():
             base_dir: Path = Path(r"C:\Users\ander\Desktop\Python_K4\ExcelData")
             nlp_output_dir: str = "DataNLP"
             #tickers_file: str = r"Data_BT\AllTickers_OSEBX_.xlsx"
-            tickers_file: str = r"Data_BT\AllTickers_OSEBX_TW_260428.xlsx"
+            tickers_file: str = r"Data_BT\AllTickers_OSEBX_TW_current.xlsx"
             output_dir: str = "StrategyResults_v4_Sentiment"
 
             # ── Portfolio ──
@@ -5580,7 +5623,7 @@ def SentimentManagement():
         @dataclass
         class Config:
             base_dir: Path          = Path(r"C:\Users\ander\Desktop\Python_K4\ExcelData")
-            tickers_file: str       = r"Data_BT\AllTickers_OSEBX_TW_260428.xlsx"
+            tickers_file: str       = r"Data_BT\AllTickers_OSEBX_TW_current.xlsx"
             nlp_output_dir: str     = "DataNLP"
             working_data_dir: str   = r"DataNLP\WorkingData"
             screenshots_dir: str    = r"DataNLP\Screenshots"
@@ -5591,8 +5634,8 @@ def SentimentManagement():
             euronext_base: str      = "https://live.euronext.com"
 
             # ── DEEP HISTORY ──
-            max_articles_per_company: int = 100   # was 10
-            max_pages: int          = 15          # paginering safety cap (~150 articles max)
+            max_articles_per_company: int = 10000  # explicit safety limit; reaching it fails
+            max_pages: int          = 1000        # explicit safety limit; reaching it fails
 
             # ── TOPIC FILTER MODE ──
             # "minimal"       = original: Halvårsdata + Årsrapporter (~4/yr)
@@ -5850,7 +5893,7 @@ def SentimentManagement():
             path = config.tickers_path
             if not path.exists():
                 log.error(f"Fil ikke funnet: {path}")
-                sys.exit(1)
+                raise FileNotFoundError(path)
             df = pd.read_excel(path)
             df = df.loc[:, ~df.columns.astype(str).str.contains("^Unnamed", na=False)]
 
@@ -6412,8 +6455,7 @@ def SentimentManagement():
                 sl.info(f"  Side {page_num}: {len(rows)} rader, {new_count} nye → totalt {len(all_rows)}")
 
                 if len(all_rows) >= config.max_articles_per_company:
-                    sl.info(f"  Nådd max_articles_per_company ({config.max_articles_per_company})")
-                    break
+                    raise RuntimeError("Article safety limit reached; collection is incomplete")
 
                 if new_count == 0:
                     raise RuntimeError("Repeated or unreadable management result page")
@@ -6430,7 +6472,9 @@ def SentimentManagement():
                     pass
                 await page.wait_for_timeout(1_500)
 
-            return all_rows[:config.max_articles_per_company]
+            if page_num >= config.max_pages and next_clicked:
+                raise RuntimeError("Page safety limit reached; collection is incomplete")
+            return all_rows
 
 
         # ─────────────────────────────────────────────────────────────────────────────
@@ -6893,7 +6937,7 @@ def SentimentManagement():
             def analyze(self, text: str) -> dict:
                 default = {"positive": 0.33, "neutral": 0.34, "negative": 0.33}
                 if not self.pipe or not text or len(text) < 50:
-                    return default
+                    raise RuntimeError("Article text/model unavailable; no sentiment score was produced")
                 try:
                     import nltk
                     try:
@@ -6922,12 +6966,13 @@ def SentimentManagement():
                                     if lbl in scores:
                                         scores[lbl] += r["score"]
                                         n += 1
-                                except Exception:
-                                    continue
-                    return {k: v / n for k, v in scores.items()} if n else default
+                                except Exception as exc:
+                                    raise RuntimeError("FinBERT sentence scoring failed") from exc
+                    if not n:
+                        raise RuntimeError("FinBERT returned no recognised scores")
+                    return {k: v / n for k, v in scores.items()}
                 except Exception as e:
-                    log.error(f"Sentimentfeil: {e}")
-                    return default
+                    raise RuntimeError("Sentiment scoring failed") from e
 
 
         # ─────────────────────────────────────────────────────────────────────────────
@@ -7021,9 +7066,10 @@ def SentimentManagement():
             # STEG A: Last selskaper
             print(f"\n📋 STEG A: Laster selskaper fra Excel...")
             companies = load_companies(config)
+            record_source("articles", status="FAILED", detail="Article collection started; not yet validated",
+                          network_attempted=False, expected_count=len(companies))
             if not companies:
-                print("   ❌ Ingen selskaper funnet.")
-                return
+                raise RuntimeError("No companies available for the management scraper")
             print(f"   ✅ STEG A FERDIG: {len(companies)} selskaper lastet")
             for i, c in enumerate(companies[:5], 1):
                 print(f"      [{i}] {c}")
@@ -7036,7 +7082,7 @@ def SentimentManagement():
             if analyzer.pipe:
                 print(f"   ✅ STEG B FERDIG: FinBERT klar")
             else:
-                print(f"   ❌ STEG B FEILET: FinBERT ikke tilgjengelig — fortsetter med default-scorer")
+                raise RuntimeError("FinBERT model unavailable; default sentiment scores are not valid data")
 
             # STEG C: Checkpoint
             print(f"\n📂 STEG C: Sjekker checkpoint...")
@@ -7063,12 +7109,17 @@ def SentimentManagement():
             print(f"   ✅ STEG C FERDIG: {len(remaining)} selskaper gjenstår")
 
             if len(remaining) == 0:
+                record_source("articles", status="CACHED", detail="Same-day checkpoint reused; no source fetched",
+                              network_attempted=False, expected_count=len(companies),
+                              cached_count=len(done), usable_count=len(all_results))
                 print(f"\n   ⚠️  Ingen selskaper å behandle!")
                 print(f"   Tips: Sett config.force_rerun = True for å kjøre på nytt,")
                 print(f"         eller slett checkpoint-filen manuelt:")
                 print(f"         {config.work_dir / f'checkpoint_{today}.csv'}")
                 return
 
+            record_source("articles", status="FAILED", detail="Fetching announcement pages",
+                          network_attempted=True, expected_count=len(companies), cached_count=len(done))
             # STEG D: Start Playwright
             print(f"\n🌐 STEG D: Starter nettleserskraping...")
             print(f"   Synlig nettleser:        {not config.headless}")
@@ -7200,6 +7251,12 @@ def SentimentManagement():
             print("✅ STEG E: SCRAPING FERDIG — LAGRER ENDELIGE RESULTATER")
             print(f"{'='*80}")
             save_results(all_results, config, today, final=not failed_companies)
+            record_source("articles", status=("PARTIAL" if failed_companies or done else "DOWNLOADED"),
+                          detail="Management announcement pages and FinBERT results processed",
+                          network_attempted=True, expected_count=len(companies),
+                          usable_count=len(companies) - len(failed_companies),
+                          downloaded_count=len(remaining) - len(failed_companies), cached_count=len(done),
+                          issues=sorted(failed_companies))
             if failed_companies:
                 raise RuntimeError("Management download incomplete: " + ", ".join(failed_companies))
 
@@ -7257,7 +7314,7 @@ def SentimentManagement():
             base_dir: Path = Path(r"C:\Users\ander\Desktop\Python_K4\ExcelData")
             nlp_output_dir: str = "DataNLP"
             working_data_dir: str = r"DataNLP\WorkingData"   # FIX 3: where article bodies live
-            tickers_file: str = r"Data_BT\AllTickers_OSEBX_TW_260428.xlsx"
+            tickers_file: str = r"Data_BT\AllTickers_OSEBX_TW_current.xlsx"
             output_dir: str = "StrategyResults_v4_Sentiment"
 
             # ── Portfolio ──
@@ -8523,6 +8580,9 @@ def SentimentMomentumV31():
             price_df = pd.read_excel(price_files[0])
             price_df['Date'] = pd.to_datetime(price_df['Date'], errors='coerce')
             price_df = price_df.dropna(subset=['Date', 'Close'])
+            from runtime_config import validate_price_frame
+            validate_price_frame(price_df.pivot_table(index='Date', columns='Ticker', values='Close'),
+                                 context="Sentiment momentum prices")
             print(f"✅ Priser:    {price_files[0].name} "
                   f"({price_df['Company'].nunique()} selskaper, "
                   f"{price_df['Date'].min().date()} → {price_df['Date'].max().date()})")
@@ -8761,7 +8821,7 @@ def SentimentMomentumV31():
         def __init__(self, capital, transaction_cost):
             self.cash = capital
             self._start = capital
-            self.tc = transaction_cost
+            self.tc = 0.0  # User-requested zero commission, spread and slippage.
             self.positions: Dict[str, dict] = {}
             self.trades: List[dict] = []
             self.history: List[dict] = []
@@ -8889,9 +8949,10 @@ def SentimentMomentumV31():
                 if not px:
                     continue
                 held = (date - pos['buy_date']).days
-                ret = px / pos['buy_price'] - 1.0
+                previous = pos['last_price']
+                ret = previous / pos['buy_price'] - 1.0
                 peak_gain = pos.get('peak_price', px) / pos['buy_price'] - 1.0
-                from_peak = px / pos.get('peak_price', px) - 1.0
+                from_peak = previous / pos.get('peak_price', previous) - 1.0
 
                 if ret <= c.stop_loss_pct:
                     self.port.sell(t, px, date, f"Stop {ret*100:.1f}%")
@@ -8930,14 +8991,20 @@ def SentimentMomentumV31():
 
             rebal_count = 0
 
+            stale_counts = {}
             for date in trading_days:
                 prices = self.book.prices_on(date)
+                for ticker in self.port.positions:
+                    stale_counts[ticker] = 0 if ticker in prices else stale_counts.get(ticker, 0) + 1
+                    if stale_counts[ticker] > 5:
+                        raise RuntimeError("Sentiment momentum held price missing for more than five sessions: " + ticker)
                 if not prices:
                     continue
 
-                self.port.mark(prices)
+                # Execute yesterday's price-based exit decisions at today's actual close.
                 if not DIAGNOSE_ONLY:
                     self._handle_exits(prices, date)
+                self.port.mark(prices)
 
                 regime = self.book.regime_ok(date) if c.use_regime else True
                 sig = self.engine.build(self.sent_df, date)
@@ -10219,8 +10286,10 @@ def SentimentHendelseLab(skriv_master: bool = True):
 
     def hent_kurser(tickere: List[str]) -> MarkedsData:
         log.info("Kurser   : laster ned %d tickere …", len(tickere))
+        record_source("management_prices", status="FAILED", detail="Price download started; not validated",
+                      network_attempted=True, expected_count=len(tickere))
         data = yf.download(tickere, start="2019-01-01", auto_adjust=True,
-                           repair=True, progress=False)
+                           repair=False, progress=False, end=datetime.now().strftime("%Y-%m-%d"))
         if data.empty:
             raise RuntimeError("yfinance ga ingen data.")
 
@@ -10243,6 +10312,13 @@ def SentimentHendelseLab(skriv_master: bool = True):
         if close.empty:
             raise RuntimeError("yfinance ga ingen Close-data.")
 
+        from runtime_config import validate_price_frame
+        missing = [t for t in tickere if t not in close.columns or close[t].dropna().empty]
+        record_source("management_prices", status="PARTIAL", detail="Validating downloaded prices",
+                      network_attempted=True, expected_count=len(tickere),
+                      usable_count=len(tickere) - len(missing), downloaded_count=len(tickere) - len(missing),
+                      cached_count=0, issues=missing)
+        validate_price_frame(close, tickere, "Management prices")
         gode = [c for c in close.columns if close[c].notna().any()]
         close = close[gode].copy()
         high = high.reindex(index=close.index, columns=gode)
@@ -10258,10 +10334,14 @@ def SentimentHendelseLab(skriv_master: bool = True):
         if not issues.empty:
             examples = ", ".join(issues["ticker"].drop_duplicates().head(8))
             raise RuntimeError(
-                "Management prices require verification after provider repair: "
+                "Management prices require source verification: "
                 + examples + ". See management_price_issues.csv. No backtest or variant "
                 "is published from these prices; prices were not clipped or guessed.")
 
+        record_source("management_prices", status="DOWNLOADED", detail="All requested price series validated",
+                      network_attempted=True, expected_count=len(tickere), usable_count=len(gode),
+                      downloaded_count=len(gode), cached_count=0,
+                      latest_observation=str(close.index.max().date()))
         # ATR20 = gjennomsnittlig True Range. Vi bruker den til volatilitetstilpassede
         # stoppnivåer, men selve exit-signalet er close-basert for å unngå antakelser
         # om intradag-fill og gaps.

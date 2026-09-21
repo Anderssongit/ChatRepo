@@ -52,14 +52,11 @@ def _insider_section(opp, insider):
     compared = {r.get('Variant') or r.get('Strategi'): r
                 for r in selection.get('top3', [])}
     compared[selected] = selection
-    cost_table = _table(
-        ['Variant','Trening: 0,15 % per side','Senere: 0,15 % per side',
-         'Trening: 0,80 % per side','Svakeste treningshalvdel: 0,80 %'],
+    comparison_table = _table(
+        ['Variant', 'Trening: CAGR, 0 % kostnad', 'Senere: CAGR, 0 % kostnad'],
         [[ip.trygg(r.get('Strategi')),
-          _number(compared.get(r.get('Strategi'),{}).get('Train_Moderate_CAGR_Pst'),1,' %'),
-          _number(compared.get(r.get('Strategi'),{}).get('Test_Moderate_CAGR_Pst'),1,' %'),
-          _number(compared.get(r.get('Strategi'),{}).get('Train_Stress_CAGR_Pst'),1,' %'),
-          _number(compared.get(r.get('Strategi'),{}).get('Train_Stress_Worst_Half_CAGR_Pst'),1,' %')]
+          _number(compared.get(r.get('Strategi'), {}).get('Train_CAGR_Pst'), 1, ' %'),
+          _number(compared.get(r.get('Strategi'), {}).get('Test_CAGR_Pst'), 1, ' %')]
          for r in displayed])
     detail = ''
     for r in displayed:
@@ -81,13 +78,12 @@ def _insider_section(opp, insider):
           _number(r.get('Verdi_NOK'),0)] for r in last])
     date = holdings[0].get('Dato','') if holdings else insider['maal'].get('Periode','')
     return f'''<div class="kort"><h2>Innsidehandel: topp tre og valgt variant</h2>
-<p>Rangeringen viser høyest historisk CAGR før den ekstra kostnadstesten.
-Valget videre vurderer robusthet i den tidligere treningsperioden.
-En høy plassering er ikke dokumentasjon på en varig konkurransefordel («MOAT»).</p>
-{headline}<h3>Kostnadstest: CAGR etter modellerte kostnader</h3>
-<p>Variantene kjøres på nytt med 0,15 % og 0,80 % kostnad per kjøp eller salg.
-Dette er antakelser, ikke observerte utførelseskostnader. Tallene annualiseres etter
-kalendertid; hovedtabellen beholder innsidermotorens 252 handelsdager per år.</p>{cost_table}
+<p>Rangeringen viser høyest historisk CAGR med 0 % handelskostnad.
+Valget videre bruker bare den tidligere treningsperioden og krav til historikk og handler.
+En høy plassering dokumenterer ikke en varig konkurransefordel.</p>
+{headline}<h3>Trening og senere evaluering — uten handelskostnader</h3>
+<p>Ingen kurtasje, spread eller glidning trekkes fra. Dette er en forenkling;
+simuleringens priser er ikke garanterte utførelsespriser.</p>{comparison_table}
 <h3>Valgt til de 25 % i samlet portefølje: {ip.trygg(selected)}</h3>
 <p>{ip.trygg(why)}</p>
 <p>Trening til {ip.trygg(selection.get('Selection_Cutoff','—'))}: {training} CAGR.
@@ -96,8 +92,10 @@ Senere periode: {heldout} CAGR. Den senere perioden brukes ikke til å velge var
 <h3>Siste ti handler for valgt variant</h3>{trades}</div>'''
 
 
-def render_capital_mail(m, run_status, portfolio, sections, insider, errors=()):
+def render_capital_mail(m, run_status, portfolio, sections, insider, errors=(), download_rows=None):
     """Portfolio is the calculation result; sections contain individual model cards."""
+    from download_status import render_download_summary, strategy_rows
+    download_header = render_download_summary(strategy_rows() if download_rows is None else download_rows)
     problems = list(dict.fromkeys(str(x) for x in errors if x))
     warnings = list((portfolio or {}).get('warnings', []))
     metrics = (portfolio or {}).get('metrics', {})
@@ -136,7 +134,7 @@ faktiske delporteføljene over samme observerte periode. Ingen ny aksjeliste lag
 ('Kontanter','Når en strategi går i kontanter, blir pengene i den strategiens del. De flyttes ikke automatisk til de andre.'),
 ('Avkastning','Ved månedlig justering er hver måneds samlede avkastning gjennomsnittet av de fire månedsavkastningene. Månedene forrentes deretter etter hverandre. CAGR er beregnet fra denne samlede kurven.'),
 ('Sammenligning','Bare fullførte måneder med observerte verdier for alle fire brukes. Daglige PB-ROE-verdier blir ikke funnet på. Risiko er derfor målt på månedspunkter og kan undervurdere fall innenfor måneden.'),
-('Innsidevalg','De 25 % til innsidehandel følger den dokumenterte robusthetsvurderingen nedenfor, ikke et gjennomsnitt av alle innsidevariantene.')])}
+('Innsidevalg','De 25 % til innsidehandel følger det dokumenterte variantvalget på treningsdata nedenfor, ikke et gjennomsnitt av alle innsidevariantene.')])}
 <h3>De fire delene, målt over samme periode</h3>{comparison}
 <h3>Kapital ved slutten av den felles perioden</h3>{holdings}
 <h3>Siste justeringer mellom strategiene</h3><p>Dette er kapitaloverføringer mellom
@@ -147,8 +145,14 @@ delporteføljene. Aksjehandlene står i hver strategis egen rapport.</p>{transfe
         main += '<div class="kort"><h3>Perioder og datagrunnlag</h3><ul>'+''.join(
             '<li>'+ip.trygg(x)+'</li>' for x in warnings)+'</ul></div>'
     cards = sections.get('kort',{})
+    bad_downloads = {row['strategy'] for row in (download_rows or [])
+                     if row.get('status') not in ('DOWNLOADED', 'CACHED')}
     def card(name):
-        html = cards.get(name,'')
+        html = cards.get(name, '')
+        if name in bad_downloads:
+            html = ('<p><strong>Datagrunnlaget ble ikke bekreftet i denne kjøringen. '
+                    'Eventuelle lagrede resultater nedenfor er historiske og skal ikke '
+                    'tolkes som nye kjøps- eller salgsanbefalinger.</strong></p>') + html
         return '<div class="strategier">'+html+'</div>' if html else ''
     detail = (card('PB-ROE-Momentum') + _insider_section(m.insider_oppsett(),insider)
               + card('NLP Sentiment — ledelse') + card('Sentiment Momentum v3.1'))
@@ -157,13 +161,14 @@ delporteføljene. Aksjehandlene står i hver strategis egen rapport.</p>{transfe
                    _number(r.get('Minutter'),1),ip.trygg(r.get('Feil'))] for r in run_status])
     return f'''<!doctype html><html lang="nb"><head><meta charset="utf-8"><style>
 {ip.EPOST_STIL}{sections.get('stil','')} table td{{vertical-align:top;}}</style></head>
-<body><div class="beholder"><div class="topp"><h1>Fire strategier med 25 % kapital hver</h1>
+<body><div class="beholder">{download_header}<div class="topp"><h1>Fire strategier med 25 % kapital hver</h1>
 <p>Bygget {datetime.now():%Y-%m-%d %H:%M}</p></div>{status}{main}
 <div class="kort"><h2>Enkeltstrategiene og deres handelsregler</h2><p>Detaljene under
 viser hver strategis egen historikk og siste registrerte beholdning. Datoene kan være
 nyere eller eldre enn den felles perioden over. Alle tall gjelder simulert handel.</p></div>
 {detail}<div class="kort"><h2>Kjøringen</h2>{runs}</div>
 {sections.get('ekstra','')}<div class="fot"><p>Historisk avkastning dokumenterer ikke
-fremtidig avkastning. Opprinnelige kostnadsforutsetninger beholdes i modellkurvene;
-ekstra kapitaljusteringer har ikke modellerte handelskostnader. Innsidevariantene har en separat kostnadstest.</p></div>
+fremtidig avkastning. Alle fire strategier og kapitaljusteringer bruker 0 % handelskostnader.
+Handler er simulert; programmet sender ingen ordre til en megler. Likviditet,
+prisgrunnlag og tilgjengelig historikk kan begrense hva som er mulig i praksis.</p></div>
 </div></body></html>'''

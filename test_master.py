@@ -18,7 +18,7 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import innsidehandel_pipeline as IP
 import master as M
@@ -494,10 +494,7 @@ class ÉnAvsender(unittest.TestCase):
         pandas, som ikke trengs for å svare på dette.
         """
         import re
-        kilde = (Path(M.__file__).resolve().parent / "mail" /
-                 "mail_strategier.py")
-        if not kilde.exists():
-            self.skipTest("mail_strategier.py er ikke med i denne utsjekken")
+        kilde = Path(M.__file__).resolve().parent / "mail_strategier.py"
         mal = re.search(r'STIL_MAL = """(.*?)"""',
                         kilde.read_text(encoding="utf-8"), re.S).group(1)
 

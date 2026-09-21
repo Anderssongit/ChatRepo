@@ -15,7 +15,7 @@ import unittest
 from datetime import date, timedelta
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import innsidehandel_pipeline as P
 
@@ -373,19 +373,24 @@ MODAL = """<div class="modal fade" id="CompanyPressRelease-%(nid)s">
 
 # Euronext fyller modalen med JavaScript når du klikker. Uten dette skriptet
 # er testsida en tro kopi av den ekte: tom modal, tom href.
+MELDING_HTML = """<div class="pr"><h1>Mandatory notification of trade</h1>
+<table><tr><th>Nature of transaction</th><td>Purchase of shares</td></tr>
+<tr><th>Volume</th><td>4 500</td></tr><tr><th>Price</th><td>NOK 88.20</td></tr>
+<tr><th>Position</th><td>Chief Executive Officer</td></tr></table>
+<p>Node {nid}. This information is subject to the disclosure
+requirements pursuant to the Market Abuse Regulation.</p></div>"""
+
 KLIKK_JS = """
 document.querySelectorAll('a[data-node-nid]').forEach(function (a) {
   a.addEventListener('click', function (e) {
     e.preventDefault();
     var nid = a.getAttribute('data-node-nid');
-    fetch('/nb/ajax/press-release/' + nid).catch(function () {});
-    var d = document.querySelector('#CompanyPressRelease-' + nid + ' .modal-body');
-    if (d) d.innerHTML = '<div class="pr"><h1>' + a.textContent.trim() +
-      '</h1><table><tr><th>Nature of transaction</th><td>Purchase of shares</td></tr>' +
-      '<tr><th>Volume</th><td>4 500</td></tr><tr><th>Price</th><td>NOK 88.20</td></tr>' +
-      '<tr><th>Position</th><td>Chief Executive Officer</td></tr></table>' +
-      '<p>Node ' + nid + '. This information is subject to the disclosure ' +
-      'requirements pursuant to the Market Abuse Regulation.</p></div>';
+    fetch('/nb/ajax/press-release/' + nid).then(function (response) {
+      return response.text();
+    }).then(function (html) {
+      var d = document.querySelector('#CompanyPressRelease-' + nid + ' .modal-body');
+      if (d) d.innerHTML = html;
+    });
   });
 });
 """
@@ -466,7 +471,50 @@ class Steg1Uttrekk(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.mappe = Path(self.tmp.name)
-        (self.mappe / "liste.html").write_text(_listeside(), encoding="utf-8")
+        # A file:// page cannot make this relative HTTP fetch. Serve a real
+        # loopback response so the browser's request listener learns an endpoint
+        # only when the modal content actually arrived from it. No remote access.
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from threading import Thread
+
+        self.requests = []
+        received = self.requests
+
+        class FixtureHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                if self.path == "/liste.html":
+                    body = _listeside()
+                elif self.path.startswith("/nb/ajax/press-release/"):
+                    nid = self.path.rsplit("/", 1)[-1]
+                    if not nid.isdigit():
+                        self.send_error(404)
+                        return
+                    body = MELDING_HTML.format(nid=nid)
+                else:
+                    self.send_error(404)
+                    return
+                payload = body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), FixtureHandler)
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def close_server():
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.addCleanup(close_server)
+        self.fixture_origin = f"http://127.0.0.1:{server.server_port}"
 
     def test_node_id_ut_av_tabellen_og_melding_ut_av_modalen(self):
         # PW_CHROME lar deg peke på en Chromium som ligger et annet sted.
@@ -476,10 +524,10 @@ class Steg1Uttrekk(unittest.TestCase):
         logg = P.stillelogger()
         try:
             with P.Nettleser(opp, logg) as nl:
-                nl.page.goto((self.mappe / "liste.html").as_uri(),
+                nl.page.goto(self.fixture_origin + "/liste.html",
                              wait_until="domcontentloaded")
                 klient = P.Euronext(nl, opp, logg)
-                rader = klient._les_tabell("https://live.euronext.com/nb/listview/x")
+                rader = klient._les_tabell(self.fixture_origin + "/liste.html")
                 self.assertEqual(len(rader), 5)
                 self.assertEqual([r["nid"] for r in rader],
                                  [str(12900000 + i) for i in range(5)])
@@ -494,6 +542,13 @@ class Steg1Uttrekk(unittest.TestCase):
                 # Første melding lærer opp resten: adressen leses av trafikken
                 self.assertIn("{nid}", klient.mal)
                 self.assertIn("12900000", klient.mal.format(nid="12900000"))
+                self.assertEqual(klient.mal, self.fixture_origin + "/nb/ajax/press-release/{nid}")
+                second = klient.hent_melding(rader[1])
+                self.assertIn("Node 12900001", second)
+                self.assertEqual(klient.via_klikk, 1)
+                self.assertEqual(klient.via_url, 1)
+                self.assertIn("/nb/ajax/press-release/12900000", self.requests)
+                self.assertIn("/nb/ajax/press-release/12900001", self.requests)
 
                 u = P.les_melding(rader[0]["tittel"],
                                   P.uten_sidemal(P.les_side(html)[1], set(), 50))
@@ -677,7 +732,7 @@ class Mailen(unittest.TestCase):
         self.assertEqual(self.opp.les_passord(), "abcd efgh ijkl mnop")
 
     def test_ingen_hemmeligheter_i_kildefilen(self):
-        kilde = (Path(__file__).resolve().parent.parent /
+        kilde = (Path(__file__).resolve().parent /
                  "innsidehandel_pipeline.py").read_text(encoding="utf-8")
         self.assertEqual(P.Oppsett(base_dir=Path(".")).epost_passord, "")
         self.assertNotIn("cotm fppr", kilde)

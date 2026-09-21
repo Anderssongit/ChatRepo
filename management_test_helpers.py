@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
-KILDE = Path(__file__).resolve().parents[1] / "Only_260820.py"
+KILDE = Path(__file__).resolve().parent / "Only_260820.py"
 
 def _hent():
     """

@@ -3679,7 +3679,7 @@ def rydd_gammelt_format(opp: Oppsett, lagret: Dict[str, Rad],
     return kastet
 
 
-def steg1_nedlasting(opp: Oppsett, logger: logging.Logger, kun: str = "",
+def _steg1_nedlasting_impl(opp: Oppsett, logger: logging.Logger, kun: str = "",
                      aksjeliste: str = "", fersk_liste: bool = False) -> Dict[str, Any]:
     """
     Henter artiklene. Returnerer en oppsummering til statustavlen.
@@ -3849,6 +3849,9 @@ def steg1_nedlasting(opp: Oppsett, logger: logging.Logger, kun: str = "",
 
     status = "OK" if feil == 0 else "DELVIS"
     return {"status": status, "artikler": len(lagret), "nye": nye,
+            "expected_count": len(selskaper), "usable_count": len(selskaper) - feil,
+            "downloaded_count": len(selskaper) - ajour - feil, "cached_count": ajour,
+            "network_attempted": True,
             "feil": feil, "uten_html": uten_html, "ajour": ajour,
             "detaljer": f"{len(lagret)} artikler på disk ({nye} nye"
                         + (f", {ajour} selskaper ajour" if ajour else "")
@@ -5447,7 +5450,7 @@ def finn_tickere(opp: Oppsett, logger: logging.Logger, alle: bool = False) -> Li
                    if t and " " not in t and len(t) <= 14})
 
 
-def steg4_kurser(opp: Oppsett, logger: logging.Logger,
+def _steg4_kurser_impl(opp: Oppsett, logger: logging.Logger,
                  alle: bool = False) -> Dict[str, Any]:
     """Henter kurser og volum, bygger børskalenderen og velger referanse."""
     opp.lag_mapper()
@@ -5492,12 +5495,26 @@ def steg4_kurser(opp: Oppsett, logger: logging.Logger,
     if kilde == "likevekt":
         logger.warning("   ⚠️  Husk: referansen er en likevektet reserve, ikke børsen.")
 
-    feilet = len(hentet.get("feilet", []))
+    invalid = []
+    for ticker in tickere:
+        series = bok.serier.get(rens(ticker).upper(), {})
+        points = sorted((d, v.get("adjclose")) for d, v in series.items() if d < i_dag)
+        positive = [(d, float(v)) for d, v in points if v is not None and math.isfinite(float(v)) and float(v) > 0]
+        if not positive or (i_dag - positive[-1][0]).days > 5 or len(positive) != len(points):
+            invalid.append(ticker)
+        elif any(b / a >= 5 or b / a <= .2 for (_, a), (_, b) in zip(positive, positive[1:])):
+            invalid.append(ticker)
+    hentet["feilet"] = sorted(set(hentet.get("feilet", [])) | set(invalid))
+    feilet = len(hentet["feilet"])
     if hentet.get("stoppet"):
         return {"status": "FEIL", "tickere": len(bok.serier), "feilet": feilet,
                 "detaljer": hentet["stoppet"]}
-    status = "OK" if feilet <= max(3, len(tickere) * 0.1) else "DELVIS"
+    status = "OK" if feilet == 0 else "DELVIS"
     return {"status": status, "tickere": len(bok.serier), "handledager": len(dager),
+            "network_attempted": not opp.offline, "downloaded_count": hentet.get("nye", 0),
+            "cached_count": hentet.get("ajour", 0), "failed_tickers": hentet.get("feilet", []),
+            "expected_count": len(tickere), "usable_count": len(tickere) - feilet,
+            "latest_observation": iso(dager[-1]) if dager else None,
             "referanse": ref_navn, "feilet": feilet, "tynne": tynne,
             "detaljer": f"{len(bok.serier)} tickere · {len(dager)} handledager · "
                         f"referanse {ref_navn}"
@@ -5603,6 +5620,8 @@ def _hent_alle_kurser(opp: Oppsett, logger: logging.Logger, bok: Kursbok,
         data = ferske.get(rens(t).upper()) or {}
         if not data:
             data = _hent_en_ticker(t, fra, i_dag, logger, opp)
+        # Today's close is not final during a market session.
+        data = {d: v for d, v in (data or {}).items() if d < i_dag}
         if not data:
             feilet.append(t)
             paa_rad += 1
@@ -6816,7 +6835,12 @@ class Marked:
         ref, _ = les_referansevalg(opp)
 
         tickere = sorted({str(r.get("Ticker")) for r in kjop if r.get("Ticker")})
-        self.kurs = {t: bok.justert_serie(t, self.kalender, felt, opp.maks_fyll_dager)
+        # Actual observations are the only execution prices. Short forward fills
+        # are marks for valuation, never evidence that a suspended share traded.
+        maks_fyll = min(5, max(0, opp.maks_fyll_dager))
+        self.handelskurs = {t: bok.justert_serie(t, self.kalender, felt, 0)
+                            for t in tickere if t in bok.serier}
+        self.kurs = {t: bok.justert_serie(t, self.kalender, felt, maks_fyll)
                      for t in tickere if t in bok.serier}
         self.volum = {t: bok.volumserie(t, self.kalender, opp.maks_fyll_dager)
                       for t in self.kurs}
@@ -6886,6 +6910,22 @@ def _beslutningsdag(kalender: Sequence[date], i: int, takt: str,
     return True
 
 
+def _handelskurs(marked: Marked, ticker: str, i: int) -> Optional[float]:
+    """Actual positive close at session i; a forward-filled mark is not a fill.
+
+    Lightweight callers may supply an unfilled ``kurs`` map only. Production
+    Marked always provides the separate ``handelskurs`` observation map.
+    """
+    series = getattr(marked, "handelskurs", marked.kurs).get(ticker, [])
+    if i < 0 or i >= len(series):
+        return None
+    value = series[i]
+    if value is None:
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value > 0 else None
+
+
 def _kandidater(marked: Marked, st: Strategi, opp: Oppsett, i: int) -> List[Tuple[str, float]]:
     """
     Selskapene som kvalifiserer på dag i, best først. (ticker, vekt-score).
@@ -6918,7 +6958,7 @@ def _kandidater(marked: Marked, st: Strategi, opp: Oppsett, i: int) -> List[Tupl
             v = score * (0.5 ** ((i - j) / float(st.halveringstid)))
         if v < min_score:
             continue
-        if marked.kurs.get(t) is None or not marked.kurs[t][i]:
+        if _handelskurs(marked, t, i) is None:
             continue
 
         if st.momentum_dager:
@@ -6966,6 +7006,8 @@ def kjor_strategi(marked: Marked, st: Strategi, opp: Oppsett
     equity: List[Rad] = []
     handler: List[Rad] = []
     nedskrevet = 0
+    stale_sessions: Dict[str, int] = {}
+    max_stale_sessions = min(5, max(0, opp.maks_fyll_dager))
     sett: Set[Any] = set()
     min_navn_krav = st.min_navn or opp.min_navn_portefolje
     # Tre kandidater til hvilken dag beholdningen skal vises fra. Se
@@ -6975,10 +7017,10 @@ def kjor_strategi(marked: Marked, st: Strategi, opp: Oppsett
     siste_bok: Tuple[int, Dict[str, Posisjon]] = (-1, {})
 
     def selg(t: str, i: int, dag: date, grunn: str) -> float:
-        p = bok.pop(t)
-        k = marked.kurs[t][i]
+        k = _handelskurs(marked, t, i)
         if not k:
             return 0.0
+        p = bok.pop(t)
         brutto = p.antall * k
         kost = brutto * kostnad_sats
         handler.append({"Dato": iso(dag), "Ticker": t, "Type": grunn,
@@ -6988,19 +7030,26 @@ def kjor_strategi(marked: Marked, st: Strategi, opp: Oppsett
     for i in marked.dager:
         dag = marked.kalender[i]
 
-        # 1. Posisjoner som mistet kursdata skrives ned til null. Et selskap
-        #    som slutter å handles er som regel et selskap du ikke kom deg
-        #    ut av, og det skal koste.
-        for t in [t for t in bok if not marked.kurs[t][i]]:
-            handler.append({"Dato": iso(dag), "Ticker": t, "Type": "NEDSKREVET",
-                            "Verdi_NOK": 0.0, "Kostnad_NOK": 0.0})
-            bok.pop(t)
-            nedskrevet += 1
+        # Missing observations do not prove either tradability or bankruptcy.
+        # Retain the last bounded mark, and block publication when it expires.
+        stale_sessions = {t: stale_sessions.get(t, 0) for t in bok}
+        for t in bok:
+            stale_sessions[t] = (stale_sessions[t] + 1
+                                 if _handelskurs(marked, t, i) is None else 0)
+            mark = marked.kurs[t][i]
+            if (stale_sessions[t] > max_stale_sessions or mark is None
+                    or not math.isfinite(float(mark)) or mark <= 0):
+                raise RuntimeError(
+                    f"Insider valuation incomplete: {t} has no verified held-position "
+                    f"price on {iso(dag)} (maximum {max_stale_sessions} missing sessions). "
+                    "Missing data is not a confirmed delisting; no write-down was assumed.")
 
         # 2. Utganger som ikke handler om nye signaler: holdetid og stopp.
         endret = False
         for t in list(bok):
-            pos, k = bok[t], marked.kurs[t][i]
+            pos, k = bok[t], _handelskurs(marked, t, i)
+            if k is None:
+                continue  # An expired holding waits for a real execution quote.
             if st.hold_dager and i - pos.inn_i >= st.hold_dager:
                 kontanter += selg(t, i, dag, "UTLØPT")
                 endret = True
@@ -7008,7 +7057,10 @@ def kjor_strategi(marked: Marked, st: Strategi, opp: Oppsett
                 kontanter += selg(t, i, dag, "STOPP")
                 endret = True
 
-        beslutning = _beslutningsdag(marked.kalender, i, st.takt, sett)
+        # Freeze rebalancing while any holding cannot be traded. Consuming the
+        # weekly/monthly decision only after quotes return also preserves retries.
+        beslutning = (all(_handelskurs(marked, t, i) is not None for t in bok)
+                      and _beslutningsdag(marked.kalender, i, st.takt, sett))
         if beslutning:
             mål = _kandidater(marked, st, opp, i)
             poeng = dict(mål)
@@ -7046,7 +7098,7 @@ def kjor_strategi(marked: Marked, st: Strategi, opp: Oppsett
                 for t in ønsket:
                     if t in bok:
                         continue
-                    k = marked.kurs[t][i]
+                    k = _handelskurs(marked, t, i)
                     beløp = min(kontanter / (1.0 + kostnad_sats), verdi / maks)
                     if not k or beløp <= 1.0:
                         continue
@@ -7148,13 +7200,16 @@ def _sett_portefolje(marked: Marked, bok: Dict[str, Posisjon],
                      kontanter: float, kostnad_sats: float, st: Strategi,
                      opp: Oppsett, handler: List[Rad]) -> float:
     """Setter porteføljen til nøyaktig `mål`. Gir tilbake kontantbeholdningen."""
+    if any(_handelskurs(marked, t, i) is None for t in bok):
+        return kontanter  # No sale, quantity change or cash from a stale mark.
+    mål = [(t, score) for t, score in mål if _handelskurs(marked, t, i) is not None]
     tidligere = {t: Posisjon(p.antall, p.inn_kurs, p.inn_i) for t, p in bok.items()}
     verdi = kontanter + sum(p.antall * (marked.kurs[t][i] or 0.0)
                             for t, p in bok.items())
     navn = [t for t, _ in mål]
     if not navn:
         for t in list(bok):
-            p, k = bok[t], marked.kurs[t][i]
+            p, k = bok[t], _handelskurs(marked, t, i)
             if k:
                 brutto = p.antall * k
                 handler.append({"Dato": iso(dag), "Ticker": t, "Type": "SELG",
@@ -7183,7 +7238,7 @@ def _sett_portefolje(marked: Marked, bok: Dict[str, Posisjon],
 
     omsetning = 0.0
     for t in sorted(set(list(bok) + navn)):
-        k = marked.kurs.get(t, [None])[i] if t in marked.kurs else None
+        k = _handelskurs(marked, t, i)
         før = bok[t].antall * (k or 0.0) if t in bok else 0.0
         etter = ønsket.get(t, 0.0) if k else 0.0
         omsetning += abs(etter - før)
@@ -8866,6 +8921,43 @@ def banner(logger: logging.Logger, opp: Oppsett, steg: Sequence[int]) -> None:
     logger.info(f"   Måler ........ {opp.avkastningstype()} mot {opp.referanse_ticker}")
     logger.info(f"   Stengetid .... {opp.stengetid}  "
                 f"(melding etter dette handles først neste dag)")
+
+
+def _download_stage(key, impl, opp, logger, **kwargs):
+    from download_status import record_source
+    record_source(key, "FAILED", "Download started; completion not yet validated",
+                  network_attempted=not opp.offline)
+    try:
+        result = impl(opp, logger, **kwargs)
+    except Exception as exc:
+        record_source(key, "FAILED", feiltekst(exc), network_attempted=not opp.offline,
+                      issues=[feiltekst(exc)])
+        raise
+    state = result.get("status", "FEIL")
+    count = int(result.get("downloaded_count", 0))
+    cached = int(result.get("cached_count", 0))
+    if state in ("FEIL", "HOPPET") and not opp.offline:
+        label = "FAILED"
+    elif state == "DELVIS":
+        label = "PARTIAL"
+    elif count and not cached:
+        label = "DOWNLOADED"
+    elif count:
+        label = "PARTIAL"
+    else:
+        label = "CACHED"
+    record_source(key, label, result.get("detaljer", ""),
+                  **{k: v for k, v in result.items() if k not in ("status", "detaljer")})
+    return result
+
+
+def steg1_nedlasting(opp, logger, kun="", aksjeliste="", fersk_liste=False):
+    return _download_stage("insider_announcements", _steg1_nedlasting_impl, opp, logger,
+                           kun=kun, aksjeliste=aksjeliste, fersk_liste=fersk_liste)
+
+
+def steg4_kurser(opp, logger, alle=False):
+    return _download_stage("insider_prices", _steg4_kurser_impl, opp, logger, alle=alle)
 
 
 def main(argv: Optional[List[str]] = None) -> int:

@@ -21,10 +21,12 @@ import argparse
 import json
 from runtime_config import data_root, configure_paths, protected_input_errors
 import bisect
+import hashlib
 import os
 import sys
 import time
 import traceback
+import download_status as downloads
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -134,6 +136,8 @@ class Master:
         """Match the standalone pipeline; legacy score-blend settings differ."""
         o = IP.Oppsett(base_dir=self.innside_dir)
         o.min_navn_portefolje = self.min_navn
+        o.spread_pst = 0.0
+        o.kurtasje_pst = 0.0
         o.inn_utvalg_slutt = self.inn_utvalg_slutt
         o.epost_fra, o.epost_til = self.epost_fra, self.epost_til
         return o
@@ -186,66 +190,67 @@ def filalder(sti: Optional[Path]) -> str:
 # innsidehandel også, og det er ingen tjent med.
 
 def kjor_alle(m: Master, logger) -> List[Rad]:
-    """Kjører de fire analysene. Én rad per analyse med status og tid."""
+    """Independent strategy runs; acquisition evidence is recorded separately."""
     ut: List[Rad] = []
 
-    def kjor(navn: str, handling) -> None:
-        logger.info(f"\n{'━' * 74}\n{navn.upper()}\n{'━' * 74}")
+    def kjor(navn, handling, source_keys=()):
         start = time.time()
         try:
             code = handling()
-            if isinstance(code, int) and not isinstance(code, bool) and code not in (0, 2):
-                raise RuntimeError(f"Analysis returned failure code {code}")
-            status, feil = "OK", ("Parsing partly classified; see insider stage status"
-                                   if code == 2 else "")
+            if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+                raise RuntimeError(f"Analysis returned incomplete/failure code {code}")
+            status, feil = "OK", ""
         except KeyboardInterrupt:
             raise
-        except Exception as e:
-            status, feil = "FEIL", IP.feiltekst(e)[:200]
-            logger.error(f"❌ {navn} feilet: {feil}")
-            logger.debug(traceback.format_exc())
+        except Exception as exc:
+            status, feil = "FEIL", IP.feiltekst(exc)[:500]
+            logger.exception("%s failed", navn)
+            for key in source_keys:
+                if downloads.get_source(key)["status"] == "NOT_RUN":
+                    downloads.record_source(key, "FAILED", feil)
         ut.append({"Analyse": navn, "Status": status,
-                   "Minutter": round((time.time() - start) / 60.0, 1), "Feil": feil})
+                   "Minutter": round((time.time() - start) / 60, 1), "Feil": feil})
+        return status == "OK"
 
-    def de_tre() -> None:
-        # Importeres først her: Only-filen krever pandas, numpy og matplotlib,
-        # og masteren skal kunne lese og sende mail uten dem.
+    def de_tre():
         import Only_260820 as O
         configure_paths(O.__dict__, m.excel_dir)
-
-        # Ledelses-sentiment kommer fra hendelseslaben, ikke fra den månedlige
-        # utgaven. Den månedlige gikk gjennom alle selskaper hver månedsslutt og
-        # regnet bedringen fra forrige rapport på nytt — men forrige rapport
-        # endrer seg ikke mellom rapportene, så samme nyhet ga samme signal
-        # måned etter måned. Én rapport ble tretten kjøp, og det første kom 23
-        # dager etter at nyheten var ute.
-        #
-        # Skrapingen ligger fortsatt i SentimentManagement(), og den er det
-        # eneste den kjøres for her: laben leser artiklene som ligger i DataNLP
-        # og henter ingenting selv. Derfor er skrapesteget betinget av
-        # --hent-nlp, mens laben kjøres hver gang.
-        analyser = [("PB-ROE-Momentum", O.PBROE_All3)]
+        kjor("PB-ROE-Momentum", O.PBROE_All3, ("pbroe_data", "pbroe_prices"))
+        article_ok = True
         if O._miljo_paa("AKSJE_NLP_HENT"):
-            analyser.append(("NLP-artikler — skraping", O.SentimentManagement))
-        analyser += [("NLP Sentiment — ledelse", O.SentimentHendelseLab),
-                     ("Sentiment Momentum v3.1", O.SentimentMomentumV31)]
-        for navn, funksjon in analyser:
-            kjor(navn, funksjon)
+            article_ok = kjor("NLP-artikler — skraping", O.SentimentManagement, ("articles",))
+        else:
+            downloads.record_source("articles", "CACHED", "Artikkelnedlasting slått av eksplisitt.")
+        if article_ok:
+            kjor("NLP Sentiment — ledelse", O.SentimentHendelseLab, ("management_prices",))
+            def sentiment_momentum():
+                from data_acquisition import build_all
+                rows = build_all(m.excel_dir, m.insider_oppsett(), logger,
+                                 steps=("step4",), download=False, force=True,
+                                 source_status=downloads.get_source("articles"))
+                bad = [r for r in rows if r.get("status") in ("FAILED", "PARTIAL")]
+                if bad or downloads.get_source("step4")["status"] not in ("DERIVED", "CACHED", "DOWNLOADED"):
+                    raise RuntimeError("Sentiment input could not be built: " + str(bad or rows))
+                return O.SentimentMomentumV31()
+            kjor("Sentiment Momentum v3.1", sentiment_momentum)
+        else:
+            for name in ("NLP Sentiment — ledelse", "Sentiment Momentum v3.1"):
+                ut.append({"Analyse": name, "Status": "FEIL", "Minutter": 0,
+                           "Feil": "Nye artikler kunne ikke valideres; gamle signaler brukes ikke som nye."})
 
     try:
         de_tre()
-    except ImportError as e:
-        logger.error(f"❌ Fant ikke Only_260820 eller pakkene den trenger: "
-                     f"{IP.feiltekst(e)}")
-        for navn in ("PB-ROE-Momentum", "NLP Sentiment — ledelse",
-                     "Sentiment Momentum v3.1"):
-            ut.append({"Analyse": navn, "Status": "FEIL", "Minutter": 0.0,
-                       "Feil": "Only_260820 kunne ikke importeres"})
-
+    except Exception as exc:
+        logger.exception("Strategy module unavailable")
+        completed = {r["Analyse"] for r in ut}
+        for name in ("PB-ROE-Momentum", "NLP Sentiment — ledelse", "Sentiment Momentum v3.1"):
+            if name not in completed:
+                ut.append({"Analyse": name, "Status": "FEIL", "Minutter": 0,
+                           "Feil": IP.feiltekst(exc)[:500]})
     kjor("Innsidehandel Oslo Børs",
-         lambda: IP.main(["--steg", "1-6", "--ingen-mail",
-                          "--mappe", str(m.innside_dir),
-                          "--min-navn", str(m.min_navn), "--stopp-ved-feil"]))
+         lambda: IP.main(["--steg", "1-6", "--ingen-mail", "--full", "--mappe", str(m.innside_dir),
+                          "--min-navn", str(m.min_navn), "--stopp-ved-feil"]),
+         ("insider_announcements", "insider_prices"))
     return ut
 
 
@@ -838,7 +843,7 @@ def _tabell(hoder: Sequence[str], rader: Sequence[Sequence[str]]) -> str:
 
 def strategisammendrag(m: Master, logger) -> Dict[str, Any]:
     """
-    De tre enkeltstrategiene fra mail/mail_strategier.py, som data og HTML.
+    De tre enkeltstrategiene fra mail_strategier.py, som data og HTML.
 
     Nøklene: «stil» (scopet CSS), «html» (alle kortene samlet, som reserve),
     «kort» ({navn: kort}) og «strategier» (rådata). Master bygger sitt eget
@@ -856,14 +861,14 @@ def strategisammendrag(m: Master, logger) -> Dict[str, Any]:
     """
     tomt: Dict[str, Any] = {"stil": "", "html": "", "kort": {},
                             "strategier": [], "ekstra": ""}
-    mappe = SKRIPTMAPPE / "mail"
+    mappe = SKRIPTMAPPE
     if not (mappe / "mail_strategier.py").exists():
-        logger.warning(f"   ⚠️  Fant ikke mail/mail_strategier.py i {mappe} — "
+        logger.warning(f"   ⚠️  Fant ikke mail_strategier.py i {mappe} — "
                        f"de tre enkeltstrategiene blir utelatt fra mailen.")
         return {**tomt, "html": (
             '<div class="kort"><h2>De tre enkeltstrategiene</h2>'
-            '<p class="sub">Fant ikke <code>mail/mail_strategier.py</code> '
-            f'ved siden av master.py ({mappe}). Legg mappen <code>mail/</code> '
+            '<p class="sub">Fant ikke <code>mail_strategier.py</code> '
+            f'ved siden av master.py ({mappe}). Legg filen <code>mail_strategier.py</code> '
             'der master.py ligger.</p></div>')}
     try:
         if str(mappe) not in sys.path:
@@ -1376,8 +1381,10 @@ def validate_sources(m, since_ns=None):
                  opp.s6_dir / "selected_variant.json"):
         try:
             stat = path.stat()
+            with path.open("rb") as handle:
+                digest = hashlib.file_digest(handle, "sha256").hexdigest()
             files.append({"source": "Insider report", "path": str(path.resolve()),
-                          "mtime_ns": stat.st_mtime_ns, "size": stat.st_size})
+                          "mtime_ns": stat.st_mtime_ns, "size": stat.st_size, "sha256": digest})
             if since_ns is not None and stat.st_mtime_ns < since_ns:
                 errors.append(f"Insider report was not refreshed: {path.name}")
         except OSError:
@@ -1422,6 +1429,8 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
         prog="master",
         description="Kjører fire aksjeanalyser, fordeler 25 % kapital til hver, "
                     "beregner felles portefølje og sender én mail.")
+    p.add_argument("--ingen-datahent", action="store_true", help="bruk lagrede felles grunnlagsdata; merkes i mailen")
+    p.add_argument("--tving-datahent", action="store_true", help="kompatibilitetsflagg; normal kjøring oppdaterer alltid")
     p.add_argument("--ikke-kjor", action="store_true",
                    help="ikke kjør analysene, bruk resultatfilene som ligger der")
     p.add_argument("--bare-mail", action="store_true",
@@ -1457,6 +1466,7 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
                    help="25 percent to each strategy at completed month-end; PB-ROE supplies monthly NAV")
     a = p.parse_args(list(argv) if argv is not None else None)
 
+    downloads.reset()
     m = Master()
     if a.mappe:
         m.innside_dir = Path(a.mappe).expanduser()
@@ -1499,12 +1509,31 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     errors = []
     kjoring = []
     if not a.ikke_kjor:
-        missing = protected_input_errors(m.excel_dir)
-        if missing:
-            errors.extend("Required upstream data missing: " + f for f in missing)
-        else:
-            kjoring = kjor_alle(m, logger)
-            errors.extend(r["Analyse"] + ": " + r["Feil"] for r in kjoring if r["Status"] != "OK")
+        try:
+            from data_acquisition import build_all
+            build_all(m.excel_dir, m.insider_oppsett(), logger,
+                      steps=("tickers", "prices"), force=not a.ingen_datahent,
+                      download=not a.ingen_datahent)
+        except Exception as exc:
+            logger.exception("Shared input download failed")
+            for key in ("tickers", "prices"):
+                if downloads.get_source(key)["status"] == "NOT_RUN":
+                    downloads.record_source(key, "FAILED", str(exc))
+        kjoring = kjor_alle(m, logger)
+        errors.extend(r["Analyse"] + ": " + r["Feil"] for r in kjoring if r["Status"] != "OK")
+    download_rows = downloads.strategy_rows(cached_run=a.ikke_kjor)
+    if not a.ikke_kjor:
+        for row in download_rows:
+            allowed = {"DOWNLOADED"}
+            if a.ingen_datahent or a.ingen_nlp_hent:
+                allowed.add("CACHED")
+            if row["status"] not in allowed:
+                errors.append(row["strategy"] + ": input download/validation is " + row["status"])
+    download_manifest = {"run_started": started, "checked_at": datetime.now().isoformat(),
+                         "cached_run": a.ikke_kjor, "strategies": download_rows,
+                         "sources": downloads.snapshot()}
+    IP.skriv_atomisk(m.ut_dir / "download_status.json", lambda tmp: tmp.write_text(
+        json.dumps(download_manifest, ensure_ascii=False, indent=2, default=str), encoding="utf-8"))
     # Old saved selection must be upgraded before it enters a capital sleeve.
     if a.ikke_kjor and not a.bare_mail:
         try:
@@ -1514,14 +1543,26 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
             errors.append(str(exc))
     source_errors, source_files = validate_sources(m, None if a.ikke_kjor else started)
     errors.extend(source_errors)
+    receipt_path = m.ut_dir / "validated_outputs.json"
+    if a.ikke_kjor:
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if receipt.get("execution_policy") != "zero-cost-next-session-v1" or receipt.get("sources") != source_files:
+                raise ValueError("Saved outputs have changed or use an older execution policy")
+        except (OSError, ValueError) as exc:
+            errors.append("Rerun all strategies before reusing saved outputs: " + str(exc))
+    elif not errors:
+        IP.skriv_atomisk(receipt_path, lambda tmp: tmp.write_text(json.dumps(
+            {"execution_policy": "zero-cost-next-session-v1", "sources": source_files},
+            ensure_ascii=False, indent=2), encoding="utf-8"))
     portfolio = None
     manifest_path = m.ut_dir / "completed_run.json"
     if not errors:
         try:
             if a.bare_mail:
                 saved = json.loads(manifest_path.read_text(encoding="utf-8"))
-                if saved.get("format_version") != 2 or saved.get("method") != "capital_25_each":
-                    raise RuntimeError("Saved report used the old score blend; recalculate the capital portfolio first")
+                if saved.get("format_version") != 3 or saved.get("method") != "capital_25_each" or saved.get("execution_policy") != "zero-cost-next-session-v1":
+                    raise RuntimeError("Saved report predates the current zero-cost execution policy; rerun all strategies first")
                 if saved.get("sources") != source_files:
                     raise RuntimeError("Saved results refer to different source files; rerun calculation")
                 portfolio = saved["portfolio"]
@@ -1551,7 +1592,8 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     if portfolio and not insider:
         errors.append("Insider results missing")
     if portfolio and not errors:
-        payload = {"format_version": 2, "method": "capital_25_each",
+        payload = {"format_version": 3, "method": "capital_25_each",
+                   "execution_policy": "zero-cost-next-session-v1", "downloads": download_manifest,
                    "completed": datetime.now().isoformat(), "sources": source_files,
                    "portfolio": portfolio}
         try:
@@ -1563,13 +1605,14 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     try:
         if sections.get("kort") or insider:
             from capital_mail import render_capital_mail
-            html = render_capital_mail(m, kjoring, portfolio, sections, insider, errors)
+            html = render_capital_mail(m, kjoring, portfolio, sections, insider, errors, download_rows=download_rows)
         else:
             html = failure_report(errors or ["No strategy reports are available"])
     except Exception as exc:
         logger.exception("Email rendering failed")
         errors.append("Email rendering failed: " + str(exc))
         html = failure_report(errors)
+    html = downloads.prepend_summary(html, download_rows)
     if errors:
         subject = "Analysis incomplete — ufullstendig beregning"
     else:

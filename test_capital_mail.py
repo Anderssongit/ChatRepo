@@ -3,7 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from capital_mail import render_capital_mail
 from master import Master
 from portfolio_blend import build_capital_portfolio
@@ -34,8 +34,8 @@ class CapitalMail(unittest.TestCase):
         html = render_capital_mail(Master(),[],portfolio,sections,insider)
         self.assertIn('5.0 %',html)  # 20% in one sleeve becomes 5% total.
         self.assertIn('månedlig',html)
-        self.assertIn('0,80 %',html)
-        self.assertIn('-9.0 %',html)
+        self.assertIn('0 %',html)
+        self.assertNotIn('0,80 %',html)
         self.assertIn('1. scorevektet',html)
         self.assertIn('2. forfall-60',html)
         self.assertIn('3. daglig',html)

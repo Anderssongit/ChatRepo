@@ -18,11 +18,11 @@ def preflight(base):
         print("Missing Python packages:", ", ".join(missing))
         print("Run SETUP.cmd with your Python 3.12 installation.")
     if inputs:
-        print("Required existing upstream files:")
+        print("Inputs that the next normal run will download/build:")
         for item in inputs:
             print(" -", item)
     print("Mail: existing code settings are retained; place mail_passord.txt beside master.py.")
-    return 2 if missing or inputs else 0
+    return 2 if missing else 0
 
 
 def main(argv=None):
@@ -53,6 +53,12 @@ def main(argv=None):
         if a.mappe: args += ["--mappe", a.mappe]
         if a.mail_kladd: args += ["--mail-kladd"]
         return ip.main(args)
+    import innsidehandel_pipeline as ip
+    import download_status as downloads
+    from data_acquisition import build_all
+    downloads.reset()
+    opp = ip.Oppsett(base_dir=Path(a.mappe) if a.mappe else Path(__file__).parent / "data")
+    build_all(base, opp, ip.stillelogger(), steps=("tickers", "prices"), force=True)
     import Only_260820 as models
     configure_paths(models.__dict__, base)
     if a.strategy == "management":
@@ -61,8 +67,16 @@ def main(argv=None):
             os.environ["AKSJE_NLP_ONLY_DOWNLOAD"] = "1"
             models.SentimentManagement()
         models.SentimentHendelseLab()
+    elif a.strategy == "sentmom":
+        if not a.ingen_nlp_hent:
+            os.environ["AKSJE_NLP_HENT"] = "1"
+            os.environ["AKSJE_NLP_ONLY_DOWNLOAD"] = "1"
+            models.SentimentManagement()
+        build_all(base, opp, ip.stillelogger(), steps=("step4",), download=False,
+                  force=True, source_status=downloads.get_source("articles"))
+        models.SentimentMomentumV31()
     else:
-        {"pbroe": models.PBROE_All3, "sentmom": models.SentimentMomentumV31}[a.strategy]()
+        models.PBROE_All3()
     return 0
 
 
