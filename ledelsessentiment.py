@@ -96,11 +96,13 @@ class Oppsett:
     # Markedskoden i Euronext sin produktadresse: /product/equities/<ISIN>-<marked>.
     marked_suffiks: str = "XOSL"          # Oslo Børs
     headless: bool = True
-    slow_mo_ms: int = 40
+    slow_mo_ms: int = 0            # hver handling ble 40 ms dyrere; unødvendig
     steg_pause_ms: int = 400
     side_timeout_ms: int = 25_000
-    modal_pause_ms: int = 1_800
-    artikkel_pause_s: float = 0.8
+    modal_pause_ms: int = 900
+    artikkel_pause_s: float = 0.25
+    nav_pause_ms: int = 500        # ro etter en sidelasting
+    parallelle: int = 3            # selskaper som skrapes samtidig
     maks_sider: int = 40           # paginering per selskap
     maks_artikler: int = 400       # per selskap
     forsok_per_selskap: int = 3
@@ -108,6 +110,9 @@ class Oppsett:
     # "all_financial" = + foreløpig regnskap og kapitalmarkedsdager
     # "everything" = ingen emnefilter (mye støy)
     emnefilter: str = "quarterly"
+    # Artikler eldre enn dette hentes ikke. Backtesten bruker kurser fra 2019
+    # og trenger en FORRIGE rapport å måle mot, så 2017 er rikelig margin.
+    eldste_artikkel: str = "2017-01-01"
 
     # ── Del 1: FinBERT ────────────────────────────────────────────────────
     finbert_modell: str = "yiyanghkust/finbert-tone"
@@ -1110,7 +1115,7 @@ async def _gaa_til(side, url: str, opp: Oppsett, timeout: Optional[int] = None) 
     try:
         await side.goto(url, wait_until="domcontentloaded",
                         timeout=timeout or opp.side_timeout_ms)
-        await side.wait_for_timeout(1_200)
+        await side.wait_for_timeout(opp.nav_pause_ms)
         return True
     except Exception as e:
         log.debug("Navigering til %s feilet: %s", url[:70], e)
@@ -1197,14 +1202,57 @@ async def _aapne_selskap(side, selskap: dict, opp: Oppsett) -> Tuple[bool, str]:
     return False, ""
 
 
-async def _velg_emner(side, opp: Oppsett) -> None:
-    """Huker av emnefilteret. Manglende emner logges, men stopper ingenting."""
+# Titler på finansielle rapporter, brukt som RESERVE når emnefilteret i
+# grensesnittet ikke slår inn. Uten denne havnet alle pressemeldinger i
+# sentimentscoren — 150 for et selskap som har rundt 25 rapporter.
+RAPPORTORD = (
+    "kvartal", "quarter", "quarterly", "q1 ", "q2 ", "q3 ", "q4 ",
+    "1q", "2q", "3q", "4q", "halvår", "halvar", "half year", "half-year",
+    "interim", "årsrapport", "arsrapport", "annual report",
+    "annual financial", "årsregnskap", "arsregnskap", "foreløpig",
+    "forelopig", "preliminary", "financial report", "financial statement",
+    "financial calendar" ,"results for", "resultat for", "trading statement",
+)
+UTELUKK_ORD = ("financial calendar", "finansiell kalender", "finanskalender")
+
+
+def _er_rapport(tittel: str) -> bool:
+    """Ser tittelen ut som en periodisk finansiell rapport?"""
+    t = " " + _rens(tittel).lower() + " "
+    if any(u in t for u in UTELUKK_ORD):
+        return False
+    return any(o in t for o in RAPPORTORD)
+
+
+def _parse_artikkeldato(tekst: str):
+    """«12 Feb 2026» → date. Returnerer None når datoen ikke lar seg lese."""
+    import datetime as _dt
+    raa = _rens(str(tekst).split("\n")[0])
+    for fmt in ("%d %b %Y", "%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%d %B %Y"):
+        try:
+            return _dt.datetime.strptime(raa, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+async def _velg_emner(side, opp: Oppsett) -> Tuple[List[str], bool]:
+    """
+    Huker av emnefilteret. Returnerer (emner som ble valgt, om Bruk landet).
+
+    Første utgave returnerte ingenting og la hver bom i log.debug, mens
+    loggen skrev hvilken modus som var KONFIGURERT. Da så en kjøring som
+    filtrerte null ut nøyaktig ut som en som virket — og du skrapte alle
+    pressemeldingene i tre kvarter per selskap uten å få vite det.
+    """
     if opp.emnefilter == "everything":
-        return
-    await _klikk(side, SEL_FILTER, "filterpanel", 8_000)
-    await side.wait_for_timeout(1_200)
-    await _klikk(side, SEL_EMNE, "emnemeny", 7_000)
-    await side.wait_for_timeout(800)
+        return [], True
+
+    if not await _klikk(side, SEL_FILTER, "filterpanel", 5_000):
+        return [], False
+    await side.wait_for_timeout(700)
+    await _klikk(side, SEL_EMNE, "emnemeny", 4_000)
+    await side.wait_for_timeout(500)
 
     onsket = ["halvaar", "aarsrapport"]
     if opp.emnefilter in ("quarterly", "all_financial"):
@@ -1212,17 +1260,50 @@ async def _velg_emner(side, opp: Oppsett) -> None:
     if opp.emnefilter == "all_financial":
         onsket += ["forelopig", "kapitalmarked"]
 
+    valgte = []
     for navn in onsket:
-        if not await _klikk(side, EMNER[navn], f"emne {navn}", 5_000):
-            log.debug("  emnet %s ble ikke funnet", navn)
-        await side.wait_for_timeout(300)
+        if await _klikk(side, EMNER[navn], f"emne {navn}", 3_000):
+            valgte.append(navn)
+        await side.wait_for_timeout(200)
 
-    if await _klikk(side, SEL_BRUK, "Bruk/Apply", 7_000):
+    brukt = await _klikk(side, SEL_BRUK, "Bruk/Apply", 5_000)
+    if brukt:
         try:
-            await side.wait_for_load_state("networkidle", timeout=10_000)
+            await side.wait_for_load_state("networkidle", timeout=8_000)
         except Exception:
             pass
-        await side.wait_for_timeout(1_500)
+        await side.wait_for_timeout(1_000)
+    return valgte, bool(valgte) and brukt
+
+
+def _filtrer_rader(rader: List[dict], opp: Oppsett, lager: "Artikkellager",
+                   symbol: str, filter_virket: bool) -> Tuple[List[dict], dict]:
+    """
+    Siler bort rader FØR teksten hentes — det er der tiden går.
+
+    Tre siler, i rekkefølge:
+      * for gammel: backtesten bruker dem ikke uansett,
+      * ikke en rapport: bare når emnefilteret i grensesnittet bommet,
+      * allerede i lageret: en artikkel hentes aldri to ganger, heller ikke
+        på tvers av kjøringer.
+    """
+    fra = _parse_artikkeldato(opp.eldste_artikkel) or date(2017, 1, 1)
+    behold, teller = [], {"gammel": 0, "ikke_rapport": 0, "hadde": 0}
+    for r in rader:
+        d = _parse_artikkeldato(r.get("dato", ""))
+        if d is not None and d < fra:
+            teller["gammel"] += 1
+            continue
+        if not filter_virket and not _er_rapport(r.get("tittel", "")):
+            teller["ikke_rapport"] += 1
+            continue
+        if lager.har({"Company": symbol,
+                      "Article_Date": r.get("dato", ""),
+                      "Article_Title": _rens(r.get("tittel"))[:180]}):
+            teller["hadde"] += 1
+            continue
+        behold.append(r)
+    return behold, teller
 
 
 async def _samle_rader(side, opp: Oppsett) -> Tuple[List[dict], bool, int]:
@@ -1405,15 +1486,13 @@ def _varighet(sekunder: float) -> str:
     return f"{s // 3600}t{(s % 3600) // 60:02d}m"
 
 
-async def _skrap_selskap(side, selskap: dict, opp: Oppsett,
+async def _skrap_selskap(side, selskap: dict, opp: Oppsett, lager: "Artikkellager",
                          merk=None) -> Tuple[List[dict], str]:
     """
-    Alle artiklene for ett selskap. Returnerer (rader, merknad).
+    Alle NYE artiklene for ett selskap. Returnerer (rader, merknad).
 
     Kaster aldri. Tom liste MED merknad betyr «ikke hentet»; tom liste UTEN
-    merknad betyr «bekreftet ingen artikler». `merk` er en loggfunksjon som
-    skriver ett trinn om gangen, slik at en kjøring på flere timer viser hvor
-    den står i stedet for å være stille.
+    merknad betyr «ingenting nytt å hente».
     """
     merk = merk or (lambda *a: None)
     symbol = selskap["Symbol"]
@@ -1425,47 +1504,53 @@ async def _skrap_selskap(side, selskap: dict, opp: Oppsett,
         return [], "fant ikke selskapssiden"
     merk("åpne", f"OK via {hvordan}")
 
-    if not await _klikk(side, SEL_SELSKAPSINFO, "selskapsinformasjon", 8_000):
+    if not await _klikk(side, SEL_SELSKAPSINFO, "selskapsinformasjon", 6_000):
         treff = re.search(r"(/product/equities/[^/?#]+)", side.url)
         if not treff or not await _gaa_til(
                 side, opp.euronext_base + treff.group(1) + "/company-information", opp):
             merk("selskapsinfo", "FEIL — fanen kunne ikke nås")
             return [], "nådde ikke selskapsinformasjon"
-    await side.wait_for_timeout(1_000)
-    merk("selskapsinfo", "OK")
+    await side.wait_for_timeout(600)
 
-    if await _klikk(side, SEL_SE_ALLE, "se alle", 8_000):
-        try:
-            await side.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
-        merk("pressemeldinger", "full liste åpnet")
-    else:
+    if not await _klikk(side, SEL_SE_ALLE, "se alle", 6_000):
         merk("pressemeldinger", "'Se alle' ikke funnet — bruker sida som den er")
-    await side.wait_for_timeout(1_200)
+    try:
+        await side.wait_for_load_state("networkidle", timeout=8_000)
+    except Exception:
+        pass
+    await side.wait_for_timeout(600)
 
     try:
-        await _velg_emner(side, opp)
-        merk("emnefilter", f"modus '{opp.emnefilter}'")
+        valgte, filter_virket = await _velg_emner(side, opp)
     except Exception as e:
-        merk("emnefilter", f"hoppet over ({e}) — fortsetter ufiltrert")
+        valgte, filter_virket = [], False
+        log.debug("emnefilter feilet: %s", e)
+    if filter_virket:
+        merk("emnefilter", f"OK — {', '.join(valgte)}")
+    else:
+        merk("emnefilter", "TRAFF IKKE i grensesnittet — siler på tittel i stedet")
 
     liste_url = side.url
     rader, komplett, sider = await _samle_rader(side, opp)
     if not rader:
         merk("artikkelliste", "0 rader" + ("" if komplett else " — listen kunne ikke leses"))
         return [], "" if komplett else "ingen artikkelrader lest"
-    merk("artikkelliste", f"{len(rader)} rader over {sider} side(r)"
-                          + ("" if komplett else " — DELVIS"))
     if len(rader) >= opp.maks_artikler:
-        merk("artikkelliste", f"ADVARSEL: traff taket på {opp.maks_artikler}. "
-                              f"Er '{symbol}' virkelig ett selskap?")
+        merk("artikkelliste", f"ADVARSEL: traff taket på {opp.maks_artikler} — "
+                              f"er '{symbol}' virkelig ett selskap?")
+
+    behold, sil = _filtrer_rader(rader, opp, lager, symbol, filter_virket)
+    merk("artikkelliste", f"{len(rader)} rader / {sider} side(r) → {len(behold)} å hente"
+                          f"  (hoppet: {sil['gammel']} for gamle, "
+                          f"{sil['ikke_rapport']} ikke rapport, {sil['hadde']} hadde)")
+    if not behold:
+        return [], ""                       # ingenting nytt, og det er i orden
 
     await _gaa_til(side, liste_url, opp)
 
     ut: List[dict] = []
     tomme = pdf_er = 0
-    for n, rad in enumerate(rader, 1):
+    for n, rad in enumerate(behold, 1):
         tekst, pdf_brukt = await _hent_tekst(side, rad, liste_url, opp)
         if not tekst:
             tomme += 1
@@ -1477,7 +1562,7 @@ async def _skrap_selskap(side, selskap: dict, opp: Oppsett,
                 fil = f"{_filnavn(symbol)}_{_filnavn(rad.get('tittel',''), 30)}_{n}.txt"
                 (opp.tekstmappe / fil).write_text(tekst[:60_000], encoding="utf-8")
             except Exception as e:
-                log.debug("  kunne ikke lagre tekstfil: %s", e)
+                log.debug("kunne ikke lagre tekstfil: %s", e)
                 fil = ""
         ut.append({
             "Company": symbol,
@@ -1490,8 +1575,8 @@ async def _skrap_selskap(side, selskap: dict, opp: Oppsett,
             "PDF_Used": bool(pdf_brukt),
             "Scrape_Date": date.today().isoformat(),
         })
-        if n % 10 == 0 or n == len(rader):
-            merk("tekst", f"{n}/{len(rader)} hentet"
+        if n % 10 == 0 or n == len(behold):
+            merk("tekst", f"{n}/{len(behold)} hentet"
                           + (f", {tomme} tomme" if tomme else "")
                           + (f", {pdf_er} via PDF" if pdf_er else ""))
         await side.wait_for_timeout(int(opp.artikkel_pause_s * 1_000))
@@ -1499,71 +1584,77 @@ async def _skrap_selskap(side, selskap: dict, opp: Oppsett,
     return ut, "" if komplett else "delvis liste"
 
 
+async def _ny_side(kontekst, opp: Oppsett):
+    side = await kontekst.new_page()
+    side.set_default_timeout(opp.side_timeout_ms)
+    return side
+
+
 async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
                       skaarer: Sentiment, fullfort: dict,
                       opp: Oppsett) -> dict:
-    """Skraper alle selskapene. Lagrer og rapporterer etter hvert eneste ett."""
+    """
+    Skraper selskapene med flere faner samtidig, og lagrer etter hvert ett.
+
+    Parallelliteten er beskjeden med vilje. Scoringen kjøres i en egen tråd,
+    ellers ville FinBERT på CPU blokkert hele hendelsesløkka og de andre
+    fanene stått stille mens én artikkel ble scoret.
+    """
     from playwright.async_api import async_playwright
 
     status = {"hentet": 0, "feilet": [], "delvis": [], "tomme": [],
               "artikler_nye": 0, "uten_score": 0}
     fm = Framdrift(len(selskaper))
+    ko: asyncio.Queue = asyncio.Queue()
+    for n, s in enumerate(selskaper, 1):
+        ko.put_nowait((n, s))
+    laas = asyncio.Lock()
 
-    async with async_playwright() as pw:
-        nettleser = await pw.chromium.launch(headless=opp.headless,
-                                             slow_mo=opp.slow_mo_ms)
-        kontekst = await nettleser.new_context(
-            viewport={"width": 1920, "height": 1080},
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0.0.0 Safari/537.36"))
-        side = await kontekst.new_page()
-        side.set_default_timeout(opp.side_timeout_ms)
-
-        # Cookie-banneret én gang, på forsida.
-        if await _gaa_til(side, opp.start_url, opp, 60_000):
-            for sel in COOKIE_UTVIDET:
-                if await _klikk(side, [sel], "cookie", 5_000):
-                    log.info("Cookie-banner lukket.")
-                    break
-
-        for n, selskap in enumerate(selskaper, 1):
+    async def arbeider(nr: int, kontekst) -> None:
+        side = await _ny_side(kontekst, opp)
+        while True:
+            try:
+                n, selskap = ko.get_nowait()
+            except asyncio.QueueEmpty:
+                break
             symbol = selskap["Symbol"]
             t0 = time.time()
-            log.info("")
-            log.info("[%d/%d] %-10s %s", n, len(selskaper), symbol,
-                     selskap.get("Navn", "")[:45])
+            linjer: List[str] = []
 
-            def merk(trinn: str, tekst: str, _s=symbol) -> None:
-                log.info("         %-16s %s", trinn, tekst)
+            def merk(trinn: str, tekst: str) -> None:
+                linjer.append(f"         {trinn:<16} {tekst}")
 
             rader, merknad = [], "ikke forsøkt"
             for forsok in range(1, opp.forsok_per_selskap + 1):
                 if forsok > 1:
                     merk("nytt forsøk", f"{forsok}/{opp.forsok_per_selskap}")
                 try:
-                    rader, merknad = await _skrap_selskap(side, selskap, opp, merk)
+                    rader, merknad = await _skrap_selskap(side, selskap, opp,
+                                                          lager, merk)
                 except Exception as e:
                     rader, merknad = [], f"{type(e).__name__}: {e}"
                     merk("FEIL", merknad[:120])
+                    try:                      # en død fane erstattes
+                        await side.close()
+                    except Exception:
+                        pass
+                    side = await _ny_side(kontekst, opp)
                 if rader or not merknad:
                     break
                 if forsok < opp.forsok_per_selskap:
-                    await side.wait_for_timeout(2_500 * forsok)
+                    await asyncio.sleep(2.0 * forsok)
                     await _gaa_til(side, opp.start_url, opp)
 
-            # Scoring mens teksten er fersk.
-            scoret = 0
             kandidater = [r for r in rader
                           if r["Text_Length"] >= opp.min_tekstlengde and r["Tekst_Fil"]]
-            if kandidater and skaarer.klar:
-                merk("FinBERT", f"scorer {len(kandidater)} artikler …")
+            scoret = 0
             for rad in kandidater:
                 try:
                     tekst = (opp.tekstmappe / rad["Tekst_Fil"]).read_text(encoding="utf-8")
                 except Exception:
                     continue
-                poeng = skaarer.analyser(tekst)
+                # Egen tråd: FinBERT skal ikke fryse de andre fanene.
+                poeng = await asyncio.to_thread(skaarer.analyser, tekst)
                 if poeng:
                     rad.update({
                         "Positive_Score": round(poeng["positive"], 4),
@@ -1578,35 +1669,71 @@ async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
                 merk("FinBERT", f"{scoret}/{len(kandidater)} scoret"
                                 + ("" if skaarer.klar else " — modellen mangler"))
 
-            lagret = lager.legg_til(rader)
-            status["artikler_nye"] += lagret
+            async with laas:
+                lagret = lager.legg_til(rader)
+                status["artikler_nye"] += lagret
+                if rader:
+                    status["hentet"] += 1
+                    fullfort[symbol] = date.today().isoformat()
+                    if merknad:
+                        status["delvis"].append(f"{symbol}: {merknad}")
+                elif merknad:
+                    status["feilet"].append(f"{symbol}: {merknad}")
+                else:
+                    status["hentet"] += 1
+                    status["tomme"].append(symbol)
+                    fullfort[symbol] = date.today().isoformat()
+                fm.tikk(lagret)
 
-            if rader:
-                status["hentet"] += 1
-                fullfort[symbol] = date.today().isoformat()
-                if merknad:
-                    status["delvis"].append(f"{symbol}: {merknad}")
-            elif merknad:
-                status["feilet"].append(f"{symbol}: {merknad}")
-            else:
-                status["hentet"] += 1
-                status["tomme"].append(symbol)
-                fullfort[symbol] = date.today().isoformat()
+                resultat = (f"{len(rader)} artikler, {lagret} nye" if rader
+                            else ("ingenting nytt" if not merknad
+                                  else f"HOPPET OVER — {merknad[:60]}"))
+                log.info("")
+                log.info("[%d/%d] %-10s %s   (fane %d)", n, len(selskaper), symbol,
+                         selskap.get("Navn", "")[:40], nr)
+                for linje in linjer:
+                    log.info("%s", linje)
+                log.info("         %-16s %s · %s", "resultat", resultat,
+                         _varighet(time.time() - t0))
+                log.info("         %-16s %s", "framdrift", fm.oppsummering())
 
-            fm.tikk(lagret)
-            resultat = (f"{len(rader)} artikler, {lagret} nye" if rader
-                        else ("ingen artikler (bekreftet tomt)" if not merknad
-                              else f"HOPPET OVER — {merknad[:60]}"))
-            merk("resultat", f"{resultat} · {_varighet(time.time() - t0)}")
-            log.info("         %-16s %s", "framdrift", fm.oppsummering())
+                _skriv_json(opp.framdriftsfil, status)
+                _skriv_json(opp.fullfortfil, fullfort)
+                if fm.ferdige % 10 == 0:
+                    lager.lagre_tabell()
+                    log.info("         %-16s %d artikler i lageret, %d OK, %d feilet",
+                             "mellomlagret", len(lager.rader), status["hentet"],
+                             len(status["feilet"]))
+            ko.task_done()
+        try:
+            await side.close()
+        except Exception:
+            pass
 
-            _skriv_json(opp.framdriftsfil, status)
-            _skriv_json(opp.fullfortfil, fullfort)
-            if n % 10 == 0:
-                lager.lagre_tabell()
-                log.info("         %-16s %d artikler i lageret, %d selskaper OK, "
-                         "%d feilet", "mellomlagret", len(lager.rader),
-                         status["hentet"], len(status["feilet"]))
+    async with async_playwright() as pw:
+        nettleser = await pw.chromium.launch(headless=opp.headless,
+                                             slow_mo=opp.slow_mo_ms)
+        kontekst = await nettleser.new_context(
+            viewport={"width": 1600, "height": 1000},
+            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"))
+
+        # Cookie-banneret én gang — samtykket gjelder hele konteksten.
+        start = await _ny_side(kontekst, opp)
+        if await _gaa_til(start, opp.start_url, opp, 60_000):
+            for sel in COOKIE_UTVIDET:
+                if await _klikk(start, [sel], "cookie", 4_000):
+                    log.info("Cookie-banner lukket.")
+                    break
+        try:
+            await start.close()
+        except Exception:
+            pass
+
+        antall = max(1, min(int(opp.parallelle), 8))
+        log.info("Skraper med %d faner samtidig.", antall)
+        await asyncio.gather(*(arbeider(i + 1, kontekst) for i in range(antall)))
 
         try:
             await nettleser.close()
@@ -1614,7 +1741,7 @@ async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
             pass
 
     log.info("")
-    log.info("Skraping ferdig på %s. %d selskaper OK (%d uten artikler), "
+    log.info("Skraping ferdig på %s. %d selskaper OK (%d uten nytt), "
              "%d feilet, %d nye artikler.", _varighet(fm.brukt),
              status["hentet"], len(status["tomme"]), len(status["feilet"]),
              status["artikler_nye"])
@@ -3140,6 +3267,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="cutoff for variantvalg, YYYY-MM-DD")
     p.add_argument("--valg", default="", help="manuell variant, f.eks. S1|TP10")
     p.add_argument("--exits", default="", help="bare disse exit-kodene")
+    p.add_argument("--faner", type=int, default=0,
+                   help="selskaper som skrapes samtidig (standard 3)")
+    p.add_argument("--emnefilter", default="",
+                   help="minimal | quarterly | all_financial | everything")
+    p.add_argument("--fra-dato", default="",
+                   help="eldste artikkel som hentes, YYYY-MM-DD")
     p.add_argument("--debug", action="store_true")
     a = p.parse_args(argv)
 
@@ -3152,6 +3285,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         opp.trening_slutt = a.trening_slutt
     if a.valg:
         opp.manuelt_valg = a.valg
+    if a.faner:
+        opp.parallelle = a.faner
+    if a.emnefilter:
+        opp.emnefilter = a.emnefilter
+    if a.fra_dato:
+        opp.eldste_artikkel = a.fra_dato
 
     if not (a.hent or a.backtest or a.alt):
         p.print_help()
