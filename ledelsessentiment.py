@@ -198,7 +198,12 @@ class Oppsett:
         return p
 
     def klargjor(self) -> None:
+        # En relativ mappe tolkes mot SKRIPTET, ikke mot der du tilfeldigvis
+        # står. Kjører du fra to forskjellige kataloger, havnet dataene ellers
+        # to steder, og den andre kjøringen begynte stille på nytt fra null.
         self.mappe = Path(self.mappe)
+        if not self.mappe.is_absolute():
+            self.mappe = (Path(__file__).resolve().parent / self.mappe).resolve()
         self.mappe.mkdir(parents=True, exist_ok=True)
         self.tekstmappe, self.kursmappe, self.resultatmappe
 
