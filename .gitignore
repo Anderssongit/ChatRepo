@@ -1,0 +1,36 @@
+# Python environments, caches, and local tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# Credentials are local configuration, never source files.
+.env
+.env.*
+!.env.example
+mail_passord.txt
+mail_password.txt
+app_passord.txt
+app_password.txt
+*.pem
+
+# Downloaded inputs, generated reports and local run artifacts
+ExcelData/
+Innsidedata/
+data/
+work/
+# Frittstående ledelsessentiment skriver hit (standard --mappe).
+LedelseData/
+*.log
+*.log.*
+~$*.xlsx
+~$*.docx
+
+# OS metadata
+Thumbs.db
+.DS_Store
