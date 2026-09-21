@@ -93,6 +93,8 @@ class Oppsett:
     euronext_base: str = "https://live.euronext.com"
     start_url: str = "https://live.euronext.com/nb/product/equities/NO0010161896-XOSL"
     aksjeliste_url: str = "https://live.euronext.com/nb/markets/oslo/equities/list"
+    # Markedskoden i Euronext sin produktadresse: /product/equities/<ISIN>-<marked>.
+    marked_suffiks: str = "XOSL"          # Oslo Børs
     headless: bool = True
     slow_mo_ms: int = 40
     steg_pause_ms: int = 400
@@ -740,98 +742,311 @@ def _skriv_selskapsfil(opp: Oppsett, selskaper: Sequence[dict]) -> None:
         log.error("Kunne ikke skrive selskapsfilen: %s", e)
 
 
+# ── Aksjelista: last ned regnearket, ikke skrap tabellen ──────────────────
+#
+# Første utgave leste HTML-tabellen og gjettet hvilken kolonne som var
+# symbolet ut fra et regex-mønster. Det ga «XOSL» — markedskoden for Oslo
+# Børs — som «selskap», og bare 100 rader fordi pagineringen aldri traff.
+# Nedlastingsruten som resten av systemet bruker gir hele lista i én fil med
+# NAVNGITTE kolonner, og ISIN-kolonnen avgjør hva som er en ekte rad.
+
+COOKIE_UTVIDET = SEL_COOKIE + [
+    "button#truste-consent-required",
+    "button#truste-consent-button",
+    ".ot-pc-refuse-all-handler",
+    "button[aria-label*='reject' i]",
+    "button:has-text('Continue without accepting')",
+    "button:has-text('Fortsett uten å godta')",
+]
+SEL_NEDLASTINGSIKON = [
+    "div.dt-buttons button[aria-controls*='stocks-data-table']",
+    "button[aria-controls*='stocks-data-table']",
+    "div.dt-buttons button.btn-link",
+    "div.dt-buttons button",
+    "button:has(svg use[href*='download'])",
+    "[data-ih-nedlasting='1']",
+]
+SEL_FORMAT_XLSX = [
+    "label:has-text('MS Excel')",
+    "input[type='radio'][value*='xlsx']",
+    "input[type='radio'][value*='excel']",
+    "//label[contains(., 'MS Excel')]",
+]
+SEL_GO = [
+    "input[type='submit'][value='Go']",
+    "input.btn-primary[value='Go']",
+    ".modal input[type='submit'].btn-primary",
+    "//input[@value='Go']",
+]
+
+# Nedlastingsikonet er en <svg><use href="...#download">. Det er ikke
+# klikkbart selv; vi merker forelderen som faktisk har klikkhåndtereren.
+JS_MERK_NEDLASTINGSIKON = """
+() => {
+    for (const u of document.querySelectorAll('use')) {
+        const h = u.getAttribute('xlink:href') || u.getAttribute('href') || '';
+        if (h.indexOf('#download') === -1) continue;
+        const svg = u.closest('svg');
+        const el = u.closest('a, button, [role=\"button\"]') || (svg ? svg.parentElement : null);
+        if (el) { el.setAttribute('data-ih-nedlasting', '1'); return true; }
+    }
+    return false;
+}
+"""
+
+# Filtypevinduet er høyere enn skjermen, så «Go» ligger utenfor til du ruller.
+JS_RULL_MODAL = """
+() => {
+    let n = 0;
+    for (const el of document.querySelectorAll(
+            '.modal, .modal-dialog, .modal-content, .modal-body, [role=\"dialog\"], '
+            + '[role=\"dialog\"] div, .modal div')) {
+        if (el.scrollHeight > el.clientHeight + 8) { el.scrollTop = el.scrollHeight; n++; }
+    }
+    window.scrollTo(0, document.body.scrollHeight);
+    return n;
+}
+"""
+
+ISIN_MONSTER = re.compile(r"^[A-Z]{2}[A-Z0-9]{9}\d$")
+
+
+def _finn_kolonne(overskrifter: Sequence[str], *alias: str) -> Optional[int]:
+    """Kolonneindeks etter NAVN, uavhengig av store/små bokstaver."""
+    kart = {str(h).strip().lower(): i for i, h in enumerate(overskrifter)}
+    for a in alias:
+        if a.lower() in kart:
+            return kart[a.lower()]
+    for i, h in enumerate(overskrifter):                  # delvis treff
+        lav = str(h).strip().lower()
+        if any(a.lower() in lav for a in alias):
+            return i
+    return None
+
+
+def _les_regneark(sti: Path) -> Tuple[List[str], List[List[str]]]:
+    """
+    Rader fra et regneark, med overskriftsraden funnet på ISIN-kolonnen.
+
+    Euronext-eksporten har et par metadatarader øverst før den ekte
+    overskriften. Vi leter derfor etter den første raden som inneholder
+    «ISIN», og bruker den som kolonnenavn.
+    """
+    from openpyxl import load_workbook
+    bok = load_workbook(sti, read_only=True, data_only=True)
+    ark = bok[bok.sheetnames[0]]
+    raa = []
+    for rad in ark.iter_rows(values_only=True):
+        raa.append(["" if c is None else str(c).strip() for c in rad])
+        if len(raa) > 50_000:
+            break
+    bok.close()
+
+    start = 0
+    for i, rad in enumerate(raa[:40]):
+        if any(c.strip().lower() == "isin" for c in rad):
+            start = i
+            break
+    if not raa:
+        return [], []
+    return raa[start], raa[start + 1:]
+
+
+def _rader_til_selskaper(overskrifter: Sequence[str], rader: Sequence[Sequence[str]],
+                         kilde: str) -> List[dict]:
+    """
+    Gjør regnearkrader til selskaper. ISIN er porten.
+
+    En rad uten gyldig ISIN er metadata, en sumlinje eller en overskrift —
+    ikke et selskap. Det er nøyaktig denne kontrollen som ville stoppet
+    «XOSL» fra å bli behandlet som et børsnotert foretak.
+    """
+    i_isin = _finn_kolonne(overskrifter, "isin")
+    i_sym = _finn_kolonne(overskrifter, "symbol", "ticker", "mnemo")
+    i_navn = _finn_kolonne(overskrifter, "name", "navn", "company", "selskap")
+    i_marked = _finn_kolonne(overskrifter, "market", "marked", "exchange")
+    if i_isin is None or i_sym is None:
+        log.error("%s mangler ISIN- eller symbolkolonne (fant: %s)",
+                  kilde, ", ".join(str(h) for h in overskrifter[:8]))
+        return []
+
+    ut, sett = [], set()
+    forkastet = 0
+    for r in rader:
+        if len(r) <= max(i_isin, i_sym):
+            continue
+        isin = _rens(r[i_isin]).upper()
+        if not ISIN_MONSTER.match(isin):
+            forkastet += 1
+            continue
+        symbol = _rens(r[i_sym]).upper().replace(".OL", "")
+        if not symbol or symbol in sett:
+            continue
+        sett.add(symbol)
+        ut.append({
+            "Symbol": symbol,
+            "Navn": (_rens(r[i_navn]) if i_navn is not None and len(r) > i_navn
+                     else symbol) or symbol,
+            "ISIN": isin,
+            "Marked": (_rens(r[i_marked]) if i_marked is not None and len(r) > i_marked
+                       else ""),
+        })
+    log.info("Aksjeliste: %d selskaper med gyldig ISIN fra %s "
+             "(%d rader uten ISIN forkastet)", len(ut), kilde, forkastet)
+    return ut
+
+
 def _last_ned_aksjeliste(opp: Oppsett) -> List[dict]:
     """
-    Henter Euronext-aksjelista med nettleseren: nedlastingsikon, så «Go».
+    Henter hele Euronext-aksjelista slik du ville gjort for hånd.
 
-    Feiler den, returneres tom liste og kalleren ber deg lage selskaper.csv
-    for hånd. Ingen unntak slipper ut.
+    Åpne lista, trykk nedlastingsikonet, velg MS Excel, trykk «Go», lagre
+    regnearket. Dette er ruten resten av systemet bruker, og den gir ALLE
+    selskapene i én fil — i motsetning til å bla gjennom HTML-tabellen.
+
+    Feiler nedlastingen, prøves tabellen som reserve. Feiler begge, får du
+    en beskjed om å legge fila der selv. Ingen unntak slipper ut.
     """
     try:
         from playwright.sync_api import sync_playwright
     except Exception as e:
-        log.error("Playwright mangler (%s). Lag %s manuelt med kolonnene "
-                  "Symbol,Navn,ISIN.", e, opp.selskapsfil)
+        log.error("Playwright mangler (%s). Legg Euronext_Equities*.xlsx i %s, "
+                  "eller lag %s med kolonnene Symbol,Navn,ISIN.",
+                  e, opp.mappe, opp.selskapsfil)
         return []
 
-    raa: List[dict] = []
+    mal = opp.mappe / f"Euronext_Equities_{date.today():%Y-%m-%d}.xlsx"
+    selskaper: List[dict] = []
+
     try:
         with sync_playwright() as pw:
+            log.info("Aksjeliste: åpner %s", opp.aksjeliste_url)
             nettleser = pw.chromium.launch(headless=opp.headless,
                                            slow_mo=opp.slow_mo_ms)
-            side = nettleser.new_page()
+            ktx = nettleser.new_context(accept_downloads=True)
+            side = ktx.new_page()
             side.set_default_timeout(opp.side_timeout_ms)
             side.goto(opp.aksjeliste_url, wait_until="domcontentloaded",
                       timeout=60_000)
-            side.wait_for_timeout(2_000)
-            for sel in SEL_COOKIE:
+            side.wait_for_timeout(2_500)
+
+            for sel in COOKIE_UTVIDET:
                 try:
                     if side.locator(sel).count():
                         side.locator(sel).first.click(timeout=4_000)
+                        log.info("Aksjeliste: lukket cookie-banner")
                         break
                 except Exception:
                     continue
+            side.wait_for_timeout(800)
 
-            # Tabellen ligger på sida; les den direkte i stedet for å gå
-            # gjennom nedlastingsdialogen. Færre klikk = færre bruddflater.
-            try:
-                side.wait_for_selector("table tbody tr", timeout=20_000)
-                # Vis så mange rader som mulig før vi leser.
-                for sel in ["select[name='per_page']", "select#edit-items-per-page"]:
+            # ── Nedlastingsikonet ──
+            klikket = False
+            for sel in SEL_NEDLASTINGSIKON:
+                try:
+                    loc = side.locator(sel)
+                    if loc.count():
+                        loc.first.click(timeout=6_000)
+                        klikket = True
+                        log.info("Aksjeliste: trykket nedlastingsikonet")
+                        break
+                except Exception:
+                    continue
+            if not klikket:
+                try:
+                    if side.evaluate(JS_MERK_NEDLASTINGSIKON):
+                        side.locator("[data-ih-nedlasting='1']").first.click(timeout=6_000)
+                        klikket = True
+                        log.info("Aksjeliste: trykket nedlastingsikonet (via JS)")
+                except Exception as e:
+                    log.debug("JS-søk etter nedlastingsikon feilet: %s", e)
+
+            if klikket:
+                try:
+                    side.wait_for_selector(
+                        "input[type='submit'][value='Go'], .modal, [role='dialog']",
+                        timeout=opp.side_timeout_ms)
+                except Exception:
+                    pass
+                side.wait_for_timeout(1_000)
+
+                for sel in SEL_FORMAT_XLSX:                # xlsx er standard
                     try:
-                        if side.locator(sel).count():
-                            side.select_option(sel, "100")
-                            side.wait_for_timeout(2_000)
+                        loc = (side.locator("xpath=" + sel) if sel.startswith("/")
+                               else side.locator(sel))
+                        if loc.count():
+                            loc.first.click(timeout=4_000)
                             break
                     except Exception:
                         continue
-                for _ in range(60):
-                    rader = side.evaluate("""
+                try:
+                    side.evaluate(JS_RULL_MODAL)           # «Go» ligger under kanten
+                except Exception:
+                    pass
+                side.wait_for_timeout(500)
+
+                try:
+                    with side.expect_download(timeout=90_000) as info:
+                        truffet = False
+                        for sel in SEL_GO:
+                            try:
+                                loc = (side.locator("xpath=" + sel) if sel.startswith("/")
+                                       else side.locator(sel))
+                                if loc.count():
+                                    loc.first.click(timeout=6_000)
+                                    truffet = True
+                                    break
+                            except Exception:
+                                continue
+                        if not truffet:
+                            raise RuntimeError("fant ingen «Go»-knapp")
+                    info.value.save_as(str(mal))
+                    log.info("Aksjeliste: lagret regnearket → %s", mal.name)
+                except Exception as e:
+                    log.warning("Aksjeliste: nedlastingen feilet (%s)", e)
+
+            # ── Reserve: les tabellen på sida, med navngitte overskrifter ──
+            if not mal.exists():
+                log.warning("Aksjeliste: faller tilbake på HTML-tabellen")
+                try:
+                    side.wait_for_selector("table tbody tr", timeout=20_000)
+                    tabell = side.evaluate("""
                     () => {
-                        const ut = [];
-                        for (const tr of document.querySelectorAll('table tbody tr')) {
-                            const tds = [...tr.querySelectorAll('td')].map(td => td.innerText.trim());
-                            if (tds.length >= 2) ut.push(tds);
-                        }
-                        return ut;
+                        const t = document.querySelector('table');
+                        if (!t) return null;
+                        const head = [...t.querySelectorAll('thead th, thead td')]
+                                       .map(e => e.innerText.trim());
+                        const rows = [...t.querySelectorAll('tbody tr')]
+                                       .map(tr => [...tr.querySelectorAll('td')]
+                                                    .map(td => td.innerText.trim()));
+                        return {head: head, rows: rows};
                     }
                     """)
-                    for tds in rader:
-                        isin = next((t for t in tds if re.fullmatch(r"[A-Z]{2}[A-Z0-9]{9}\d", t or "")), "")
-                        symbol = next((t for t in tds
-                                       if re.fullmatch(r"[A-Z][A-Z0-9\-]{1,9}", t or "")
-                                       and t != isin), "")
-                        navn = tds[0] if tds else ""
-                        if symbol:
-                            raa.append({"Symbol": symbol, "Navn": navn, "ISIN": isin})
-                    klikket = False
-                    for sel in SEL_NESTE_SIDE:
-                        try:
-                            loc = side.locator(sel)
-                            if loc.count():
-                                loc.first.click(timeout=5_000)
-                                side.wait_for_timeout(1_500)
-                                klikket = True
-                                break
-                        except Exception:
-                            continue
-                    if not klikket:
-                        break
-            except Exception as e:
-                log.error("Kunne ikke lese aksjelistetabellen: %s", e)
+                    if tabell and tabell.get("head"):
+                        selskaper = _rader_til_selskaper(
+                            tabell["head"], tabell["rows"], "HTML-tabellen")
+                except Exception as e:
+                    log.error("Aksjeliste: kunne ikke lese tabellen (%s)", e)
+
             nettleser.close()
     except Exception as e:
-        log.error("Nedlasting av aksjelista feilet: %s", e)
+        log.error("Aksjeliste: nettleseren feilet (%s)", e)
 
-    sett, ut = set(), []
-    for r in raa:
-        s = r["Symbol"].upper()
-        if s and s not in sett:
-            sett.add(s)
-            ut.append(r)
-    log.info("Aksjeliste: %d selskaper hentet", len(ut))
-    return ut
+    if mal.exists():
+        try:
+            overskrifter, rader = _les_regneark(mal)
+            selskaper = _rader_til_selskaper(overskrifter, rader, mal.name)
+        except Exception as e:
+            log.error("Aksjeliste: %s lot seg ikke lese som Excel (%s). "
+                      "En feilet nedlasting gir ofte en HTML-side med "
+                      ".xlsx-navn.", mal.name, e)
 
+    if len(selskaper) < 50:
+        log.error("Aksjeliste: bare %d selskaper — det er for få for Oslo Børs. "
+                  "Gjør det for hånd: åpne %s, trykk nedlastingsikonet og «Go», "
+                  "og legg fila i %s.",
+                  len(selskaper), opp.aksjeliste_url, opp.mappe)
+    return selskaper
 
 def hent_selskaper(opp: Oppsett, selskaper: Optional[Sequence] = None) -> List[dict]:
     """Eksplisitt liste > selskaper.csv > nedlasting fra Euronext."""
@@ -911,8 +1126,35 @@ async def _lukk_modaler(side) -> None:
         pass
 
 
-async def _finn_selskap(side, symbol: str, navn: str, opp: Oppsett) -> bool:
-    """Søker opp selskapet. Prøver symbol, så navn, så kortformer."""
+async def _aapne_selskap(side, selskap: dict, opp: Oppsett) -> Tuple[bool, str]:
+    """
+    Åpner selskapets side. ISIN først, søkefeltet bare som reserve.
+
+    Euronext sin produktadresse er /product/equities/<ISIN>-<marked>, og vi
+    HAR ISIN fra aksjelista. Å navigere rett dit fjerner hele klassen av feil
+    der autocomplete gir et annet selskap — eller, som i den første utgaven,
+    børsens egen side. Søket beholdes for de tilfellene der markedskoden ikke
+    er XOSL.
+
+    Returnerer (ok, hvordan).
+    """
+    isin = _rens(selskap.get("ISIN")).upper()
+    symbol, navn = selskap["Symbol"], selskap.get("Navn", "")
+
+    if ISIN_MONSTER.match(isin):
+        for marked in (opp.marked_suffiks, "XOAM", "MERK", "ALXO"):
+            url = f"{opp.euronext_base}/nb/product/equities/{isin}-{marked}"
+            if not await _gaa_til(side, url, opp):
+                continue
+            try:
+                kropp = (await side.locator("body").inner_text())[:3000].lower()
+            except Exception:
+                kropp = ""
+            if ("/product/equities/" in side.url
+                    and "page not found" not in kropp
+                    and "siden finnes ikke" not in kropp):
+                return True, f"ISIN {isin}-{marked}"
+
     for term in _sokevarianter(symbol, navn):
         felt = None
         for sel in SEL_SOKEFELT:
@@ -925,7 +1167,7 @@ async def _finn_selskap(side, symbol: str, navn: str, opp: Oppsett) -> bool:
             except Exception:
                 continue
         if felt is None:
-            return False
+            break
         try:
             await felt.click(timeout=6_000)
             await felt.fill("")
@@ -945,9 +1187,14 @@ async def _finn_selskap(side, symbol: str, navn: str, opp: Oppsett) -> bool:
             pass
         await side.wait_for_timeout(1_000)
         if "/product/equities/" in side.url:
-            return True
+            # Traff søket riktig selskap? ISIN står i adressen.
+            if ISIN_MONSTER.match(isin) and isin not in side.url.upper():
+                log.debug("  søk på '%s' ga %s — ikke %s", term, side.url, isin)
+                await _gaa_til(side, opp.start_url, opp)
+                continue
+            return True, f"søk '{term}'"
         await _gaa_til(side, opp.start_url, opp)
-    return False
+    return False, ""
 
 
 async def _velg_emner(side, opp: Oppsett) -> None:
@@ -978,7 +1225,7 @@ async def _velg_emner(side, opp: Oppsett) -> None:
         await side.wait_for_timeout(1_500)
 
 
-async def _samle_rader(side, opp: Oppsett) -> Tuple[List[dict], bool]:
+async def _samle_rader(side, opp: Oppsett) -> Tuple[List[dict], bool, int]:
     """
     Blar gjennom tabellen og samler artikkelrader.
 
@@ -1001,16 +1248,16 @@ async def _samle_rader(side, opp: Oppsett) -> Tuple[List[dict], bool]:
                 kropp = ""
             if any(t in kropp for t in ("no results found", "ingen resultater",
                                         "ingen treff")):
-                return [], True          # bekreftet tomt, ikke en feil
-            log.warning("  tabellen kom ikke på side %d — bruker det vi har", sidenr)
-            return rader, False
+                return [], True, sidenr   # bekreftet tomt, ikke en feil
+            log.debug("tabellen kom ikke på side %d — bruker det vi har", sidenr)
+            return rader, False, sidenr
 
         await side.wait_for_timeout(700)
         try:
             nye_rader = await side.evaluate(JS_ARTIKKELRADER)
         except Exception as e:
-            log.warning("  kunne ikke lese side %d (%s)", sidenr, e)
-            return rader, False
+            log.debug("kunne ikke lese side %d (%s)", sidenr, e)
+            return rader, False, sidenr
 
         nye = 0
         for r in nye_rader:
@@ -1026,24 +1273,24 @@ async def _samle_rader(side, opp: Oppsett) -> Tuple[List[dict], bool]:
             rader.append(r)
             nye += 1
 
-        log.debug("  side %d: %d rader, %d nye (totalt %d)",
+        log.debug("side %d: %d rader, %d nye (totalt %d)",
                   sidenr, len(nye_rader), nye, len(rader))
 
         if len(rader) >= opp.maks_artikler:
-            log.info("  nådde grensen på %d artikler — stopper her",
-                     opp.maks_artikler)
-            return rader[:opp.maks_artikler], False
+            log.warning("Traff taket på %d artikler — lista er ufullstendig.",
+                        opp.maks_artikler)
+            return rader[:opp.maks_artikler], False, sidenr
         if nye == 0:
-            return rader, komplett
+            return rader, komplett, sidenr
         if not await _klikk(side, SEL_NESTE_SIDE, "neste side", 7_000):
-            return rader, komplett
+            return rader, komplett, sidenr
         try:
             await side.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
         await side.wait_for_timeout(1_200)
 
-    return rader, False                  # sidegrensen nådd
+    return rader, False, opp.maks_sider  # sidegrensen nådd
 
 
 def _pdf_tekst(url: str) -> str:
@@ -1121,61 +1368,109 @@ async def _hent_tekst(side, rad: dict, liste_url: str, opp: Oppsett) -> Tuple[st
         return "", False
 
 
-async def _skrap_selskap(side, selskap: dict, forste: bool,
-                         opp: Oppsett) -> Tuple[List[dict], str]:
+class Framdrift:
+    """Teller, tidsbruk og ETA. Finnes bare for å gjøre loggen lesbar."""
+
+    def __init__(self, totalt: int):
+        self.totalt = totalt
+        self.start = time.time()
+        self.ferdige = 0
+        self.artikler = 0
+
+    def tikk(self, artikler: int = 0) -> None:
+        self.ferdige += 1
+        self.artikler += artikler
+
+    @property
+    def brukt(self) -> float:
+        return time.time() - self.start
+
+    def oppsummering(self) -> str:
+        if not self.ferdige:
+            return f"0/{self.totalt}"
+        snitt = self.brukt / self.ferdige
+        igjen = max(self.totalt - self.ferdige, 0) * snitt
+        ferdig_kl = datetime.fromtimestamp(time.time() + igjen)
+        return (f"{self.ferdige}/{self.totalt} · {self.artikler} artikler · "
+                f"{_varighet(self.brukt)} brukt · {_varighet(snitt)}/selskap · "
+                f"{_varighet(igjen)} igjen · ferdig ca. {ferdig_kl:%H:%M %d.%m}")
+
+
+def _varighet(sekunder: float) -> str:
+    s = int(max(sekunder, 0))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{s % 60:02d}s"
+    return f"{s // 3600}t{(s % 3600) // 60:02d}m"
+
+
+async def _skrap_selskap(side, selskap: dict, opp: Oppsett,
+                         merk=None) -> Tuple[List[dict], str]:
     """
     Alle artiklene for ett selskap. Returnerer (rader, merknad).
 
-    Kaster aldri. En tom liste med merknad betyr «ikke hentet»; en tom liste
-    uten merknad betyr «bekreftet ingen artikler».
+    Kaster aldri. Tom liste MED merknad betyr «ikke hentet»; tom liste UTEN
+    merknad betyr «bekreftet ingen artikler». `merk` er en loggfunksjon som
+    skriver ett trinn om gangen, slik at en kjøring på flere timer viser hvor
+    den står i stedet for å være stille.
     """
-    symbol, navn = selskap["Symbol"], selskap.get("Navn", "")
+    merk = merk or (lambda *a: None)
+    symbol = selskap["Symbol"]
 
-    if forste:
-        if not await _gaa_til(side, opp.start_url, opp, 60_000):
-            return [], "kom ikke inn på Euronext"
-        for sel in SEL_COOKIE:
-            if await _klikk(side, [sel], "cookie", 5_000):
-                break
-        await side.wait_for_timeout(opp.steg_pause_ms)
-    else:
-        if not await _finn_selskap(side, symbol, navn, opp):
-            await _gaa_til(side, opp.start_url, opp)
-            return [], f"fant ikke '{symbol}' i søket"
+    ok, hvordan = await _aapne_selskap(side, selskap, opp)
+    if not ok:
+        merk("åpne", "FEIL — verken ISIN-adresse eller søk traff")
+        await _gaa_til(side, opp.start_url, opp)
+        return [], "fant ikke selskapssiden"
+    merk("åpne", f"OK via {hvordan}")
 
-    # Selskapsinformasjon-fanen.
     if not await _klikk(side, SEL_SELSKAPSINFO, "selskapsinformasjon", 8_000):
         treff = re.search(r"(/product/equities/[^/?#]+)", side.url)
         if not treff or not await _gaa_til(
                 side, opp.euronext_base + treff.group(1) + "/company-information", opp):
+            merk("selskapsinfo", "FEIL — fanen kunne ikke nås")
             return [], "nådde ikke selskapsinformasjon"
     await side.wait_for_timeout(1_000)
+    merk("selskapsinfo", "OK")
 
-    # Full pressemeldingsliste.
-    if not await _klikk(side, SEL_SE_ALLE, "se alle", 8_000):
-        log.debug("  'Se alle' ikke funnet — bruker sida som den er")
-    else:
+    if await _klikk(side, SEL_SE_ALLE, "se alle", 8_000):
         try:
             await side.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
+        merk("pressemeldinger", "full liste åpnet")
+    else:
+        merk("pressemeldinger", "'Se alle' ikke funnet — bruker sida som den er")
     await side.wait_for_timeout(1_200)
 
     try:
         await _velg_emner(side, opp)
+        merk("emnefilter", f"modus '{opp.emnefilter}'")
     except Exception as e:
-        log.debug("  emnefilter feilet (%s) — fortsetter ufiltrert", e)
+        merk("emnefilter", f"hoppet over ({e}) — fortsetter ufiltrert")
 
     liste_url = side.url
-    rader, komplett = await _samle_rader(side, opp)
+    rader, komplett, sider = await _samle_rader(side, opp)
     if not rader:
+        merk("artikkelliste", "0 rader" + ("" if komplett else " — listen kunne ikke leses"))
         return [], "" if komplett else "ingen artikkelrader lest"
+    merk("artikkelliste", f"{len(rader)} rader over {sider} side(r)"
+                          + ("" if komplett else " — DELVIS"))
+    if len(rader) >= opp.maks_artikler:
+        merk("artikkelliste", f"ADVARSEL: traff taket på {opp.maks_artikler}. "
+                              f"Er '{symbol}' virkelig ett selskap?")
 
     await _gaa_til(side, liste_url, opp)
 
     ut: List[dict] = []
+    tomme = pdf_er = 0
     for n, rad in enumerate(rader, 1):
         tekst, pdf_brukt = await _hent_tekst(side, rad, liste_url, opp)
+        if not tekst:
+            tomme += 1
+        if pdf_brukt:
+            pdf_er += 1
         fil = ""
         if tekst:
             try:
@@ -1188,27 +1483,31 @@ async def _skrap_selskap(side, selskap: dict, forste: bool,
             "Company": symbol,
             "Article_Date": _rens(rad.get("dato")),
             "Article_Title": _rens(rad.get("tittel"))[:180],
-            "Article_URL": rad.get("href") or (f"modal://{rad.get('nid','')}"),
+            "Article_URL": rad.get("href") or f"modal://{rad.get('nid','')}",
             "Final_Score": None, "Positive_Score": None,
             "Neutral_Score": None, "Negative_Score": None,
             "Text_Length": len(tekst), "Tekst_Fil": fil,
             "PDF_Used": bool(pdf_brukt),
             "Scrape_Date": date.today().isoformat(),
         })
+        if n % 10 == 0 or n == len(rader):
+            merk("tekst", f"{n}/{len(rader)} hentet"
+                          + (f", {tomme} tomme" if tomme else "")
+                          + (f", {pdf_er} via PDF" if pdf_er else ""))
         await side.wait_for_timeout(int(opp.artikkel_pause_s * 1_000))
 
-    merknad = "" if komplett else "delvis liste"
-    return ut, merknad
+    return ut, "" if komplett else "delvis liste"
 
 
 async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
                       skaarer: Sentiment, fullfort: dict,
                       opp: Oppsett) -> dict:
-    """Skraper alle selskapene. Lagrer etter hvert eneste selskap."""
+    """Skraper alle selskapene. Lagrer og rapporterer etter hvert eneste ett."""
     from playwright.async_api import async_playwright
 
-    status = {"hentet": 0, "hoppet": 0, "feilet": [], "delvis": [],
+    status = {"hentet": 0, "feilet": [], "delvis": [], "tomme": [],
               "artikler_nye": 0, "uten_score": 0}
+    fm = Framdrift(len(selskaper))
 
     async with async_playwright() as pw:
         nettleser = await pw.chromium.launch(headless=opp.headless,
@@ -1221,29 +1520,45 @@ async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
         side = await kontekst.new_page()
         side.set_default_timeout(opp.side_timeout_ms)
 
-        forste = True
+        # Cookie-banneret én gang, på forsida.
+        if await _gaa_til(side, opp.start_url, opp, 60_000):
+            for sel in COOKIE_UTVIDET:
+                if await _klikk(side, [sel], "cookie", 5_000):
+                    log.info("Cookie-banner lukket.")
+                    break
+
         for n, selskap in enumerate(selskaper, 1):
             symbol = selskap["Symbol"]
-            log.info("[%d/%d] %s", n, len(selskaper), symbol)
+            t0 = time.time()
+            log.info("")
+            log.info("[%d/%d] %-10s %s", n, len(selskaper), symbol,
+                     selskap.get("Navn", "")[:45])
+
+            def merk(trinn: str, tekst: str, _s=symbol) -> None:
+                log.info("         %-16s %s", trinn, tekst)
 
             rader, merknad = [], "ikke forsøkt"
             for forsok in range(1, opp.forsok_per_selskap + 1):
+                if forsok > 1:
+                    merk("nytt forsøk", f"{forsok}/{opp.forsok_per_selskap}")
                 try:
-                    rader, merknad = await _skrap_selskap(side, selskap, forste, opp)
-                    forste = False
+                    rader, merknad = await _skrap_selskap(side, selskap, opp, merk)
                 except Exception as e:
                     rader, merknad = [], f"{type(e).__name__}: {e}"
-                    log.warning("  forsøk %d feilet: %s", forsok, merknad)
+                    merk("FEIL", merknad[:120])
                 if rader or not merknad:
                     break
                 if forsok < opp.forsok_per_selskap:
                     await side.wait_for_timeout(2_500 * forsok)
                     await _gaa_til(side, opp.start_url, opp)
 
-            # Score med en gang, mens teksten er fersk.
-            for rad in rader:
-                if rad["Text_Length"] < opp.min_tekstlengde or not rad["Tekst_Fil"]:
-                    continue
+            # Scoring mens teksten er fersk.
+            scoret = 0
+            kandidater = [r for r in rader
+                          if r["Text_Length"] >= opp.min_tekstlengde and r["Tekst_Fil"]]
+            if kandidater and skaarer.klar:
+                merk("FinBERT", f"scorer {len(kandidater)} artikler …")
+            for rad in kandidater:
                 try:
                     tekst = (opp.tekstmappe / rad["Tekst_Fil"]).read_text(encoding="utf-8")
                 except Exception:
@@ -1256,8 +1571,12 @@ async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
                         "Negative_Score": round(poeng["negative"], 4),
                         "Final_Score": round(poeng["positive"] - poeng["negative"], 4),
                     })
+                    scoret += 1
                 else:
                     status["uten_score"] += 1
+            if kandidater:
+                merk("FinBERT", f"{scoret}/{len(kandidater)} scoret"
+                                + ("" if skaarer.klar else " — modellen mangler"))
 
             lagret = lager.legg_til(rader)
             status["artikler_nye"] += lagret
@@ -1267,27 +1586,43 @@ async def _skrap_alle(selskaper: Sequence[dict], lager: Artikkellager,
                 fullfort[symbol] = date.today().isoformat()
                 if merknad:
                     status["delvis"].append(f"{symbol}: {merknad}")
-                log.info("  → %d artikler (%d nye)", len(rader), lagret)
+            elif merknad:
+                status["feilet"].append(f"{symbol}: {merknad}")
             else:
-                if merknad:
-                    status["feilet"].append(f"{symbol}: {merknad}")
-                    log.warning("  → hoppet over: %s", merknad)
-                else:
-                    status["hentet"] += 1
-                    fullfort[symbol] = date.today().isoformat()
-                    log.info("  → ingen artikler (bekreftet tomt)")
+                status["hentet"] += 1
+                status["tomme"].append(symbol)
+                fullfort[symbol] = date.today().isoformat()
 
-            # Delllagring etter HVERT selskap.
-            _skriv_json(opp.fullfortfil, fullfort)
+            fm.tikk(lagret)
+            resultat = (f"{len(rader)} artikler, {lagret} nye" if rader
+                        else ("ingen artikler (bekreftet tomt)" if not merknad
+                              else f"HOPPET OVER — {merknad[:60]}"))
+            merk("resultat", f"{resultat} · {_varighet(time.time() - t0)}")
+            log.info("         %-16s %s", "framdrift", fm.oppsummering())
+
             _skriv_json(opp.framdriftsfil, status)
+            _skriv_json(opp.fullfortfil, fullfort)
             if n % 10 == 0:
                 lager.lagre_tabell()
+                log.info("         %-16s %d artikler i lageret, %d selskaper OK, "
+                         "%d feilet", "mellomlagret", len(lager.rader),
+                         status["hentet"], len(status["feilet"]))
 
         try:
             await nettleser.close()
         except Exception:
             pass
 
+    log.info("")
+    log.info("Skraping ferdig på %s. %d selskaper OK (%d uten artikler), "
+             "%d feilet, %d nye artikler.", _varighet(fm.brukt),
+             status["hentet"], len(status["tomme"]), len(status["feilet"]),
+             status["artikler_nye"])
+    for f in status["feilet"][:20]:
+        log.info("   feilet: %s", f)
+    if len(status["feilet"]) > 20:
+        log.info("   … og %d til (se %s)", len(status["feilet"]) - 20,
+                 opp.framdriftsfil.name)
     return status
 
 
@@ -1509,11 +1844,28 @@ def last_ned_data(opp: Optional[Oppsett] = None,
         if not alle:
             status["merknader"].append("Ingen selskapsliste — artikler ikke hentet.")
         else:
+            # Sanity: Oslo Børs har rundt 290 noteringer. Er tallet mye lavere,
+            # stoppet lista på første side, og du hadde skrapet et utvalg uten
+            # å vite det. Bedre å si fra nå enn etter seks timer.
+            if len(alle) < 150:
+                log.warning("Selskapslista har bare %d rader. Oslo Børs har "
+                            "rundt 290 — sjekk %s før du lar dette gå natta "
+                            "over.", len(alle), opp.selskapsfil)
+                status["merknader"].append(
+                    f"Bare {len(alle)} selskaper i lista — mulig ufullstendig.")
+
             fullfort = _les_json(opp.fullfortfil, {})
             igjen = (alle if full else
                      [s for s in alle if s["Symbol"] not in fullfort])
-            log.info("Selskaper: %d totalt, %d gjenstår%s",
-                     len(alle), len(igjen), "" if full else " (resten er hentet før)")
+            log.info("Selskaper: %d i lista, %d hentet før, %d gjenstår%s",
+                     len(alle), len(alle) - len(igjen), len(igjen),
+                     " (--full: henter alle på nytt)" if full else "")
+            if igjen:
+                log.info("Først i køen: %s", ", ".join(
+                    s["Symbol"] for s in igjen[:8]) + (" …" if len(igjen) > 8 else ""))
+                log.info("Emnefilter: '%s' · maks %d sider og %d artikler per "
+                         "selskap · %s nettleser", opp.emnefilter, opp.maks_sider,
+                         opp.maks_artikler, "skjult" if opp.headless else "synlig")
 
             if igjen:
                 skaarer = Sentiment(opp)
