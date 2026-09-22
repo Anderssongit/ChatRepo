@@ -633,6 +633,73 @@ class InnsidebacktestenBekreftes(unittest.TestCase):
             M.kjor_innsidehandel(self.m, IP.stillelogger())
 
 
+class Datamappene(unittest.TestCase):
+    """
+    En ny versjonsmappe (…\\260922) skal ikke skygge for dataene som finnes.
+
+    En tom eller halv ExcelData ved siden av master.py vant over den fulle, og
+    «data» ved siden av scriptet var tom. Da kjørte ingenting, og alle fire
+    strategiene så ut til å mangle.
+    """
+
+    def setUp(self):
+        import runtime_config as rc
+        self.rc = rc
+        self.rot = Path(tempfile.mkdtemp())
+        for navn, verdi in (("ROOT", rc.ROOT), ("LEGACY", rc.LEGACY)):
+            self.addCleanup(setattr, rc, navn, verdi)
+        self.addCleanup(setattr, IP, "SKRIPTMAPPE", IP.SKRIPTMAPPE)
+        miljo = os.environ.pop("AKSJE_BASE_DIR", None)
+        if miljo is not None:
+            self.addCleanup(os.environ.__setitem__, "AKSJE_BASE_DIR", miljo)
+
+    @staticmethod
+    def _grunnlag(excel: Path) -> Path:
+        for mappe, fil in (("Data_BT", "AllTickers_OSEBX_TW_260428.xlsx"),
+                           ("DataNLP", "Step4_Sentiment_Changes_1.xlsx"),
+                           ("Data_BT1/FinancialData", "Stock_Prices_1.xlsx")):
+            (excel / mappe).mkdir(parents=True, exist_ok=True)
+            (excel / mappe / fil).write_bytes(b"")
+        return excel
+
+    def test_halv_lokal_exceldata_skygger_ikke_for_den_fulle(self):
+        self.rc.ROOT = self.rot / "260922"
+        (self.rc.ROOT / "ExcelData" / "DataNLP").mkdir(parents=True)
+        full = self._grunnlag(self.rot / "Python_K4" / "ExcelData")
+        self.rc.LEGACY = str(full)
+        self.assertEqual(self.rc.data_root(), full)
+
+    def test_full_lokal_exceldata_vinner_fortsatt(self):
+        self.rc.ROOT = self.rot / "260922"
+        lokal = self._grunnlag(self.rc.ROOT / "ExcelData")
+        self.rc.LEGACY = str(self._grunnlag(self.rot / "Python_K4" / "ExcelData"))
+        self.assertEqual(self.rc.data_root(), lokal)
+
+    def test_innsidedata_fra_forrige_versjon_brukes_naar_egen_er_tom(self):
+        gammel, eldre = self.rot / "260917" / "data", self.rot / "260913" / "data"
+        for mappe, alder in ((gammel, 100), (eldre, 5000)):
+            mappe.mkdir(parents=True)
+            (mappe / "status.json").write_text("{}", encoding="utf-8")
+            os.utime(mappe / "status.json", (time.time() - alder,) * 2)
+        IP.SKRIPTMAPPE = self.rot / "260922"
+        (IP.SKRIPTMAPPE / "data").mkdir(parents=True)          # tom
+        self.assertEqual(M.standard_innsidemappe(), gammel)
+        self.assertEqual(M.Master(excel_dir=self.rot).ut_dir, gammel / "7_master")
+
+    def test_egen_innsidedata_vinner(self):
+        IP.SKRIPTMAPPE = self.rot / "260922"
+        (IP.SKRIPTMAPPE / "data").mkdir(parents=True)
+        (IP.SKRIPTMAPPE / "data" / "status.json").write_text("{}", encoding="utf-8")
+        (self.rot / "260917" / "data").mkdir(parents=True)
+        (self.rot / "260917" / "data" / "status.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(M.standard_innsidemappe(), IP.SKRIPTMAPPE / "data")
+
+    def test_uten_innsidedata_noe_sted_brukes_egen_mappe(self):
+        IP.SKRIPTMAPPE = self.rot / "260922"
+        IP.SKRIPTMAPPE.mkdir()
+        self.assertEqual(M.standard_innsidemappe(), IP.SKRIPTMAPPE / "data")
+
+
 class Prisnotat(unittest.TestCase):
     def test_rettede_og_utelatte_tickere_vises_i_kjoringen(self):
         mappe = Path(tempfile.mkdtemp())

@@ -1,7 +1,6 @@
 {
   "master.py :: hente- og statushjelpere": "def kjor_alle(m: Master, logger) -> List[Rad]:",
   "master.py :: Step4 mellom skraping og SentMom": "analyser = [(\"PB-ROE-Momentum\", O.PBROE_All3)]",
-  "master.py :: finn mail_strategier i flat mappe": "mappe = SKRIPTMAPPE / \"mail\"",
   "master.py :: validate_sources per strategi": "def validate_sources(m, since_ns=None):",
   "master.py :: datastatus også i feilrapporten": "def failure_report(errors):",
   "master.py :: bland bare strategier med ferske data": "def calculate_capital_portfolio(m, rebalance=\"monthly\"):",

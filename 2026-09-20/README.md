@@ -296,7 +296,10 @@ Alt ligger i denne mappen. Ingen kildefil som fantes fra før er endret.
 rotfilene, fordi de også rammer `RUN_ALL.cmd`: prisvakten i `Only_260820.py`,
 at `master.py` tolket returkode 2 fra innsidepipelinen som OK selv når
 backtesten aldri kjørte, og at én feilet nedlasting i steg 1 stanset hele
-innsidekjeden. `build_patches.py` og `patches.json` er oppdatert til de nye
+innsidekjeden. Samme dag: `mail_strategier.py` finnes nå også flatt ved siden
+av `master.py` uten patch, en halv `ExcelData` i en ny versjonsmappe skygger
+ikke lenger for den fulle, og en tom `data` henter innsidedata fra forrige
+versjon. `build_patches.py` og `patches.json` er oppdatert til de nye
 linjenumrene.
 
 Den eneste endringen utenfor mappen er at `2026-09-18` er **fjernet** fra denne
@@ -313,7 +316,7 @@ Fire av rettelsene gjelder likevel filer som allerede fantes:
 
 | Fil | Blokker | Hva |
 |---|---|---|
-| `master.py` | 12 | henter grunnlagsdata, bygger datastatus, lar én strategi feile alene |
+| `master.py` | 11 | henter grunnlagsdata, bygger datastatus, lar én strategi feile alene |
 | `portfolio_blend.py` | 13 | lik vekt til N strategier, ikke alltid fire |
 | `capital_mail.py` | 7 | datastatus øverst; all tekst teller strategiene |
 | `insider_selection.py` | 6 | valg uten kostnader, uendret horisont |
@@ -364,7 +367,7 @@ python 2026-09-20/build_patches.py --frys     frys ankerlinjene på nytt
 ### Verifisert her, uten pandas og uten nett
 
 * **174 tester i `tests/` passerer.**
-* Alle 38 patchblokker treffer de urørte rotfilene; ankerlinjene stemmer;
+* Alle 37 patchblokker treffer de urørte rotfilene; ankerlinjene stemmer;
   `patch(patch(x)) == patch(x)`; hver patchet fil parser.
 * `patches.json` er nøyaktig det `build_patches.py` lager av dagens rotfiler.
 * **`PBROE_All3` og `SentimentMomentumV31` har identiske abstrakte syntakstrær

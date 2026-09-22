@@ -21,11 +21,18 @@ def configure_console():
 def data_root(explicit=None):
     if explicit or os.environ.get("AKSJE_BASE_DIR"):
         return Path(explicit or os.environ["AKSJE_BASE_DIR"]).expanduser().resolve()
-    if (ROOT / "ExcelData").is_dir():
-        return ROOT / "ExcelData"
-    if Path(LEGACY).is_dir():
-        return Path(LEGACY)
-    return ROOT / "ExcelData"
+    local, legacy = ROOT / "ExcelData", Path(LEGACY)
+    # A local ExcelData wins only when it holds the upstream files. A partial
+    # or empty copy next to a new version used to shadow the complete folder,
+    # so nothing ran and every strategy looked missing.
+    for candidate in (local, legacy):
+        if candidate.is_dir() and not protected_input_errors(candidate):
+            return candidate
+    if local.is_dir():
+        return local
+    if legacy.is_dir():
+        return legacy
+    return local
 
 
 class LazyImport:

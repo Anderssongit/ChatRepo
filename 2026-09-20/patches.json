@@ -4,8 +4,8 @@
     "name": "master.py :: hente- og statushjelpere",
     "marker": "def hent_grunnlagsdata",
     "lines": [
-      188,
-      188
+      223,
+      223
     ],
     "original_text": "def kjor_alle(m: Master, logger) -> List[Rad]:\r",
     "replacement_text": "def _fikspakke() -> bool:\r\n    \"\"\"Legg rettelsesmappen på sys.path uten å importere noe med det samme.\"\"\"\r\n    folder = SKRIPTMAPPE / \"2026-09-20\"\r\n    if folder.is_dir() and str(folder) not in sys.path:\r\n        sys.path.insert(0, str(folder))\r\n    return folder.is_dir()\r\n\r\n\r\ndef hent_grunnlagsdata(m: Master, logger, *, steg, force: bool = False) -> List[Rad]:\r\n    \"\"\"Bygg grunnlagsfilene masteren tidligere bare KONTROLLERTE at fantes.\r\n\r\n    AllTickers_OSEBX_TW_260428.xlsx, Stock_Prices_*.xlsx og\r\n    Step4_Sentiment_Changes_*.xlsx kom fra et annet program. Ingen hadde kjørt\r\n    det siden 2026-08-19, og det er hele grunnen til at Sentiment Momentum\r\n    backtestet måned gamle kurser og likevel ble rapportert som OK.\r\n\r\n    Alt som trengs for å bygge dem lastes allerede ned av denne pakken:\r\n    aksjelista og kursene av innsidepipelinen, artikkelscorene av FinBERT-\r\n    skrapingen. Masteren bygger dem derfor selv. De hash-beskyttede strategiene\r\n    røres ikke — dette skriver filene de leser, i formatet de forventer.\r\n\r\n    Statusradene bærer Kilde, Handling, Rader og Siste videre, slik at\r\n    datastatusblokken i mailen kan si hva som faktisk kom ned.\r\n    \"\"\"\r\n    start = time.time()\r\n    if not _fikspakke():\r\n        return [{\"Analyse\": \"Datahenting\", \"Status\": \"FEIL\", \"Minutter\": 0.0,\r\n                 \"Feil\": \"Fant ikke mappen 2026-09-20 ved siden av master.py\"}]\r\n    try:\r\n        from data_acquisition import build_all\r\n        rader = build_all(m.excel_dir, m.oppsett(), logger, steps=steg, force=force)\r\n    except KeyboardInterrupt:\r\n        raise\r\n    except Exception as e:\r\n        logger.exception(\"Datahenting feilet\")\r\n        return [{\"Analyse\": \"Datahenting\", \"Status\": \"OK\", \"Handling\": \"FEIL\",\r\n                 \"Kilde\": \"Datahenting\", \"Merknad\": IP.feiltekst(e)[:180],\r\n                 \"Minutter\": round((time.time() - start) / 60.0, 1),\r\n                 \"Feil\": \"feil — \" + IP.feiltekst(e)[:180]}]\r\n    minutter = round((time.time() - start) / 60.0, 1)\r\n    ut: List[Rad] = []\r\n    for rad in rader:\r\n        logger.info(\"   %-11s %-22s %s\", rad[\"Handling\"], rad[\"Kilde\"], rad[\"Merknad\"])\r\n        # Status er alltid OK: henting som feiler skal ikke velte en kjøring der\r\n        # filene allerede ligger der og er ferske. Handling bærer utfallet, og\r\n        # både bygg_sentimentendringer og datastatusblokken leser den.\r\n        ut.append({\"Analyse\": \"Data: \" + str(rad[\"Kilde\"]), \"Status\": \"OK\",\r\n                   \"Handling\": rad[\"Handling\"], \"Kilde\": rad[\"Kilde\"],\r\n                   \"Merknad\": rad[\"Merknad\"], \"Rader\": rad.get(\"Rader\"),\r\n                   \"Siste\": rad.get(\"Siste\"), \"Minutter\": minutter,\r\n                   \"Feil\": f'{rad[\"Handling\"].lower()} — {rad[\"Merknad\"]}'})\r\n        minutter = 0.0\r\n    return ut\r\n\r\n\r\ndef bygg_sentimentendringer(m: Master, logger) -> int:\r\n    \"\"\"Step4-endringene, bygget av FinBERT-scorene skrapingen nettopp skrev.\r\n\r\n    Må kjøre ETTER skrapingen og FØR SentimentMomentumV31, som leser fila.\r\n    \"\"\"\r\n    rader = hent_grunnlagsdata(m, logger, steg=(\"step4\",))\r\n    feil = [r[\"Feil\"] for r in rader if r.get(\"Handling\") == \"FEIL\"]\r\n    if feil:\r\n        # Her ER det fatalt for SentMom: uten en fersk Step4-fil leser den den\r\n        # forrige, og da er vi tilbake i 2026-09-18.\r\n        raise RuntimeError(\"; \".join(feil))\r\n    return 0\r\n\r\n\r\ndef bygg_datastatus(m: Master, kjoring: Sequence[Rad],\r\n                    per_component=None, curves=None) -> Dict[str, Any]:\r\n    \"\"\"Kom dataene ned, per strategi — og hvem får være med i fellestallene?\r\n\r\n    Feiler aldri kjøringen. Uten datastatus faller masteren tilbake til den\r\n    gamle oppførselen der alle fire må være gyldige.\r\n    \"\"\"\r\n    if not _fikspakke():\r\n        return {}\r\n    try:\r\n        import data_status\r\n        return data_status.hent(\r\n            m.excel_dir, m.innside_dir,\r\n            acquisition=[r for r in kjoring if r.get(\"Kilde\")],\r\n            run_status=kjoring, component_errors=per_component or {},\r\n            as_of=date.today(), curves=curves)\r\n    except Exception as e:\r\n        logger.exception(\"Datastatus kunne ikke bygges: %s\", IP.feiltekst(e))\r\n        return {}\r\n\r\n\r\ndef kjor_alle(m: Master, logger) -> List[Rad]:\r"
@@ -15,30 +15,19 @@
     "name": "master.py :: Step4 mellom skraping og SentMom",
     "marker": "Sentimentendringer — Step4",
     "lines": [
-      229,
-      233
+      264,
+      268
     ],
     "original_text": "        analyser = [(\"PB-ROE-Momentum\", O.PBROE_All3)]\r\n        if O._miljo_paa(\"AKSJE_NLP_HENT\"):\r\n            analyser.append((\"NLP-artikler — skraping\", O.SentimentManagement))\r\n        analyser += [(\"NLP Sentiment — ledelse\", O.SentimentHendelseLab),\r\n                     (\"Sentiment Momentum v3.1\", O.SentimentMomentumV31)]\r",
     "replacement_text": "        analyser = [(\"PB-ROE-Momentum\", O.PBROE_All3)]\r\n        if O._miljo_paa(\"AKSJE_NLP_HENT\"):\r\n            analyser.append((\"NLP-artikler — skraping\", O.SentimentManagement))\r\n        # Step4 bygges av scorene skrapingen nettopp skrev, og må ligge der før\r\n        # SentimentMomentumV31 leser den. Derfor akkurat her.\r\n        analyser.append((\"Sentimentendringer — Step4\",\r\n                         lambda: bygg_sentimentendringer(m, logger)))\r\n        analyser += [(\"NLP Sentiment — ledelse\", O.SentimentHendelseLab),\r\n                     (\"Sentiment Momentum v3.1\", O.SentimentMomentumV31)]\r"
   },
   {
     "file": "master.py",
-    "name": "master.py :: finn mail_strategier i flat mappe",
-    "marker": "mail_strategier ligger flatt i roten",
-    "lines": [
-      933,
-      933
-    ],
-    "original_text": "    mappe = SKRIPTMAPPE / \"mail\"\r",
-    "replacement_text": "    # mail_strategier.py ligger flatt i roten i dette repoet, ikke i en mail/-\r\n    # undermappe. Før falt de tre enkeltstrategiene ut av mailen uten annen\r\n    # grunn enn plasseringen. Undermappen har forrang når den finnes.\r\n    mappe = SKRIPTMAPPE / \"mail\"\r\n    if not (mappe / \"mail_strategier.py\").exists() and (\r\n            SKRIPTMAPPE / \"mail_strategier.py\").exists():\r\n        mappe = SKRIPTMAPPE          # mail_strategier ligger flatt i roten\r"
-  },
-  {
-    "file": "master.py",
     "name": "master.py :: validate_sources per strategi",
     "marker": "per_component.setdefault",
     "lines": [
-      1436,
-      1459
+      1477,
+      1500
     ],
     "original_text": "def validate_sources(m, since_ns=None):\r\n    errors, files = [], []\r\n    from portfolio_blend import load_production_curves\r\n    for component in load_production_curves(m.excel_dir, m.innside_dir):\r\n        name = component['name']\r\n        errors.extend(name + ': ' + str(e) for e in component.get('errors', []))\r\n        source = component.get('source')\r\n        if source:\r\n            files.append({'source': name, **source})\r\n            if since_ns is not None and source['mtime_ns'] < since_ns:\r\n                errors.append(f\"{name}: output was not refreshed by this run\")\r\n    opp = m.oppsett()\r\n    for path in (opp.strategier_csv, opp.strategi_equity_csv,\r\n                 opp.beholdning_csv, opp.strategi_handler_csv,\r\n                 opp.s6_dir / \"selected_variant.json\"):\r\n        try:\r\n            stat = path.stat()\r\n            files.append({\"source\": \"Insider report\", \"path\": str(path.resolve()),\r\n                          \"mtime_ns\": stat.st_mtime_ns, \"size\": stat.st_size})\r\n            if since_ns is not None and stat.st_mtime_ns < since_ns:\r\n                errors.append(f\"Insider report was not refreshed: {path.name}\")\r\n        except OSError:\r\n            errors.append(f\"Insider report missing: {path.name}\")\r\n    return errors, files\r",
     "replacement_text": "def validate_sources(m, since_ns=None):\r\n    \"\"\"Feil per strategi i stedet for én felles liste.\r\n\r\n    Returnerer (errors, files, per_component, curves). `errors` er bare det som\r\n    ikke kan tilskrives én strategi; resten ligger i per_component, slik at en\r\n    strategi med dårlige data kan utelates fra fellestallene i stedet for å\r\n    velte hele mailen. `curves` gis videre så eksportene ikke leses to ganger.\r\n    \"\"\"\r\n    errors, files, per_component = [], [], {}\r\n    from portfolio_blend import load_production_curves\r\n    curves = load_production_curves(m.excel_dir, m.innside_dir)\r\n\r\n    def _per(name, text):\r\n        per_component.setdefault(name, []).append(str(text))\r\n\r\n    for component in curves:\r\n        name = component['name']\r\n        for e in component.get('errors', []):\r\n            _per(name, e)\r\n        source = component.get('source')\r\n        if source:\r\n            files.append({'source': name, **source})\r\n            if since_ns is not None and source['mtime_ns'] < since_ns:\r\n                _per(name, \"output was not refreshed by this run\")\r\n    opp = m.oppsett()\r\n    innside = \"Innsidehandel — Oslo Børs\"\r\n    for path in (opp.strategier_csv, opp.strategi_equity_csv,\r\n                 opp.beholdning_csv, opp.strategi_handler_csv,\r\n                 opp.s6_dir / \"selected_variant.json\"):\r\n        try:\r\n            stat = path.stat()\r\n            files.append({\"source\": \"Insider report\", \"path\": str(path.resolve()),\r\n                          \"mtime_ns\": stat.st_mtime_ns, \"size\": stat.st_size})\r\n            if since_ns is not None and stat.st_mtime_ns < since_ns:\r\n                _per(innside, f\"Insider report was not refreshed: {path.name}\")\r\n        except OSError:\r\n            _per(innside, f\"Insider report missing: {path.name}\")\r\n    return errors, files, per_component, curves\r"
@@ -48,8 +37,8 @@
     "name": "master.py :: datastatus også i feilrapporten",
     "marker": "data_status_html or ''",
     "lines": [
-      1495,
-      1498
+      1536,
+      1539
     ],
     "original_text": "def failure_report(errors):\r\n    return ('<html><meta charset=\"utf-8\"><body><h1>Analysis incomplete</h1>'\r\n            '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'\r\n            + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')\r",
     "replacement_text": "def failure_report(errors, data_status_html=\"\"):\r\n    \"\"\"Selv en mislykket kjøring skal lede med hva som kom ned og hva som ikke.\"\"\"\r\n    return ('<html><meta charset=\"utf-8\"><body><h1>Analysis incomplete</h1>'\r\n            + (data_status_html or '')\r\n            + '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'\r\n            + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')\r"
@@ -59,8 +48,8 @@
     "name": "master.py :: bland bare strategier med ferske data",
     "marker": "included_curves(datastatus)",
     "lines": [
-      1501,
-      1506
+      1542,
+      1547
     ],
     "original_text": "def calculate_capital_portfolio(m, rebalance=\"monthly\"):\r\n    \"\"\"Blend exported strategy NAVs; raw scores are not allocations.\"\"\"\r\n    from portfolio_blend import build_from_files\r\n    return build_from_files(m.excel_dir, m.innside_dir, rebalance=rebalance,\r\n                            as_of=date.today(), start_capital=m.startkapital,\r\n                            risk_free_pct=m.oppsett().risikofri_pst)\r",
     "replacement_text": "def calculate_capital_portfolio(m, rebalance=\"monthly\", datastatus=None):\r\n    \"\"\"Bland de eksporterte strategikurvene; rå scorer er ikke kapitalvekter.\r\n\r\n    Med datastatus blandes bare strategiene som faktisk har ferske data, med\r\n    lik vekt til hver: fire gir 25 % hver, tre gir 33 %. En strategi uten\r\n    ferske data erstattes ikke med null avkastning, og forrige verdi\r\n    videreføres ikke som om den var dagens.\r\n    \"\"\"\r\n    from portfolio_blend import build_capital_portfolio, build_from_files\r\n    felles = dict(rebalance=rebalance, as_of=date.today(),\r\n                  start_capital=m.startkapital,\r\n                  risk_free_pct=m.oppsett().risikofri_pst)\r\n    if datastatus and datastatus.get(\"curves\"):\r\n        import data_status\r\n        valgte = data_status.included_curves(datastatus)\r\n        if len(valgte) < 2:\r\n            raise RuntimeError(\r\n                \"Færre enn to strategier har ferske data (\"\r\n                + (\", \".join(datastatus.get(\"excluded\") or ()) or \"ingen kilder\")\r\n                + \" er utelatt). Ingen samlet portefølje kan beregnes av dette.\")\r\n        result = build_capital_portfolio(valgte, **felles)\r\n        result.setdefault(\"metrics\", {})[\"Utelatte_Strategier\"] = list(\r\n            datastatus.get(\"excluded\") or ())\r\n        return result\r\n    return build_from_files(m.excel_dir, m.innside_dir, **felles)\r"
@@ -70,8 +59,8 @@
     "name": "master.py :: hente- og kostnadsbrytere",
     "marker": "--tving-datahent",
     "lines": [
-      1559,
-      1559
+      1600,
+      1600
     ],
     "original_text": "    p.add_argument(\"--ingen-nlp-hent\", action=\"store_true\", help=\"use existing management article data\")\r",
     "replacement_text": "    p.add_argument(\"--ingen-nlp-hent\", action=\"store_true\", help=\"use existing management article data\")\r\n    p.add_argument(\"--ingen-datahent\", action=\"store_true\",\r\n                   help=\"ikke bygg tickerliste, kursfil og sentimentendringer; \"\r\n                        \"bruk filene som allerede ligger i ExcelData\")\r\n    p.add_argument(\"--tving-datahent\", action=\"store_true\",\r\n                   help=\"bygg grunnlagsfilene på nytt selv om de er ferske\")\r\n    p.add_argument(\"--kostnadstest\", action=\"store_true\",\r\n                   help=\"kjør innsidevariantene på nytt med 0,15 %% og 0,80 %% \"\r\n                        \"kostnad per side som ren opplysning. Kjøringen handler \"\r\n                        \"uten kostnader uansett, og valget bruker dem ikke\")\r"
@@ -81,8 +70,8 @@
     "name": "master.py :: hent data, og la én strategi feile alene",
     "marker": "datastatus = bygg_datastatus",
     "lines": [
-      1605,
-      1623
+      1656,
+      1674
     ],
     "original_text": "    started = time.time_ns()\r\n    errors = []\r\n    kjoring = []\r\n    if not a.ikke_kjor:\r\n        missing = protected_input_errors(m.excel_dir)\r\n        if missing:\r\n            errors.extend(\"Required upstream data missing: \" + f for f in missing)\r\n        else:\r\n            kjoring = kjor_alle(m, logger)\r\n            errors.extend(r[\"Analyse\"] + \": \" + r[\"Feil\"] for r in kjoring if r[\"Status\"] != \"OK\")\r\n    # Old saved selection must be upgraded before it enters a capital sleeve.\r\n    if a.ikke_kjor and not a.bare_mail:\r\n        try:\r\n            ensure_robust_insider_selection(m, logger)\r\n        except Exception as exc:\r\n            logger.exception(\"Insider selection failed\")\r\n            errors.append(str(exc))\r\n    source_errors, source_files = validate_sources(m, None if a.ikke_kjor else started)\r\n    errors.extend(source_errors)\r",
     "replacement_text": "    started = time.time_ns()\r\n    errors = []\r\n    kjoring = []\r\n    if not a.ikke_kjor:\r\n        # Tickerliste og kurser først: PB-ROE og SentMom leser dem. Step4 bygges\r\n        # inne i kjor_alle, rett etter artikkelskrapingen.\r\n        if not a.ingen_datahent:\r\n            kjoring.extend(hent_grunnlagsdata(m, logger, steg=(\"tickers\", \"prices\"),\r\n                                              force=a.tving_datahent))\r\n        missing = protected_input_errors(m.excel_dir)\r\n        if missing:\r\n            # Ikke lenger fatalt for HELE kjøringen. En manglende grunnlagsfil\r\n            # rammer de strategiene som leser den; de øvrige skal fortsatt\r\n            # kjøre, og datastatusblokken sier hvem som mangler hva.\r\n            logger.warning(\"   ⚠️  Grunnlagsdata mangler: %s\", \"; \".join(missing))\r\n            kjoring.append({\"Analyse\": \"Grunnlagsdata\", \"Status\": \"FEIL\",\r\n                            \"Minutter\": 0.0,\r\n                            \"Feil\": \"mangler: \" + \"; \".join(missing)})\r\n        kjoring.extend(kjor_alle(m, logger))\r\n    # Old saved selection must be upgraded before it enters a capital sleeve.\r\n    if a.ikke_kjor and not a.bare_mail:\r\n        try:\r\n            ensure_robust_insider_selection(m, logger)\r\n        except Exception as exc:\r\n            logger.exception(\"Insider selection failed\")\r\n            errors.append(str(exc))\r\n    source_errors, source_files, per_component, curves = validate_sources(\r\n        m, None if a.ikke_kjor else started)\r\n    errors.extend(source_errors)\r\n    # Hver strategi vurderes for seg. En strategi uten ferske data utelates fra\r\n    # fellestallene og navngis øverst i mailen — den stopper ikke de tre andre.\r\n    datastatus = bygg_datastatus(m, kjoring, per_component, curves)\r\n    for _rad in datastatus.get(\"rows\", ()):\r\n        logger.info(\"   Datastatus  %-26s %-9s %s\", _rad.get(\"Strategi\"),\r\n                    _rad.get(\"Status\"), _rad.get(\"Begrunnelse\"))\r"
@@ -92,8 +81,8 @@
     "name": "master.py :: send datastatus inn i kapitalberegningen",
     "marker": "rebalance=a.rebalance, datastatus=datastatus",
     "lines": [
-      1636,
-      1636
+      1687,
+      1687
     ],
     "original_text": "                portfolio = calculate_capital_portfolio(m, rebalance=a.rebalance)\r",
     "replacement_text": "                portfolio = calculate_capital_portfolio(\r\n                    m, rebalance=a.rebalance, datastatus=datastatus)\r"
@@ -103,8 +92,8 @@
     "name": "master.py :: manglende seksjon roper ikke over datastatusen",
     "marker": "alle_strategier_med",
     "lines": [
-      1655,
-      1659
+      1706,
+      1710
     ],
     "original_text": "    if portfolio and (len(sections.get(\"strategier\", [])) != 3\r\n                      or any(x.get(\"mangler\") for x in sections[\"strategier\"])):\r\n        errors.append(\"One or more strategy report sections are missing or invalid\")\r\n    if portfolio and not insider:\r\n        errors.append(\"Insider results missing\")\r",
     "replacement_text": "    # Datastatusen sier allerede hvilke strategier som mangler data, og de er da\r\n    # utelatt fra fellestallene. Da skal en manglende seksjon ikke i tillegg\r\n    # gjøre hele kjøringen ufullstendig — det ville skjult et svar med et rop.\r\n    alle_strategier_med = bool(datastatus.get(\"all_ok\")) if datastatus else True\r\n    if portfolio and alle_strategier_med and (\r\n            len(sections.get(\"strategier\", [])) != 3\r\n            or any(x.get(\"mangler\") for x in sections[\"strategier\"])):\r\n        errors.append(\"One or more strategy report sections are missing or invalid\")\r\n    if portfolio and alle_strategier_med and not insider:\r\n        errors.append(\"Insider results missing\")\r"
@@ -114,8 +103,8 @@
     "name": "master.py :: datastatusblokken øverst i mailen",
     "marker": "statusblokk = mail_status.render",
     "lines": [
-      1673,
-      1678
+      1724,
+      1729
     ],
     "original_text": "    try:\r\n        if sections.get(\"kort\") or insider:\r\n            from capital_mail import render_capital_mail\r\n            html = render_capital_mail(m, kjoring, portfolio, sections, insider, errors)\r\n        else:\r\n            html = failure_report(errors or [\"No strategy reports are available\"])\r",
     "replacement_text": "    statusblokk = \"\"\r\n    try:\r\n        _fikspakke()\r\n        import mail_status\r\n        statusblokk = mail_status.render(datastatus)\r\n    except Exception as exc:\r\n        logger.warning(\"Datastatusblokken kunne ikke bygges: %s\", exc)\r\n    try:\r\n        if sections.get(\"kort\") or insider:\r\n            from capital_mail import render_capital_mail\r\n            html = render_capital_mail(m, kjoring, portfolio, sections, insider,\r\n                                       errors, data_status_html=statusblokk)\r\n        else:\r\n            html = failure_report(errors or [\"No strategy reports are available\"],\r\n                                  data_status_html=statusblokk)\r"
@@ -125,8 +114,8 @@
     "name": "master.py :: emnefelt som teller strategiene",
     "marker": "uten ferske data",
     "lines": [
-      1685,
-      1686
+      1736,
+      1737
     ],
     "original_text": "    else:\r\n        subject = \"Samlet aksjeanalyse — 25 % i hver strategi\"\r",
     "replacement_text": "    else:\r\n        _antall = int(((portfolio or {}).get(\"metrics\", {}) or {}).get(\"N_Strategier\", 4) or 4)\r\n        subject = (\"Samlet aksjeanalyse — 25 % i hver strategi\" if _antall == 4 else\r\n                   f\"Samlet aksjeanalyse — {100.0 / _antall:.0f} % i hver av {_antall} strategier\")\r\n        if datastatus and not datastatus.get(\"all_ok\"):\r\n            subject += f\" · {len(datastatus.get('excluded') or ())} uten ferske data\"\r"

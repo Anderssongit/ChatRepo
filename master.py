@@ -42,15 +42,50 @@ Rad = Dict[str, Any]
 # INNSTILLINGER
 # ══════════════════════════════════════════════════════════════════════════
 
+def _innsidedata_sist_brukt(mappe: Path) -> float:
+    """Når en innsidekjøring sist skrev her; 0 når mappen ikke har innsidedata."""
+    opp = IP.Oppsett(base_dir=mappe)
+    tider = []
+    for sti in (opp.status_json, opp.indeks_csv, opp.strategier_csv):
+        try:
+            tider.append(sti.stat().st_mtime)
+        except OSError:
+            pass
+    return max(tider, default=0.0)
+
+
+def standard_innsidemappe() -> Path:
+    """
+    «data» ved siden av master.py — eller den sist brukte fra en annen versjon.
+
+    Hver versjon pakkes ut i en ny mappe (…\\MainProcessCode\\260917,
+    …\\260922). Med bare «data» ved siden av scriptet begynte hver ny versjon
+    uten innsidehistorikk: ingen resultater å vise, og steg 1 måtte hente alt
+    fra Euronext på nytt. Finnes det ingen innsidedata her, brukes den sist
+    brukte datamappen i en søstermappe. --mappe overstyrer alltid.
+    """
+    egen = IP.SKRIPTMAPPE / "data"
+    if _innsidedata_sist_brukt(egen):
+        return egen
+    try:
+        andre = [p / "data" for p in IP.SKRIPTMAPPE.parent.iterdir()
+                 if p.is_dir() and p != IP.SKRIPTMAPPE]
+    except OSError:
+        return egen
+    brukt = [(t, p) for p in andre for t in (_innsidedata_sist_brukt(p),) if t]
+    return max(brukt)[1] if brukt else egen
+
+
 @dataclass
 class Master:
     """Alt som er verdt å justere, ett sted."""
 
     # ── hvor filene ligger ───────────────────────────────────────────────
     excel_dir: Path = field(default_factory=data_root)
-    # Samme standard som innsidehandel_pipeline: mappen «data» ved siden av
-    # scriptet. Overstyres med --mappe.
-    innside_dir: Path = IP.SKRIPTMAPPE / "data"
+    # Mappen «data» ved siden av scriptet, som i innsidehandel_pipeline — med
+    # mindre den er tom og en tidligere versjon har data. Se
+    # standard_innsidemappe(). Overstyres med --mappe.
+    innside_dir: Path = field(default_factory=standard_innsidemappe)
     ut_dir: Path = field(default_factory=Path)
 
     # ── eldre scoremodell, ikke brukt av standardkjøringen ───────────────
@@ -930,7 +965,13 @@ def strategisammendrag(m: Master, logger) -> Dict[str, Any]:
     """
     tomt: Dict[str, Any] = {"stil": "", "html": "", "kort": {},
                             "strategier": [], "ekstra": ""}
+    # Pakken fra 17. september hadde fila i en mail/-undermappe; i repoet ligger
+    # den ved siden av master.py. Uten reserven falt de tre enkeltstrategiene ut
+    # av mailen bare på grunn av plasseringen. Undermappen har forrang.
     mappe = SKRIPTMAPPE / "mail"
+    if not (mappe / "mail_strategier.py").exists() and (
+            SKRIPTMAPPE / "mail_strategier.py").exists():
+        mappe = SKRIPTMAPPE
     if not (mappe / "mail_strategier.py").exists():
         logger.warning(f"   ⚠️  Fant ikke mail/mail_strategier.py i {mappe} — "
                        f"de tre enkeltstrategiene blir utelatt fra mailen.")
@@ -1601,6 +1642,16 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
     logger.info(f"\n{'═' * 74}\nMASTER — FIRE STRATEGIER, 25 % KAPITAL TIL HVER\n{'═' * 74}")
     logger.info(f"   Innsidedata : {m.innside_dir}")
     logger.info(f"   ExcelData   : {m.excel_dir}")
+    # En ny versjonsmappe har ofte sin egen, tomme eller halve, data. Si hvilke
+    # mapper som faktisk brukes, og hvorfor, før noe annet skjer.
+    egen_data, egen_excel = IP.SKRIPTMAPPE / "data", SKRIPTMAPPE / "ExcelData"
+    if not a.mappe and m.innside_dir != egen_data:
+        logger.warning(f"   ⚠️  Ingen innsidedata i {egen_data} — bruker den sist brukte "
+                       f"fra en annen versjon. Velg selv med --mappe.")
+    if (not a.excel_dir and egen_excel.is_dir() and m.excel_dir != egen_excel
+            and protected_input_errors(egen_excel)):
+        logger.warning(f"   ⚠️  {egen_excel} mangler grunnlagsfilene og brukes ikke. "
+                       f"Velg selv med --excel-dir.")
 
     started = time.time_ns()
     errors = []

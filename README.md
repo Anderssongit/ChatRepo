@@ -6,8 +6,8 @@ Denne utgaven fordeler **25 % kapital til hver strategi**, justerer vektene ved 
 
 1. Pakk ut hele mappen. Behold undermappen `mail` og alle Python-filene sammen. Legg `mail_passord.txt` ved siden av `master.py`. Eksisterende mailinnstillinger og legitimasjon i kildekoden er beholdt.
 2. Installer Python 3.12 med Python Launcher. Kjør `SETUP.cmd` én gang. Dette installerer pakkene og Chromium. Språkmodellen lastes ned når den først trengs.
-3. Kopier eksisterende `ExcelData` inn i denne mappen, eller oppgi plasseringen: `RUN_ALL.cmd --excel-dir "D:\DinMappe\ExcelData"`. På den opprinnelige PC-en kan eksisterende ExcelData fortsatt finnes automatisk. En lokal ExcelData-mappe har forrang.
-4. Kopier eventuelt eksisterende innsidedata som `data` i denne mappen. Kjør `CHECK_SETUP.cmd`, deretter `RUN_ALL.cmd`.
+3. Kopier eksisterende `ExcelData` inn i denne mappen, eller oppgi plasseringen: `RUN_ALL.cmd --excel-dir "D:\DinMappe\ExcelData"`. På den opprinnelige PC-en kan eksisterende ExcelData fortsatt finnes automatisk. En lokal ExcelData-mappe har forrang når den inneholder grunnlagsfilene nevnt under; en tom eller halv kopi hoppes over.
+4. Kopier eventuelt eksisterende innsidedata som `data` i denne mappen. Uten den brukes den sist brukte `data`-mappen fra en tidligere versjon ved siden av (for eksempel `260917\data`), og loggen sier hvilken. `--mappe` velger selv. Kjør `CHECK_SETUP.cmd`, deretter `RUN_ALL.cmd`.
 
 Normal kjøring oppdaterer analysene og sender mail etter beregningen. Nedlasting, teksttolking og 384 varianter av ledelsessentiment kan ta tid. En mislykket del gir en tydelig ufullstendig rapport med tilgjengelige delresultater. Mislykket maillevering gir en feilkode og beholder HTML-kopien lokalt.
 

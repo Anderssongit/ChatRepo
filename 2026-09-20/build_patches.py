@@ -85,7 +85,7 @@ def edit(file: str, name: str, marker: str, first: int, last: int, replacement: 
 # master.py
 # ══════════════════════════════════════════════════════════════════════════
 
-edit("master.py", "master.py :: hente- og statushjelpere", "def hent_grunnlagsdata", 188, 188, f'''
+edit("master.py", "master.py :: hente- og statushjelpere", "def hent_grunnlagsdata", 223, 223, f'''
 def _fikspakke() -> bool:
     """Legg rettelsesmappen på sys.path uten å importere noe med det samme."""
     folder = SKRIPTMAPPE / "{FOLDER}"
@@ -179,7 +179,7 @@ def bygg_datastatus(m: Master, kjoring: Sequence[Rad],
 def kjor_alle(m: Master, logger) -> List[Rad]:'''.lstrip("\n"))
 
 edit("master.py", "master.py :: Step4 mellom skraping og SentMom",
-     "Sentimentendringer — Step4", 229, 233, '''
+     "Sentimentendringer — Step4", 264, 268, '''
         analyser = [("PB-ROE-Momentum", O.PBROE_All3)]
         if O._miljo_paa("AKSJE_NLP_HENT"):
             analyser.append(("NLP-artikler — skraping", O.SentimentManagement))
@@ -190,18 +190,11 @@ edit("master.py", "master.py :: Step4 mellom skraping og SentMom",
         analyser += [("NLP Sentiment — ledelse", O.SentimentHendelseLab),
                      ("Sentiment Momentum v3.1", O.SentimentMomentumV31)]'''.lstrip("\n"))
 
-edit("master.py", "master.py :: finn mail_strategier i flat mappe",
-     "mail_strategier ligger flatt i roten", 933, 933, '''
-    # mail_strategier.py ligger flatt i roten i dette repoet, ikke i en mail/-
-    # undermappe. Før falt de tre enkeltstrategiene ut av mailen uten annen
-    # grunn enn plasseringen. Undermappen har forrang når den finnes.
-    mappe = SKRIPTMAPPE / "mail"
-    if not (mappe / "mail_strategier.py").exists() and (
-            SKRIPTMAPPE / "mail_strategier.py").exists():
-        mappe = SKRIPTMAPPE          # mail_strategier ligger flatt i roten'''.lstrip("\n"))
+# «finn mail_strategier i flat mappe» er rettet i selve master.py (2026-09-22)
+# og patches ikke lenger.
 
 edit("master.py", "master.py :: validate_sources per strategi",
-     "per_component.setdefault", 1436, 1459, '''
+     "per_component.setdefault", 1477, 1500, '''
 def validate_sources(m, since_ns=None):
     """Feil per strategi i stedet for én felles liste.
 
@@ -242,7 +235,7 @@ def validate_sources(m, since_ns=None):
     return errors, files, per_component, curves'''.lstrip("\n"))
 
 edit("master.py", "master.py :: datastatus også i feilrapporten",
-     "data_status_html or ''", 1495, 1498, '''
+     "data_status_html or ''", 1536, 1539, '''
 def failure_report(errors, data_status_html=""):
     """Selv en mislykket kjøring skal lede med hva som kom ned og hva som ikke."""
     return ('<html><meta charset="utf-8"><body><h1>Analysis incomplete</h1>'
@@ -251,7 +244,7 @@ def failure_report(errors, data_status_html=""):
             + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')'''.lstrip("\n"))
 
 edit("master.py", "master.py :: bland bare strategier med ferske data",
-     "included_curves(datastatus)", 1501, 1506, '''
+     "included_curves(datastatus)", 1542, 1547, '''
 def calculate_capital_portfolio(m, rebalance="monthly", datastatus=None):
     """Bland de eksporterte strategikurvene; rå scorer er ikke kapitalvekter.
 
@@ -278,7 +271,7 @@ def calculate_capital_portfolio(m, rebalance="monthly", datastatus=None):
         return result
     return build_from_files(m.excel_dir, m.innside_dir, **felles)'''.lstrip("\n"))
 
-edit("master.py", "master.py :: hente- og kostnadsbrytere", "--tving-datahent", 1559, 1559, '''
+edit("master.py", "master.py :: hente- og kostnadsbrytere", "--tving-datahent", 1600, 1600, '''
     p.add_argument("--ingen-nlp-hent", action="store_true", help="use existing management article data")
     p.add_argument("--ingen-datahent", action="store_true",
                    help="ikke bygg tickerliste, kursfil og sentimentendringer; "
@@ -291,7 +284,7 @@ edit("master.py", "master.py :: hente- og kostnadsbrytere", "--tving-datahent", 
                         "uten kostnader uansett, og valget bruker dem ikke")'''.lstrip("\n"))
 
 edit("master.py", "master.py :: hent data, og la én strategi feile alene",
-     "datastatus = bygg_datastatus", 1605, 1623, '''
+     "datastatus = bygg_datastatus", 1656, 1674, '''
     started = time.time_ns()
     errors = []
     kjoring = []
@@ -329,12 +322,12 @@ edit("master.py", "master.py :: hent data, og la én strategi feile alene",
                     _rad.get("Status"), _rad.get("Begrunnelse"))'''.lstrip("\n"))
 
 edit("master.py", "master.py :: send datastatus inn i kapitalberegningen",
-     "rebalance=a.rebalance, datastatus=datastatus", 1636, 1636, '''
+     "rebalance=a.rebalance, datastatus=datastatus", 1687, 1687, '''
                 portfolio = calculate_capital_portfolio(
                     m, rebalance=a.rebalance, datastatus=datastatus)'''.lstrip("\n"))
 
 edit("master.py", "master.py :: manglende seksjon roper ikke over datastatusen",
-     "alle_strategier_med", 1655, 1659, '''
+     "alle_strategier_med", 1706, 1710, '''
     # Datastatusen sier allerede hvilke strategier som mangler data, og de er da
     # utelatt fra fellestallene. Da skal en manglende seksjon ikke i tillegg
     # gjøre hele kjøringen ufullstendig — det ville skjult et svar med et rop.
@@ -347,7 +340,7 @@ edit("master.py", "master.py :: manglende seksjon roper ikke over datastatusen",
         errors.append("Insider results missing")'''.lstrip("\n"))
 
 edit("master.py", "master.py :: datastatusblokken øverst i mailen",
-     "statusblokk = mail_status.render", 1673, 1678, '''
+     "statusblokk = mail_status.render", 1724, 1729, '''
     statusblokk = ""
     try:
         _fikspakke()
@@ -365,7 +358,7 @@ edit("master.py", "master.py :: datastatusblokken øverst i mailen",
                                   data_status_html=statusblokk)'''.lstrip("\n"))
 
 edit("master.py", "master.py :: emnefelt som teller strategiene",
-     "uten ferske data", 1685, 1686, '''
+     "uten ferske data", 1736, 1737, '''
     else:
         _antall = int(((portfolio or {}).get("metrics", {}) or {}).get("N_Strategier", 4) or 4)
         subject = ("Samlet aksjeanalyse — 25 % i hver strategi" if _antall == 4 else

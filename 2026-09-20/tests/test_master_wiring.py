@@ -231,7 +231,8 @@ class Kjoreflyten(unittest.TestCase):
         self.assertLess(i_status, i_kapital)
 
     def test_mail_strategier_finnes_ogsa_flatt_i_roten(self):
-        self.assertIn("mappe = SKRIPTMAPPE          #", self.kilde)
+        # Rettet i selve master.py 2026-09-22, ikke lenger en patch.
+        self.assertIn('SKRIPTMAPPE / "mail_strategier.py").exists()', self.kilde)
 
     def test_nye_brytere_finnes(self):
         for flagg in ("--ingen-datahent", "--tving-datahent", "--kostnadstest"):
