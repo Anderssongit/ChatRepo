@@ -179,7 +179,7 @@ def bygg_datastatus(m: Master, kjoring: Sequence[Rad],
 def kjor_alle(m: Master, logger) -> List[Rad]:'''.lstrip("\n"))
 
 edit("master.py", "master.py :: Step4 mellom skraping og SentMom",
-     "Sentimentendringer — Step4", 227, 231, '''
+     "Sentimentendringer — Step4", 229, 233, '''
         analyser = [("PB-ROE-Momentum", O.PBROE_All3)]
         if O._miljo_paa("AKSJE_NLP_HENT"):
             analyser.append(("NLP-artikler — skraping", O.SentimentManagement))
@@ -191,7 +191,7 @@ edit("master.py", "master.py :: Step4 mellom skraping og SentMom",
                      ("Sentiment Momentum v3.1", O.SentimentMomentumV31)]'''.lstrip("\n"))
 
 edit("master.py", "master.py :: finn mail_strategier i flat mappe",
-     "mail_strategier ligger flatt i roten", 859, 859, '''
+     "mail_strategier ligger flatt i roten", 933, 933, '''
     # mail_strategier.py ligger flatt i roten i dette repoet, ikke i en mail/-
     # undermappe. Før falt de tre enkeltstrategiene ut av mailen uten annen
     # grunn enn plasseringen. Undermappen har forrang når den finnes.
@@ -201,7 +201,7 @@ edit("master.py", "master.py :: finn mail_strategier i flat mappe",
         mappe = SKRIPTMAPPE          # mail_strategier ligger flatt i roten'''.lstrip("\n"))
 
 edit("master.py", "master.py :: validate_sources per strategi",
-     "per_component.setdefault", 1362, 1385, '''
+     "per_component.setdefault", 1436, 1459, '''
 def validate_sources(m, since_ns=None):
     """Feil per strategi i stedet for én felles liste.
 
@@ -242,7 +242,7 @@ def validate_sources(m, since_ns=None):
     return errors, files, per_component, curves'''.lstrip("\n"))
 
 edit("master.py", "master.py :: datastatus også i feilrapporten",
-     "data_status_html or ''", 1388, 1391, '''
+     "data_status_html or ''", 1495, 1498, '''
 def failure_report(errors, data_status_html=""):
     """Selv en mislykket kjøring skal lede med hva som kom ned og hva som ikke."""
     return ('<html><meta charset="utf-8"><body><h1>Analysis incomplete</h1>'
@@ -251,7 +251,7 @@ def failure_report(errors, data_status_html=""):
             + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')'''.lstrip("\n"))
 
 edit("master.py", "master.py :: bland bare strategier med ferske data",
-     "included_curves(datastatus)", 1394, 1399, '''
+     "included_curves(datastatus)", 1501, 1506, '''
 def calculate_capital_portfolio(m, rebalance="monthly", datastatus=None):
     """Bland de eksporterte strategikurvene; rå scorer er ikke kapitalvekter.
 
@@ -278,7 +278,7 @@ def calculate_capital_portfolio(m, rebalance="monthly", datastatus=None):
         return result
     return build_from_files(m.excel_dir, m.innside_dir, **felles)'''.lstrip("\n"))
 
-edit("master.py", "master.py :: hente- og kostnadsbrytere", "--tving-datahent", 1452, 1452, '''
+edit("master.py", "master.py :: hente- og kostnadsbrytere", "--tving-datahent", 1559, 1559, '''
     p.add_argument("--ingen-nlp-hent", action="store_true", help="use existing management article data")
     p.add_argument("--ingen-datahent", action="store_true",
                    help="ikke bygg tickerliste, kursfil og sentimentendringer; "
@@ -291,7 +291,7 @@ edit("master.py", "master.py :: hente- og kostnadsbrytere", "--tving-datahent", 
                         "uten kostnader uansett, og valget bruker dem ikke")'''.lstrip("\n"))
 
 edit("master.py", "master.py :: hent data, og la én strategi feile alene",
-     "datastatus = bygg_datastatus", 1498, 1516, '''
+     "datastatus = bygg_datastatus", 1605, 1623, '''
     started = time.time_ns()
     errors = []
     kjoring = []
@@ -329,12 +329,12 @@ edit("master.py", "master.py :: hent data, og la én strategi feile alene",
                     _rad.get("Status"), _rad.get("Begrunnelse"))'''.lstrip("\n"))
 
 edit("master.py", "master.py :: send datastatus inn i kapitalberegningen",
-     "rebalance=a.rebalance, datastatus=datastatus", 1529, 1529, '''
+     "rebalance=a.rebalance, datastatus=datastatus", 1636, 1636, '''
                 portfolio = calculate_capital_portfolio(
                     m, rebalance=a.rebalance, datastatus=datastatus)'''.lstrip("\n"))
 
 edit("master.py", "master.py :: manglende seksjon roper ikke over datastatusen",
-     "alle_strategier_med", 1548, 1552, '''
+     "alle_strategier_med", 1655, 1659, '''
     # Datastatusen sier allerede hvilke strategier som mangler data, og de er da
     # utelatt fra fellestallene. Da skal en manglende seksjon ikke i tillegg
     # gjøre hele kjøringen ufullstendig — det ville skjult et svar med et rop.
@@ -347,7 +347,7 @@ edit("master.py", "master.py :: manglende seksjon roper ikke over datastatusen",
         errors.append("Insider results missing")'''.lstrip("\n"))
 
 edit("master.py", "master.py :: datastatusblokken øverst i mailen",
-     "statusblokk = mail_status.render", 1563, 1568, '''
+     "statusblokk = mail_status.render", 1673, 1678, '''
     statusblokk = ""
     try:
         _fikspakke()
@@ -365,7 +365,7 @@ edit("master.py", "master.py :: datastatusblokken øverst i mailen",
                                   data_status_html=statusblokk)'''.lstrip("\n"))
 
 edit("master.py", "master.py :: emnefelt som teller strategiene",
-     "uten ferske data", 1575, 1576, '''
+     "uten ferske data", 1685, 1686, '''
     else:
         _antall = int(((portfolio or {}).get("metrics", {}) or {}).get("N_Strategier", 4) or 4)
         subject = ("Samlet aksjeanalyse — 25 % i hver strategi" if _antall == 4 else
@@ -746,46 +746,14 @@ edit("insider_selection.py", "insider_selection.py :: forbehold uten kostnadsstr
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# Only_260820.py  —  prisvakten retter enhetsavvik, blokkerer resten
+# Only_260820.py  —  ingen patch lenger
 # ══════════════════════════════════════════════════════════════════════════
-
-
-edit("Only_260820.py", "Only_260820.py :: prisvakten retter enhetsavvik",
-     "repair_price_frames", 10256, 10263, f'''
-        # Prisrettelse. kontroller_priser flagger ethvert sprang paa 4x eller mer
-        # mellom to observasjoner, og dette kallet avbroet hele ledelseskjoringen
-        # paa hvilket som helst av dem. Et sprang som er en eksakt tierpotens
-        # (BSP.OL: 0.101440 -> 10.144007, forhold 100.000) er et enhetsavvik fra
-        # datakilden, og det er beviselig fra tallene alene. De rettes BAKOVER -
-        # de nyeste kursene, som aapne posisjoner verdsettes mot, endres aldri -
-        # og hver endring skrives til management_price_issues.csv. Alle andre
-        # flaggede observasjoner blokkerer fortsatt publisering. Ingenting
-        # klippes, interpoleres eller gjettes. Logikk og tester ligger i
-        # {FOLDER}/price_repair.py.
-        import sys as _sys
-        from pathlib import Path as _Path
-        _fix_dir = _Path(__file__).resolve().parent / "{FOLDER}"
-        if _fix_dir.is_dir() and str(_fix_dir) not in _sys.path:
-            _sys.path.insert(0, str(_fix_dir))
-        from price_repair import repair_price_frames, blocked_tickers, summary
-        close, high, low, _repair_results, _issue_rows = repair_price_frames(
-            close, high, low, logger=log)
-        issues = pd.DataFrame(_issue_rows, columns=[
-            "ticker", "date", "issue", "previous_date", "previous_price",
-            "price", "ratio", "applied_factor", "resolution"])
-        issues.to_csv(config.ut_dir / "management_price_issues.csv", index=False)
-        log.info("Kurser   : prisrevisjon %s", summary(_repair_results.values()))
-        _blocked = blocked_tickers(_repair_results.values())
-        if _blocked:
-            raise RuntimeError(
-                "Management prices require verification after provider repair: "
-                + ", ".join(_blocked[:8]) + ". See management_price_issues.csv. "
-                "Power-of-ten unit artifacts were repaired and logged; these remaining "
-                "discontinuities are not provably unit errors, so no backtest or "
-                "variant is published from them. Prices were not clipped or guessed.")
-        # Den rettede serien som faktisk brukes, lagret ved siden av raadataene.
-        close.to_csv(config.ut_dir / "management_prices_close_repaired.csv",
-                     index_label="Date")'''.lstrip("\n"))
+#
+# Prisvakten er rettet direkte i rotfila (2026-09-22): tierpotenser skaleres
+# bakover som her, og en ticker med et sprang ingen kan forklare holdes utenfor
+# universet i stedet for å stanse hele ledelsesanalysen. Å patche over den ville
+# ha satt tilbake den strengere regelen. price_repair.py og testene står igjen
+# som dokumentasjon av logikken.
 
 
 # ══════════════════════════════════════════════════════════════════════════

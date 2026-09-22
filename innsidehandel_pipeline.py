@@ -3847,7 +3847,14 @@ def steg1_nedlasting(opp: Oppsett, logger: logging.Logger, kun: str = "",
         logger.info(f"Meldingene: {klient.via_url} hentet direkte, "
                     f"{klient.via_klikk} åpnet i nettleseren")
 
-    status = "OK" if feil == 0 else "DELVIS"
+    # Noen få selskaper som feiler er Euronext som hikker, ikke en ødelagt
+    # nedlasting: vannmerket deres står urørt, så de prøves igjen neste gang,
+    # og artiklene på disk er fortsatt gyldige. Samme toleranse som kursene i
+    # steg 4. Før ga ÉN feil DELVIS, og DELVIS i steg 1 stanser kjeden før
+    # backtesten — da ble ingenting i 6_backtest oppdatert.
+    status = ("OK" if feil == 0 or (feil <= max(3, len(selskaper) * 0.1)
+                                   and feil < len(selskaper))
+              else "DELVIS")
     return {"status": status, "artikler": len(lagret), "nye": nye,
             "feil": feil, "uten_html": uten_html, "ajour": ajour,
             "detaljer": f"{len(lagret)} artikler på disk ({nye} nye"

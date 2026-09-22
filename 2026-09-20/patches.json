@@ -15,8 +15,8 @@
     "name": "master.py :: Step4 mellom skraping og SentMom",
     "marker": "Sentimentendringer — Step4",
     "lines": [
-      227,
-      231
+      229,
+      233
     ],
     "original_text": "        analyser = [(\"PB-ROE-Momentum\", O.PBROE_All3)]\r\n        if O._miljo_paa(\"AKSJE_NLP_HENT\"):\r\n            analyser.append((\"NLP-artikler — skraping\", O.SentimentManagement))\r\n        analyser += [(\"NLP Sentiment — ledelse\", O.SentimentHendelseLab),\r\n                     (\"Sentiment Momentum v3.1\", O.SentimentMomentumV31)]\r",
     "replacement_text": "        analyser = [(\"PB-ROE-Momentum\", O.PBROE_All3)]\r\n        if O._miljo_paa(\"AKSJE_NLP_HENT\"):\r\n            analyser.append((\"NLP-artikler — skraping\", O.SentimentManagement))\r\n        # Step4 bygges av scorene skrapingen nettopp skrev, og må ligge der før\r\n        # SentimentMomentumV31 leser den. Derfor akkurat her.\r\n        analyser.append((\"Sentimentendringer — Step4\",\r\n                         lambda: bygg_sentimentendringer(m, logger)))\r\n        analyser += [(\"NLP Sentiment — ledelse\", O.SentimentHendelseLab),\r\n                     (\"Sentiment Momentum v3.1\", O.SentimentMomentumV31)]\r"
@@ -26,8 +26,8 @@
     "name": "master.py :: finn mail_strategier i flat mappe",
     "marker": "mail_strategier ligger flatt i roten",
     "lines": [
-      859,
-      859
+      933,
+      933
     ],
     "original_text": "    mappe = SKRIPTMAPPE / \"mail\"\r",
     "replacement_text": "    # mail_strategier.py ligger flatt i roten i dette repoet, ikke i en mail/-\r\n    # undermappe. Før falt de tre enkeltstrategiene ut av mailen uten annen\r\n    # grunn enn plasseringen. Undermappen har forrang når den finnes.\r\n    mappe = SKRIPTMAPPE / \"mail\"\r\n    if not (mappe / \"mail_strategier.py\").exists() and (\r\n            SKRIPTMAPPE / \"mail_strategier.py\").exists():\r\n        mappe = SKRIPTMAPPE          # mail_strategier ligger flatt i roten\r"
@@ -37,8 +37,8 @@
     "name": "master.py :: validate_sources per strategi",
     "marker": "per_component.setdefault",
     "lines": [
-      1362,
-      1385
+      1436,
+      1459
     ],
     "original_text": "def validate_sources(m, since_ns=None):\r\n    errors, files = [], []\r\n    from portfolio_blend import load_production_curves\r\n    for component in load_production_curves(m.excel_dir, m.innside_dir):\r\n        name = component['name']\r\n        errors.extend(name + ': ' + str(e) for e in component.get('errors', []))\r\n        source = component.get('source')\r\n        if source:\r\n            files.append({'source': name, **source})\r\n            if since_ns is not None and source['mtime_ns'] < since_ns:\r\n                errors.append(f\"{name}: output was not refreshed by this run\")\r\n    opp = m.oppsett()\r\n    for path in (opp.strategier_csv, opp.strategi_equity_csv,\r\n                 opp.beholdning_csv, opp.strategi_handler_csv,\r\n                 opp.s6_dir / \"selected_variant.json\"):\r\n        try:\r\n            stat = path.stat()\r\n            files.append({\"source\": \"Insider report\", \"path\": str(path.resolve()),\r\n                          \"mtime_ns\": stat.st_mtime_ns, \"size\": stat.st_size})\r\n            if since_ns is not None and stat.st_mtime_ns < since_ns:\r\n                errors.append(f\"Insider report was not refreshed: {path.name}\")\r\n        except OSError:\r\n            errors.append(f\"Insider report missing: {path.name}\")\r\n    return errors, files\r",
     "replacement_text": "def validate_sources(m, since_ns=None):\r\n    \"\"\"Feil per strategi i stedet for én felles liste.\r\n\r\n    Returnerer (errors, files, per_component, curves). `errors` er bare det som\r\n    ikke kan tilskrives én strategi; resten ligger i per_component, slik at en\r\n    strategi med dårlige data kan utelates fra fellestallene i stedet for å\r\n    velte hele mailen. `curves` gis videre så eksportene ikke leses to ganger.\r\n    \"\"\"\r\n    errors, files, per_component = [], [], {}\r\n    from portfolio_blend import load_production_curves\r\n    curves = load_production_curves(m.excel_dir, m.innside_dir)\r\n\r\n    def _per(name, text):\r\n        per_component.setdefault(name, []).append(str(text))\r\n\r\n    for component in curves:\r\n        name = component['name']\r\n        for e in component.get('errors', []):\r\n            _per(name, e)\r\n        source = component.get('source')\r\n        if source:\r\n            files.append({'source': name, **source})\r\n            if since_ns is not None and source['mtime_ns'] < since_ns:\r\n                _per(name, \"output was not refreshed by this run\")\r\n    opp = m.oppsett()\r\n    innside = \"Innsidehandel — Oslo Børs\"\r\n    for path in (opp.strategier_csv, opp.strategi_equity_csv,\r\n                 opp.beholdning_csv, opp.strategi_handler_csv,\r\n                 opp.s6_dir / \"selected_variant.json\"):\r\n        try:\r\n            stat = path.stat()\r\n            files.append({\"source\": \"Insider report\", \"path\": str(path.resolve()),\r\n                          \"mtime_ns\": stat.st_mtime_ns, \"size\": stat.st_size})\r\n            if since_ns is not None and stat.st_mtime_ns < since_ns:\r\n                _per(innside, f\"Insider report was not refreshed: {path.name}\")\r\n        except OSError:\r\n            _per(innside, f\"Insider report missing: {path.name}\")\r\n    return errors, files, per_component, curves\r"
@@ -48,8 +48,8 @@
     "name": "master.py :: datastatus også i feilrapporten",
     "marker": "data_status_html or ''",
     "lines": [
-      1388,
-      1391
+      1495,
+      1498
     ],
     "original_text": "def failure_report(errors):\r\n    return ('<html><meta charset=\"utf-8\"><body><h1>Analysis incomplete</h1>'\r\n            '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'\r\n            + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')\r",
     "replacement_text": "def failure_report(errors, data_status_html=\"\"):\r\n    \"\"\"Selv en mislykket kjøring skal lede med hva som kom ned og hva som ikke.\"\"\"\r\n    return ('<html><meta charset=\"utf-8\"><body><h1>Analysis incomplete</h1>'\r\n            + (data_status_html or '')\r\n            + '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'\r\n            + ''.join('<li>' + IP.trygg(e) + '</li>' for e in errors) + '</ul></body></html>')\r"
@@ -59,8 +59,8 @@
     "name": "master.py :: bland bare strategier med ferske data",
     "marker": "included_curves(datastatus)",
     "lines": [
-      1394,
-      1399
+      1501,
+      1506
     ],
     "original_text": "def calculate_capital_portfolio(m, rebalance=\"monthly\"):\r\n    \"\"\"Blend exported strategy NAVs; raw scores are not allocations.\"\"\"\r\n    from portfolio_blend import build_from_files\r\n    return build_from_files(m.excel_dir, m.innside_dir, rebalance=rebalance,\r\n                            as_of=date.today(), start_capital=m.startkapital,\r\n                            risk_free_pct=m.oppsett().risikofri_pst)\r",
     "replacement_text": "def calculate_capital_portfolio(m, rebalance=\"monthly\", datastatus=None):\r\n    \"\"\"Bland de eksporterte strategikurvene; rå scorer er ikke kapitalvekter.\r\n\r\n    Med datastatus blandes bare strategiene som faktisk har ferske data, med\r\n    lik vekt til hver: fire gir 25 % hver, tre gir 33 %. En strategi uten\r\n    ferske data erstattes ikke med null avkastning, og forrige verdi\r\n    videreføres ikke som om den var dagens.\r\n    \"\"\"\r\n    from portfolio_blend import build_capital_portfolio, build_from_files\r\n    felles = dict(rebalance=rebalance, as_of=date.today(),\r\n                  start_capital=m.startkapital,\r\n                  risk_free_pct=m.oppsett().risikofri_pst)\r\n    if datastatus and datastatus.get(\"curves\"):\r\n        import data_status\r\n        valgte = data_status.included_curves(datastatus)\r\n        if len(valgte) < 2:\r\n            raise RuntimeError(\r\n                \"Færre enn to strategier har ferske data (\"\r\n                + (\", \".join(datastatus.get(\"excluded\") or ()) or \"ingen kilder\")\r\n                + \" er utelatt). Ingen samlet portefølje kan beregnes av dette.\")\r\n        result = build_capital_portfolio(valgte, **felles)\r\n        result.setdefault(\"metrics\", {})[\"Utelatte_Strategier\"] = list(\r\n            datastatus.get(\"excluded\") or ())\r\n        return result\r\n    return build_from_files(m.excel_dir, m.innside_dir, **felles)\r"
@@ -70,8 +70,8 @@
     "name": "master.py :: hente- og kostnadsbrytere",
     "marker": "--tving-datahent",
     "lines": [
-      1452,
-      1452
+      1559,
+      1559
     ],
     "original_text": "    p.add_argument(\"--ingen-nlp-hent\", action=\"store_true\", help=\"use existing management article data\")\r",
     "replacement_text": "    p.add_argument(\"--ingen-nlp-hent\", action=\"store_true\", help=\"use existing management article data\")\r\n    p.add_argument(\"--ingen-datahent\", action=\"store_true\",\r\n                   help=\"ikke bygg tickerliste, kursfil og sentimentendringer; \"\r\n                        \"bruk filene som allerede ligger i ExcelData\")\r\n    p.add_argument(\"--tving-datahent\", action=\"store_true\",\r\n                   help=\"bygg grunnlagsfilene på nytt selv om de er ferske\")\r\n    p.add_argument(\"--kostnadstest\", action=\"store_true\",\r\n                   help=\"kjør innsidevariantene på nytt med 0,15 %% og 0,80 %% \"\r\n                        \"kostnad per side som ren opplysning. Kjøringen handler \"\r\n                        \"uten kostnader uansett, og valget bruker dem ikke\")\r"
@@ -81,8 +81,8 @@
     "name": "master.py :: hent data, og la én strategi feile alene",
     "marker": "datastatus = bygg_datastatus",
     "lines": [
-      1498,
-      1516
+      1605,
+      1623
     ],
     "original_text": "    started = time.time_ns()\r\n    errors = []\r\n    kjoring = []\r\n    if not a.ikke_kjor:\r\n        missing = protected_input_errors(m.excel_dir)\r\n        if missing:\r\n            errors.extend(\"Required upstream data missing: \" + f for f in missing)\r\n        else:\r\n            kjoring = kjor_alle(m, logger)\r\n            errors.extend(r[\"Analyse\"] + \": \" + r[\"Feil\"] for r in kjoring if r[\"Status\"] != \"OK\")\r\n    # Old saved selection must be upgraded before it enters a capital sleeve.\r\n    if a.ikke_kjor and not a.bare_mail:\r\n        try:\r\n            ensure_robust_insider_selection(m, logger)\r\n        except Exception as exc:\r\n            logger.exception(\"Insider selection failed\")\r\n            errors.append(str(exc))\r\n    source_errors, source_files = validate_sources(m, None if a.ikke_kjor else started)\r\n    errors.extend(source_errors)\r",
     "replacement_text": "    started = time.time_ns()\r\n    errors = []\r\n    kjoring = []\r\n    if not a.ikke_kjor:\r\n        # Tickerliste og kurser først: PB-ROE og SentMom leser dem. Step4 bygges\r\n        # inne i kjor_alle, rett etter artikkelskrapingen.\r\n        if not a.ingen_datahent:\r\n            kjoring.extend(hent_grunnlagsdata(m, logger, steg=(\"tickers\", \"prices\"),\r\n                                              force=a.tving_datahent))\r\n        missing = protected_input_errors(m.excel_dir)\r\n        if missing:\r\n            # Ikke lenger fatalt for HELE kjøringen. En manglende grunnlagsfil\r\n            # rammer de strategiene som leser den; de øvrige skal fortsatt\r\n            # kjøre, og datastatusblokken sier hvem som mangler hva.\r\n            logger.warning(\"   ⚠️  Grunnlagsdata mangler: %s\", \"; \".join(missing))\r\n            kjoring.append({\"Analyse\": \"Grunnlagsdata\", \"Status\": \"FEIL\",\r\n                            \"Minutter\": 0.0,\r\n                            \"Feil\": \"mangler: \" + \"; \".join(missing)})\r\n        kjoring.extend(kjor_alle(m, logger))\r\n    # Old saved selection must be upgraded before it enters a capital sleeve.\r\n    if a.ikke_kjor and not a.bare_mail:\r\n        try:\r\n            ensure_robust_insider_selection(m, logger)\r\n        except Exception as exc:\r\n            logger.exception(\"Insider selection failed\")\r\n            errors.append(str(exc))\r\n    source_errors, source_files, per_component, curves = validate_sources(\r\n        m, None if a.ikke_kjor else started)\r\n    errors.extend(source_errors)\r\n    # Hver strategi vurderes for seg. En strategi uten ferske data utelates fra\r\n    # fellestallene og navngis øverst i mailen — den stopper ikke de tre andre.\r\n    datastatus = bygg_datastatus(m, kjoring, per_component, curves)\r\n    for _rad in datastatus.get(\"rows\", ()):\r\n        logger.info(\"   Datastatus  %-26s %-9s %s\", _rad.get(\"Strategi\"),\r\n                    _rad.get(\"Status\"), _rad.get(\"Begrunnelse\"))\r"
@@ -92,8 +92,8 @@
     "name": "master.py :: send datastatus inn i kapitalberegningen",
     "marker": "rebalance=a.rebalance, datastatus=datastatus",
     "lines": [
-      1529,
-      1529
+      1636,
+      1636
     ],
     "original_text": "                portfolio = calculate_capital_portfolio(m, rebalance=a.rebalance)\r",
     "replacement_text": "                portfolio = calculate_capital_portfolio(\r\n                    m, rebalance=a.rebalance, datastatus=datastatus)\r"
@@ -103,8 +103,8 @@
     "name": "master.py :: manglende seksjon roper ikke over datastatusen",
     "marker": "alle_strategier_med",
     "lines": [
-      1548,
-      1552
+      1655,
+      1659
     ],
     "original_text": "    if portfolio and (len(sections.get(\"strategier\", [])) != 3\r\n                      or any(x.get(\"mangler\") for x in sections[\"strategier\"])):\r\n        errors.append(\"One or more strategy report sections are missing or invalid\")\r\n    if portfolio and not insider:\r\n        errors.append(\"Insider results missing\")\r",
     "replacement_text": "    # Datastatusen sier allerede hvilke strategier som mangler data, og de er da\r\n    # utelatt fra fellestallene. Da skal en manglende seksjon ikke i tillegg\r\n    # gjøre hele kjøringen ufullstendig — det ville skjult et svar med et rop.\r\n    alle_strategier_med = bool(datastatus.get(\"all_ok\")) if datastatus else True\r\n    if portfolio and alle_strategier_med and (\r\n            len(sections.get(\"strategier\", [])) != 3\r\n            or any(x.get(\"mangler\") for x in sections[\"strategier\"])):\r\n        errors.append(\"One or more strategy report sections are missing or invalid\")\r\n    if portfolio and alle_strategier_med and not insider:\r\n        errors.append(\"Insider results missing\")\r"
@@ -114,8 +114,8 @@
     "name": "master.py :: datastatusblokken øverst i mailen",
     "marker": "statusblokk = mail_status.render",
     "lines": [
-      1563,
-      1568
+      1673,
+      1678
     ],
     "original_text": "    try:\r\n        if sections.get(\"kort\") or insider:\r\n            from capital_mail import render_capital_mail\r\n            html = render_capital_mail(m, kjoring, portfolio, sections, insider, errors)\r\n        else:\r\n            html = failure_report(errors or [\"No strategy reports are available\"])\r",
     "replacement_text": "    statusblokk = \"\"\r\n    try:\r\n        _fikspakke()\r\n        import mail_status\r\n        statusblokk = mail_status.render(datastatus)\r\n    except Exception as exc:\r\n        logger.warning(\"Datastatusblokken kunne ikke bygges: %s\", exc)\r\n    try:\r\n        if sections.get(\"kort\") or insider:\r\n            from capital_mail import render_capital_mail\r\n            html = render_capital_mail(m, kjoring, portfolio, sections, insider,\r\n                                       errors, data_status_html=statusblokk)\r\n        else:\r\n            html = failure_report(errors or [\"No strategy reports are available\"],\r\n                                  data_status_html=statusblokk)\r"
@@ -125,8 +125,8 @@
     "name": "master.py :: emnefelt som teller strategiene",
     "marker": "uten ferske data",
     "lines": [
-      1575,
-      1576
+      1685,
+      1686
     ],
     "original_text": "    else:\r\n        subject = \"Samlet aksjeanalyse — 25 % i hver strategi\"\r",
     "replacement_text": "    else:\r\n        _antall = int(((portfolio or {}).get(\"metrics\", {}) or {}).get(\"N_Strategier\", 4) or 4)\r\n        subject = (\"Samlet aksjeanalyse — 25 % i hver strategi\" if _antall == 4 else\r\n                   f\"Samlet aksjeanalyse — {100.0 / _antall:.0f} % i hver av {_antall} strategier\")\r\n        if datastatus and not datastatus.get(\"all_ok\"):\r\n            subject += f\" · {len(datastatus.get('excluded') or ())} uten ferske data\"\r"
@@ -416,16 +416,5 @@
     ],
     "original_text": "        \"limitations\": [\r\n            \"En forhåndsdefinert robusthetsheuristikk er ikke bevis for MOAT eller fremtidig meravkastning.\",\r\n            \"Senere testdata er holdt utenfor dette valget, men eksisterende varianter var tidligere utviklet på deler av samme historikk; testen er ikke uberørt forskning.\",\r\n            \"Kostnadsstress modellerer prosentkostnader, ikke ordrebok, markedspåvirkning eller garantert utførelse.\",\r\n            \"Fullhistorisk kurve for den valgte varianten er tilbakeberegnet; et historisk porteføljeresultat basert på dette valget må begynne etter treningsslutt.\",\r\n        ],\r",
     "replacement_text": "        \"limitations\": list(_zero_cost().LIMITATIONS),\r"
-  },
-  {
-    "file": "Only_260820.py",
-    "name": "Only_260820.py :: prisvakten retter enhetsavvik",
-    "marker": "repair_price_frames",
-    "lines": [
-      10256,
-      10263
-    ],
-    "original_text": "        issues = kontroller_priser(close)\n        issues.to_csv(config.ut_dir / \"management_price_issues.csv\", index=False)\n        if not issues.empty:\n            examples = \", \".join(issues[\"ticker\"].drop_duplicates().head(8))\n            raise RuntimeError(\n                \"Management prices require verification after provider repair: \"\n                + examples + \". See management_price_issues.csv. No backtest or variant \"\n                \"is published from these prices; prices were not clipped or guessed.\")",
-    "replacement_text": "        # Prisrettelse. kontroller_priser flagger ethvert sprang paa 4x eller mer\n        # mellom to observasjoner, og dette kallet avbroet hele ledelseskjoringen\n        # paa hvilket som helst av dem. Et sprang som er en eksakt tierpotens\n        # (BSP.OL: 0.101440 -> 10.144007, forhold 100.000) er et enhetsavvik fra\n        # datakilden, og det er beviselig fra tallene alene. De rettes BAKOVER -\n        # de nyeste kursene, som aapne posisjoner verdsettes mot, endres aldri -\n        # og hver endring skrives til management_price_issues.csv. Alle andre\n        # flaggede observasjoner blokkerer fortsatt publisering. Ingenting\n        # klippes, interpoleres eller gjettes. Logikk og tester ligger i\n        # 2026-09-20/price_repair.py.\n        import sys as _sys\n        from pathlib import Path as _Path\n        _fix_dir = _Path(__file__).resolve().parent / \"2026-09-20\"\n        if _fix_dir.is_dir() and str(_fix_dir) not in _sys.path:\n            _sys.path.insert(0, str(_fix_dir))\n        from price_repair import repair_price_frames, blocked_tickers, summary\n        close, high, low, _repair_results, _issue_rows = repair_price_frames(\n            close, high, low, logger=log)\n        issues = pd.DataFrame(_issue_rows, columns=[\n            \"ticker\", \"date\", \"issue\", \"previous_date\", \"previous_price\",\n            \"price\", \"ratio\", \"applied_factor\", \"resolution\"])\n        issues.to_csv(config.ut_dir / \"management_price_issues.csv\", index=False)\n        log.info(\"Kurser   : prisrevisjon %s\", summary(_repair_results.values()))\n        _blocked = blocked_tickers(_repair_results.values())\n        if _blocked:\n            raise RuntimeError(\n                \"Management prices require verification after provider repair: \"\n                + \", \".join(_blocked[:8]) + \". See management_price_issues.csv. \"\n                \"Power-of-ten unit artifacts were repaired and logged; these remaining \"\n                \"discontinuities are not provably unit errors, so no backtest or \"\n                \"variant is published from them. Prices were not clipped or guessed.\")\n        # Den rettede serien som faktisk brukes, lagret ved siden av raadataene.\n        close.to_csv(config.ut_dir / \"management_prices_close_repaired.csv\",\n                     index_label=\"Date\")"
   }
 ]

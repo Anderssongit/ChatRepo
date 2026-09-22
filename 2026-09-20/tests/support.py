@@ -25,7 +25,7 @@ import patched_import as pi                                         # noqa: E402
 
 def patched_source(stem: str) -> str:
     """Kildekoden til én rotmodul med alle patchene påført, som tekst."""
-    return pi.patch_source(bp.read(stem + ".py"), pi.load_patches()[stem],
+    return pi.patch_source(bp.read(stem + ".py"), pi.load_patches().get(stem, []),
                            stem + ".py")
 
 

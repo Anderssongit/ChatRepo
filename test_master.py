@@ -14,6 +14,7 @@ import os
 import random
 import sys
 import tempfile
+import time
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -570,6 +571,114 @@ class HvilkenMotorMasterKjorer(unittest.TestCase):
                   if "SentimentManagement" in l]
         self.assertFalse(any("NLP Sentiment — ledelse" in l for l in linjer),
                          f"den månedlige er fortsatt merket som kilden: {linjer}")
+
+
+class InnsidebacktestenBekreftes(unittest.TestCase):
+    """
+    Returkode 2 fra innsidepipelinen betyr ikke at backtesten kjørte.
+
+    Et delvis steg 1 stanset kjeden før steg 6 og ga 2. Masteren kalte det OK,
+    og feilen kom først fram som fem «not refreshed»-linjer uten årsak.
+    """
+
+    def setUp(self):
+        self.mappe = Path(tempfile.mkdtemp())
+        self.m = M.Master(excel_dir=self.mappe, innside_dir=self.mappe)
+        self.ekte = IP.main
+        self.addCleanup(setattr, IP, "main", self.ekte)
+
+    def _pipeline(self, statuser, kode, skriv=True):
+        def falsk(argv):
+            if skriv:
+                steg = [{"Steg": n, "Navn": IP.STEGNAVN[n], "Status": s,
+                         "Sekunder": 1.0, "Detaljer": d, "Feil": ""}
+                        for n, (s, d) in sorted(statuser.items())]
+                self.m.oppsett().status_json.write_text(
+                    __import__("json").dumps({"steg": steg}), encoding="utf-8")
+            return kode
+        IP.main = falsk
+
+    def test_delvis_nedlasting_som_stanset_kjeden_er_en_feil(self):
+        self._pipeline({1: ("DELVIS", "3912 artikler på disk (40 selskaper feilet)"),
+                        **{n: ("IKKE_VALGT", "stanset fordi steg 1 feilet")
+                           for n in range(2, 7)}}, 2)
+        with self.assertRaisesRegex(RuntimeError, r"stanset på steg 1 .*40 selskaper"):
+            M.kjor_innsidehandel(self.m, IP.stillelogger())
+
+    def test_delvis_tekstuttrekk_med_fullfort_backtest_er_ok_med_merknad(self):
+        self._pipeline({**{n: ("OK", "") for n in range(1, 7)},
+                        3: ("DELVIS", "30 % ukjent")}, 2)
+        merknad = M.kjor_innsidehandel(self.m, IP.stillelogger())
+        self.assertIn("steg 3", merknad)
+        self.assertIn("30 % ukjent", merknad)
+
+    def test_noen_faa_feilede_selskaper_vises_som_merknad(self):
+        self._pipeline({**{n: ("OK", "") for n in range(1, 7)},
+                        1: ("OK", "3912 artikler på disk (2 selskaper feilet)")}, 0)
+        self.assertIn("2 selskaper feilet",
+                      M.kjor_innsidehandel(self.m, IP.stillelogger()))
+
+    def test_ren_kjoring_gir_ingen_merknad(self):
+        self._pipeline({n: ("OK", "") for n in range(1, 7)}, 0)
+        self.assertEqual(M.kjor_innsidehandel(self.m, IP.stillelogger()), "")
+
+    def test_gammel_statustavle_godtas_ikke(self):
+        sti = self.m.oppsett().status_json
+        sti.parent.mkdir(parents=True, exist_ok=True)
+        sti.write_text('{"steg": [{"Steg": 6, "Status": "OK"}]}', encoding="utf-8")
+        gammel = time.time() - 3600
+        os.utime(sti, (gammel, gammel))
+        self._pipeline({}, 0, skriv=False)
+        with self.assertRaisesRegex(RuntimeError, "statustavle"):
+            M.kjor_innsidehandel(self.m, IP.stillelogger())
+
+
+class Prisnotat(unittest.TestCase):
+    def test_rettede_og_utelatte_tickere_vises_i_kjoringen(self):
+        mappe = Path(tempfile.mkdtemp())
+        m = M.Master(excel_dir=mappe, innside_dir=mappe)
+        start = time.time()
+        sti = mappe / "StrategyResults_v5_Sentiment_Exit" / "management_price_issues.csv"
+        sti.parent.mkdir(parents=True)
+        sti.write_text(
+            "ticker,date,issue,previous_price,price,ratio,resolution\n"
+            "BSP.OL,2025-01-02,unit_scale_artifact,0.1,10.1,100.0,earlier prices multiplied by 100\n"
+            "2020.OL,2025-06-02,unverified_adjusted_price_discontinuity,50,9,0.18,"
+            "ticker excluded from the universe\n", encoding="utf-8")
+        notat = M.prisnotat(m, start)
+        self.assertIn("enhetsavvik rettet: BSP.OL", notat)
+        self.assertIn("utelatt for uforklarte kurssprang: 2020.OL", notat)
+        gammel = start - 3600
+        os.utime(sti, (gammel, gammel))
+        self.assertEqual(M.prisnotat(m, start), "")    # fra en tidligere kjøring
+
+
+class Folgefeil(unittest.TestCase):
+    def test_folgene_av_en_feilet_analyse_blir_en_linje(self):
+        kjoring = [{"Analyse": "NLP Sentiment — ledelse", "Status": "FEIL",
+                    "Feil": "RuntimeError: prisene"},
+                   {"Analyse": "Innsidehandel Oslo Børs", "Status": "FEIL",
+                    "Feil": "Backtesten ble ikke kjørt"},
+                   {"Analyse": "PB-ROE-Momentum", "Status": "OK", "Feil": ""}]
+        errors = ["NLP Sentiment — ledelse: RuntimeError: prisene",
+                  "Innsidehandel Oslo Børs: Backtesten ble ikke kjørt",
+                  "NLP Sentiment — ledelse: Management export predates accounting_version=2",
+                  "NLP Sentiment — ledelse: output was not refreshed by this run",
+                  "Innsidehandel — Oslo Børs: output was not refreshed by this run",
+                  "Insider report was not refreshed: strategier.csv",
+                  "PB-ROE-Momentum: output was not refreshed by this run"]
+        ut, sammenslatt = M.samle_folgefeil(errors, kjoring)
+        self.assertEqual(len(ut), 3)
+        self.assertTrue(ut[0].startswith("NLP Sentiment — ledelse: RuntimeError: prisene"))
+        self.assertIn("2 kontroller feilet", ut[0])
+        self.assertIn("2 kontroller feilet", ut[1])
+        # PB-ROE kjørte OK, så en utdatert fil der er en egen feil.
+        self.assertIn("PB-ROE-Momentum: output was not refreshed by this run", ut)
+        self.assertEqual(len(sammenslatt), 4)
+
+    def test_uten_feilede_analyser_er_listen_uendret(self):
+        errors = ["Insider report missing: strategier.csv"]
+        self.assertEqual(M.samle_folgefeil(errors, [])[0], errors)
 
 
 if __name__ == "__main__":

@@ -48,7 +48,7 @@ class Patchene(unittest.TestCase):
 
     def test_patch_er_idempotent(self):
         for stem in FILER:
-            patches = pi.load_patches()[stem]
+            patches = pi.load_patches().get(stem, [])
             once = support.patched_source(stem)
             twice = pi.patch_source(once, patches, stem + ".py")
             with self.subTest(fil=stem):
@@ -90,12 +90,10 @@ class BeskyttedeStrategier(unittest.TestCase):
                 self.assertEqual(self._funksjonskropp(original, navn),
                                  self._funksjonskropp(patchet, navn))
 
-    def test_bare_ledelsesvakten_er_endret(self):
-        """Ett eneste sted i Only_260820.py er rørt, og det er prisvakten."""
-        patches = pi.load_patches()["Only_260820"]
-        self.assertEqual(len(patches), 1)
-        self.assertIn("kontroller_priser", patches[0]["original_text"])
-        self.assertIn("repair_price_frames", patches[0]["replacement_text"])
+    def test_prisvakten_patches_ikke_lenger(self):
+        """Prisvakten er rettet i rotfila; en patch ville satt tilbake den strengere regelen."""
+        self.assertNotIn("Only_260820", pi.load_patches())
+        self.assertIn("def rett_og_utelat_priser", bp.read("Only_260820.py"))
 
 
 class RotfileneErUrorte(unittest.TestCase):

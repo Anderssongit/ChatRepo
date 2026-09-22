@@ -80,6 +80,65 @@ class ManagementAccounting(unittest.TestCase):
                               index=pd.bdate_range("2024-01-01", periods=5))
         self.assertTrue(self.ns["kontroller_priser"](prices).empty)
 
+    def test_power_of_ten_artifact_is_rescaled_backwards(self):
+        dates = pd.bdate_range("2024-12-27", periods=4)
+        close = pd.DataFrame({"BSP.OL": [.10, .10144, 10.144, 10.3],
+                              "A.OL": [100., 101., 102., 103.]}, index=dates)
+        close, high, low, issues, excluded = self.ns["rett_og_utelat_priser"](
+            close, close * 1.01, close * 0.99)
+        self.assertEqual(excluded, [])
+        self.assertEqual(list(issues["issue"]), ["unit_scale_artifact"])
+        self.assertEqual(list(close["BSP.OL"].round(4)), [10., 10.144, 10.144, 10.3])
+        self.assertEqual(close["BSP.OL"].iloc[-1], 10.3)       # latest untouched
+        self.assertAlmostEqual(high["BSP.OL"].iloc[0], 10. * 1.01)
+        self.assertAlmostEqual(low["BSP.OL"].iloc[0], 10. * 0.99)
+        self.assertEqual(list(close["A.OL"]), [100., 101., 102., 103.])
+
+    def test_unexplained_jump_excludes_only_that_ticker(self):
+        dates = pd.bdate_range("2025-03-03", periods=4)
+        close = pd.DataFrame({"OTEC.OL": [20., 20.5, 4.1, 4.2],
+                              "A.OL": [100., 101., 102., 103.]}, index=dates)
+        out, _, _, issues, excluded = self.ns["rett_og_utelat_priser"](
+            close, close, close)
+        self.assertEqual(excluded, ["OTEC.OL"])
+        self.assertEqual(issues.iloc[0]["resolution"], "ticker excluded from the universe")
+        pd.testing.assert_series_equal(out["OTEC.OL"], close["OTEC.OL"])  # not guessed
+
+    def _download(self, close, directory):
+        from types import SimpleNamespace
+        data = pd.concat({"Close": close, "High": close * 1.01,
+                          "Low": close * 0.99}, axis=1)
+        self.ns["yf"] = SimpleNamespace(download=lambda *a, **k: data)
+        self.ns["config"].base_dir = Path(directory)
+        return self.ns["hent_kurser"](list(close.columns))
+
+    def test_price_download_drops_unverified_ticker_and_keeps_the_rest(self):
+        dates = pd.bdate_range("2025-01-01", periods=60)
+        close = pd.DataFrame({f"T{i}.OL": np.linspace(100, 110, 60) for i in range(10)},
+                             index=dates)
+        close["BSP.OL"] = [.1] * 30 + [10.] * 30
+        close["2020.OL"] = [50.] * 30 + [9.] * 30
+        with tempfile.TemporaryDirectory() as directory:
+            md = self._download(close, directory)
+            saved = pd.read_csv(Path(directory) / "StrategyResults_v5_Sentiment_Exit"
+                                / "management_price_issues.csv")
+        self.assertNotIn("2020.OL", md.close.columns)
+        self.assertNotIn("2020.OL", md.high.columns)
+        self.assertIn("BSP.OL", md.close.columns)
+        self.assertEqual(md.close["BSP.OL"].iloc[0], 10.)
+        self.assertEqual(set(saved["ticker"]), {"BSP.OL", "2020.OL"})
+        self.assertEqual(self.ns["config"].pris_utelatt, ["2020.OL"])
+        self.assertEqual(self.ns["config"].pris_rettet, ["BSP.OL"])
+
+    def test_many_unverified_tickers_still_stop_the_run(self):
+        dates = pd.bdate_range("2025-01-01", periods=10)
+        close = pd.DataFrame({f"T{i}.OL": [50.] * 5 + [9.] * 5 for i in range(6)},
+                             index=dates)
+        close["A.OL"] = 100.
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "6 tickers have unexplained jumps"):
+                self._download(close, directory)
+
     def test_export_declares_accounting_version_and_consistent_nav(self):
         result, strategy, rule, signals = self.run_prices([100, 100, 110, 110, 110, 110])
         with tempfile.TemporaryDirectory() as directory:

@@ -250,6 +250,12 @@ datakilden, beviselig fra tallene alene. Det rettes **bakover**, så de nyeste
 kursene — de åpne posisjoner verdsettes mot — aldri endres. Alt annet blokkerer
 fortsatt publisering. Hver endring skrives til `management_price_issues.csv`.
 
+*Oppdatert 2026-09-22:* prisvakten er nå rettet i selve `Only_260820.py`, og
+patches ikke lenger her. Tierpotenser rettes som over. En ticker med et sprang
+ingen kan forklare (2020.OL og OTEC.OL i kjøringen 2026-09-22) holdes utenfor
+universet i stedet for å stanse hele ledelsesanalysen; bare flere enn 5 slike
+(eller 5 % av tickerne) stanser den fortsatt.
+
 **`mail_strategier.py` ble ikke funnet.** `master.py` lette etter
 `mail/mail_strategier.py`, men fila ligger flatt i roten i dette repoet. De tre
 enkeltstrategiene falt ut av mailen uten annen grunn enn plasseringen. Nå
@@ -286,6 +292,13 @@ nøyaktig det den alltid har gjort, uten rettelsene.
 
 Alt ligger i denne mappen. Ingen kildefil som fantes fra før er endret.
 
+*Unntak fra 2026-09-22:* tre feil fra en ekte kjøring er rettet direkte i
+rotfilene, fordi de også rammer `RUN_ALL.cmd`: prisvakten i `Only_260820.py`,
+at `master.py` tolket returkode 2 fra innsidepipelinen som OK selv når
+backtesten aldri kjørte, og at én feilet nedlasting i steg 1 stanset hele
+innsidekjeden. `build_patches.py` og `patches.json` er oppdatert til de nye
+linjenumrene.
+
 Den eneste endringen utenfor mappen er at `2026-09-18` er **fjernet** fra denne
 grenen. Den er erstattet, ikke bare supplert: alt derfra som fortsatt gjelder
 ligger her — `price_repair.py`, `freshness.py`, importkroken og alle
@@ -296,7 +309,7 @@ mappen ligger fortsatt i historikken og på `main`.
 git diff c4fb146 -- . ":!2026-09-20" ":!2026-09-18"     # tom
 ```
 
-Fem av rettelsene gjelder likevel filer som allerede fantes:
+Fire av rettelsene gjelder likevel filer som allerede fantes:
 
 | Fil | Blokker | Hva |
 |---|---|---|
@@ -304,7 +317,6 @@ Fem av rettelsene gjelder likevel filer som allerede fantes:
 | `portfolio_blend.py` | 13 | lik vekt til N strategier, ikke alltid fire |
 | `capital_mail.py` | 7 | datastatus øverst; all tekst teller strategiene |
 | `insider_selection.py` | 6 | valg uten kostnader, uendret horisont |
-| `Only_260820.py` | 1 | prisvakten retter enhetsavvik, blokkerer resten |
 
 De endres **ikke på disk**. `patched_import.py` installerer en importkrok: når
 en av dem importeres, leses kildekoden fra roten, patchene i `patches.json`
@@ -352,12 +364,12 @@ python 2026-09-20/build_patches.py --frys     frys ankerlinjene på nytt
 ### Verifisert her, uten pandas og uten nett
 
 * **174 tester i `tests/` passerer.**
-* Alle 39 patchblokker treffer de urørte rotfilene; ankerlinjene stemmer;
+* Alle 38 patchblokker treffer de urørte rotfilene; ankerlinjene stemmer;
   `patch(patch(x)) == patch(x)`; hver patchet fil parser.
 * `patches.json` er nøyaktig det `build_patches.py` lager av dagens rotfiler.
 * **`PBROE_All3` og `SentimentMomentumV31` har identiske abstrakte syntakstrær
-  før og etter patchen.** Bare prisvakten i `SentimentHendelseLab` er rørt i
-  `Only_260820.py`.
+  før og etter patchen.** `Only_260820.py` patches ikke lenger; prisvakten
+  er rettet i rotfila (2026-09-22).
 * Rotfilene er byte-identiske (SHA-256) etter at patchene er bygget og påført.
 * Repoets egne `test_portfolio_blend` (15), `test_capital_mail` (3) og
   `test_master` (24) passerer **mot de patchede modulene**.

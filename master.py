@@ -188,6 +188,7 @@ def filalder(sti: Optional[Path]) -> str:
 def kjor_alle(m: Master, logger) -> List[Rad]:
     """Kjører de fire analysene. Én rad per analyse med status og tid."""
     ut: List[Rad] = []
+    kjoring_start = time.time()
 
     def kjor(navn: str, handling) -> None:
         logger.info(f"\n{'━' * 74}\n{navn.upper()}\n{'━' * 74}")
@@ -196,8 +197,9 @@ def kjor_alle(m: Master, logger) -> List[Rad]:
             code = handling()
             if isinstance(code, int) and not isinstance(code, bool) and code not in (0, 2):
                 raise RuntimeError(f"Analysis returned failure code {code}")
-            status, feil = "OK", ("Parsing partly classified; see insider stage status"
-                                   if code == 2 else "")
+            # En tekst er en merknad fra kjor_innsidehandel; de andre
+            # analysene returnerer None eller en filsti.
+            status, feil = "OK", (code if isinstance(code, str) else "")
         except KeyboardInterrupt:
             raise
         except Exception as e:
@@ -242,11 +244,83 @@ def kjor_alle(m: Master, logger) -> List[Rad]:
             ut.append({"Analyse": navn, "Status": "FEIL", "Minutter": 0.0,
                        "Feil": "Only_260820 kunne ikke importeres"})
 
-    kjor("Innsidehandel Oslo Børs",
-         lambda: IP.main(["--steg", "1-6", "--ingen-mail",
-                          "--mappe", str(m.innside_dir),
-                          "--min-navn", str(m.min_navn), "--stopp-ved-feil"]))
+    notat = prisnotat(m, kjoring_start)
+    for rad in ut:
+        if notat and rad["Analyse"] == "NLP Sentiment — ledelse" and rad["Status"] == "OK":
+            rad["Feil"] = "; ".join(x for x in (rad["Feil"], notat) if x)
+
+    kjor("Innsidehandel Oslo Børs", lambda: kjor_innsidehandel(m, logger))
     return ut
+
+
+def prisnotat(m: Master, siden: float) -> str:
+    """Kursene ledelsesanalysen rettet eller holdt utenfor i denne kjøringen."""
+    sti = m.excel_dir / "StrategyResults_v5_Sentiment_Exit" / "management_price_issues.csv"
+    try:
+        if sti.stat().st_mtime < siden - 1.0:
+            return ""
+    except OSError:
+        return ""
+    rader = IP.les_csv(sti)
+    rettet = sorted({r.get("ticker") for r in rader if r.get("issue") == "unit_scale_artifact"})
+    utelatt = sorted({r.get("ticker") for r in rader
+                      if r.get("resolution") == "ticker excluded from the universe"})
+    deler = ([f"enhetsavvik rettet: {', '.join(rettet)}"] if rettet else []) + (
+        [f"utelatt for uforklarte kurssprang: {', '.join(utelatt)}"] if utelatt else [])
+    return ("Kurser — " + "; ".join(deler) + " (se management_price_issues.csv)"
+            if deler else "")
+
+
+def _innside_steg(m: Master, siden: float) -> Dict[int, Rad]:
+    """Stegene fra innsidepipelinens status.json — bare hvis den er fra nå."""
+    sti = m.oppsett().status_json
+    try:
+        if sti.stat().st_mtime < siden - 1.0:
+            return {}
+        data = json.loads(sti.read_text(encoding="utf-8"))
+        return {int(r["Steg"]): r for r in data.get("steg", [])}
+    except (OSError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def _beskriv_steg(rad: Rad) -> str:
+    tekst = str(rad.get("Feil") or rad.get("Detaljer") or "").strip()
+    return (f"steg {rad.get('Steg')} ({rad.get('Navn')}) {rad.get('Status')}"
+            + (f": {tekst}" if tekst else ""))
+
+
+def kjor_innsidehandel(m: Master, logger) -> str:
+    """
+    Innsidepipelinen, og en kontroll av at backtesten faktisk ble kjørt.
+
+    IP.main returnerer 2 både når et steg var delvis og backtesten likevel
+    kjørte, og når et delvis steg 1, 4 eller 5 stanset kjeden FØR backtesten.
+    Masteren tolket 2 som OK. Da ble ingenting i 6_backtest oppdatert, og
+    feilen dukket først opp som fem «not refreshed»-linjer uten årsak.
+
+    Leser derfor statustavlen pipelinen skriver. Returnerer en merknad (tom
+    når alt var rent) og kaster med steget som stanset når steg 6 ikke er OK.
+    """
+    start = time.time()
+    kode = IP.main(["--steg", "1-6", "--ingen-mail", "--mappe", str(m.innside_dir),
+                    "--min-navn", str(m.min_navn), "--stopp-ved-feil"])
+    steg = _innside_steg(m, start)
+    if not steg:
+        raise RuntimeError(f"Innsidepipelinen returnerte {kode}, men skrev ingen "
+                           f"statustavle ({m.oppsett().status_json.name}); "
+                           f"backtesten kan ikke bekreftes")
+    avvik = [r for _, r in sorted(steg.items())
+             if r.get("Status") not in ("OK", "IKKE_VALGT")]
+    if steg.get(6, {}).get("Status") != "OK":
+        stanset = avvik[0] if avvik else steg.get(6, {"Steg": 6, "Status": "IKKE_VALGT"})
+        raise RuntimeError("Backtesten ble ikke kjørt — stanset på "
+                           + _beskriv_steg(stanset))
+    # Noen få selskaper som feilet i nedlastingen stanser ikke lenger kjeden,
+    # men de skal fortsatt synes i mailen.
+    nedlasting = steg.get(1, {})
+    if nedlasting not in avvik and "feilet" in str(nedlasting.get("Detaljer", "")):
+        avvik.insert(0, nedlasting)
+    return "; ".join(_beskriv_steg(r) for r in avvik)
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1385,6 +1459,39 @@ def validate_sources(m, since_ns=None):
     return errors, files
 
 
+# Kontrollfeil som bare er en følge av at analysen selv feilet i denne
+# kjøringen: resultatfilen ble ikke oppdatert, og den gamle er kanskje fra før
+# en rettelse. Riktig, men støy — årsaken står allerede i listen.
+FOLGEFEIL = {
+    "PB-ROE-Momentum": ("PB-ROE-Momentum: ",),
+    "NLP Sentiment — ledelse": ("NLP Sentiment — ledelse: ",),
+    "Sentiment Momentum v3.1": ("Sentiment Momentum v3.1: ",),
+    "Innsidehandel Oslo Børs": ("Innsidehandel — Oslo Børs: ",
+                                "Insider report was not refreshed: ",
+                                "Insider report missing: "),
+}
+
+
+def samle_folgefeil(errors: Sequence[str], kjoring: Sequence[Rad]
+                    ) -> Tuple[List[str], List[str]]:
+    """(feil med én linje per analyse som feilet, følgefeilene som ble slått sammen)."""
+    ut, sammenslatt = [str(e) for e in errors], []
+    for rad in kjoring:
+        navn = rad.get("Analyse")
+        if rad.get("Status") == "OK" or navn not in FOLGEFEIL:
+            continue
+        aarsak = f"{navn}: {rad.get('Feil')}"
+        folger = [e for e in ut if e != aarsak and e.startswith(FOLGEFEIL[navn])]
+        if not folger or aarsak not in ut:
+            continue
+        ut = [e for e in ut if e not in folger]
+        ut[ut.index(aarsak)] = (f"{aarsak} — lagrede resultater fra en tidligere "
+                                f"kjøring brukes derfor ikke ({len(folger)} "
+                                f"kontroller feilet)")
+        sammenslatt.extend(folger)
+    return ut, sammenslatt
+
+
 def failure_report(errors):
     return ('<html><meta charset="utf-8"><body><h1>Analysis incomplete</h1>'
             '<p>No current performance report was issued. Correct these errors and rerun.</p><ul>'
@@ -1560,6 +1667,9 @@ def kjor(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as exc:
             logger.exception("Could not save completed portfolio")
             errors.append("Could not save completed portfolio: " + str(exc))
+    errors, sammenslatt = samle_folgefeil(errors, kjoring)
+    for folge in sammenslatt:
+        logger.info("Følge av en feil over: %s", folge)
     try:
         if sections.get("kort") or insider:
             from capital_mail import render_capital_mail

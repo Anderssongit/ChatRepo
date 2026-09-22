@@ -36,6 +36,5 @@
   "insider_selection.py :: manuelt valg uten kostnadsspråk": "reason = (f\"Manuelt valg: {manual}. Den automatiske robusthetsregelen anbefalte \"",
   "insider_selection.py :: treningshalvdeler uten kostnad": "\"Train_Turnover_Per_Year_Pst\": 100 * turnover / mean_capital / years",
   "insider_selection.py :: politikk uten kostnadsregel": "\"policy\": {",
-  "insider_selection.py :: forbehold uten kostnadsstress": "\"limitations\": [",
-  "Only_260820.py :: prisvakten retter enhetsavvik": "issues = kontroller_priser(close)"
+  "insider_selection.py :: forbehold uten kostnadsstress": "\"limitations\": ["
 }

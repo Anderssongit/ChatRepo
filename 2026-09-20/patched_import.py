@@ -3,11 +3,13 @@
 
 WHY
 ---
-The fixes change three files that were already in the repository:
+The fixes change files that were already in the repository, among them:
 
     master.py           builds the upstream workbooks instead of only checking
-    Only_260820.py      the management price guard repairs unit artifacts
     portfolio_blend.py  reports which strategy caps the joint window
+
+(The management price guard in Only_260820.py used to be patched here too. It
+is now fixed in the root file itself, so nothing in Only_260820.py is patched.)
 
 Nothing in this folder may modify them. So instead of editing the files, this
 installs an import hook: when one of those modules is imported, its source is

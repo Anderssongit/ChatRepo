@@ -10217,6 +10217,61 @@ def SentimentHendelseLab(skriv_master: bool = True):
                                    price=float(good.loc[day]), ratio=float(ratio.loc[day])))
         return pd.DataFrame(issues, columns=["ticker", "date", "issue", "previous_price", "price", "ratio"])
 
+    # Et sprang som er en eksakt tierpotens er et enhetsavvik fra datakilden
+    # (øre/krone), ikke en kurs: BSP.OL gikk 0,101440 → 10,144007, forhold
+    # 100,000. 0,5 % toleranse gir rom for en vanlig dagsbevegelse oppå
+    # omregningen, men er altfor trang til å svelge et ordinært firedobbelt sprang.
+    PRIS_TIERPOTENSER = (1000.0, 100.0, 10.0, 0.1, 0.01, 0.001)
+    PRIS_TOLERANSE = 0.005
+    # Så mange tickere kan utelates for uforklarte sprang før det regnes som en
+    # feil i hele nedlastingen, og kjøringen stanser som før.
+    PRIS_MAKS_UTELATT = 5
+    PRIS_MAKS_UTELATT_ANDEL = 0.05
+
+    def rett_og_utelat_priser(close: pd.DataFrame, high: pd.DataFrame,
+                              low: pd.DataFrame):
+        """Repair provable unit artifacts; exclude, never guess, the rest.
+
+        Returns (close, high, low, issues, excluded). A jump within tolerance of
+        a power of ten is rescaled BACKWARDS, so the latest prices that open
+        positions are marked against never change; high and low get the same
+        factor so ATR is not computed across two units. Any jump that is still
+        flagged afterwards is not provably an error, so its ticker is left out
+        of the universe instead of being clipped or adjusted. Every repair and
+        exclusion is returned as a row for management_price_issues.csv.
+        """
+        close, high, low = close.copy(), high.copy(), low.copy()
+        rows = []
+        for ticker in close.columns:
+            prices = pd.to_numeric(close[ticker], errors="coerce")
+            good = prices[np.isfinite(prices) & (prices > 0)]
+            ratio = good / good.shift(1)
+            factor = pd.Series(1.0, index=close.index)
+            for day in ratio.index[(ratio >= 4.0) | (ratio <= 0.25)]:
+                r = float(ratio.loc[day])
+                scale = next((f for f in PRIS_TIERPOTENSER
+                              if abs(r / f - 1.0) <= PRIS_TOLERANSE), None)
+                if scale is None:
+                    continue
+                factor.loc[factor.index < day] *= scale
+                rows.append(dict(ticker=ticker, date=str(day.date()),
+                                 issue="unit_scale_artifact",
+                                 previous_price=float(good.shift(1).loc[day]),
+                                 price=float(good.loc[day]), ratio=r,
+                                 resolution=f"earlier prices multiplied by {scale:g}"))
+            if (factor != 1.0).any():
+                close[ticker] = prices * factor
+                for frame in (high, low):
+                    if ticker in frame.columns:
+                        frame[ticker] = pd.to_numeric(frame[ticker], errors="coerce") * factor
+        rest = kontroller_priser(close)
+        excluded = sorted(rest["ticker"].drop_duplicates()) if not rest.empty else []
+        for r in rest.to_dict("records"):
+            rows.append({**r, "resolution": "ticker excluded from the universe"})
+        issues = pd.DataFrame(rows, columns=["ticker", "date", "issue", "previous_price",
+                                             "price", "ratio", "resolution"])
+        return close, high, low, issues, excluded
+
     def hent_kurser(tickere: List[str]) -> MarkedsData:
         log.info("Kurser   : laster ned %d tickere …", len(tickere))
         data = yf.download(tickere, start="2019-01-01", auto_adjust=True,
@@ -10253,14 +10308,34 @@ def SentimentHendelseLab(skriv_master: bool = True):
         close.to_csv(config.ut_dir / "management_prices_close.csv", index_label="Date")
         high.to_csv(config.ut_dir / "management_prices_high.csv", index_label="Date")
         low.to_csv(config.ut_dir / "management_prices_low.csv", index_label="Date")
-        issues = kontroller_priser(close)
+        # Før stanset ETT uforklart sprang hele ledelsesanalysen, også for
+        # tickere som aldri ga et signal. Nå rettes tierpotensene, og en ticker
+        # med et sprang ingen kan forklare holdes utenfor i stedet for å velte
+        # de andre. Bare mange slike på én gang stanser kjøringen, for da er det
+        # nedlastingen som er feil, ikke én aksje.
+        close, high, low, issues, utelatt = rett_og_utelat_priser(close, high, low)
         issues.to_csv(config.ut_dir / "management_price_issues.csv", index=False)
-        if not issues.empty:
-            examples = ", ".join(issues["ticker"].drop_duplicates().head(8))
+        grense = max(PRIS_MAKS_UTELATT, int(len(close.columns) * PRIS_MAKS_UTELATT_ANDEL))
+        if len(utelatt) > grense:
             raise RuntimeError(
-                "Management prices require verification after provider repair: "
-                + examples + ". See management_price_issues.csv. No backtest or variant "
-                "is published from these prices; prices were not clipped or guessed.")
+                f"Management prices require verification after provider repair: "
+                f"{len(utelatt)} tickers have unexplained jumps (limit {grense}), e.g. "
+                + ", ".join(utelatt[:8]) + ". See management_price_issues.csv. No backtest "
+                "or variant is published from these prices; prices were not clipped or guessed.")
+        rettet = sorted(set(issues.loc[issues["issue"] == "unit_scale_artifact", "ticker"]))
+        for ticker in rettet:
+            log.warning("Kurser   : %s hadde et enhetsavvik (tierpotens); eldre kurser "
+                        "er skalert, se management_price_issues.csv", ticker)
+        if utelatt:
+            log.warning("Kurser   : %d ticker(e) utelatt for uforklarte kurssprang: %s. "
+                        "Se management_price_issues.csv.", len(utelatt), ", ".join(utelatt))
+            close = close.drop(columns=utelatt)
+            high = high.drop(columns=[t for t in utelatt if t in high.columns])
+            low = low.drop(columns=[t for t in utelatt if t in low.columns])
+            if close.empty:
+                raise RuntimeError("Ingen tickere igjen etter priskontrollen.")
+        config.pris_rettet = rettet
+        config.pris_utelatt = utelatt
 
         # ATR20 = gjennomsnittlig True Range. Vi bruker den til volatilitetstilpassede
         # stoppnivåer, men selve exit-signalet er close-basert for å unngå antakelser
@@ -11596,6 +11671,10 @@ def SentimentHendelseLab(skriv_master: bool = True):
             "minimum_trend_exit_age_sessions": config.min_dager_for_trend_exit,
             "minimum_relative_exit_age_sessions": config.min_dager_for_relative_exit,
             "transaction_cost": 0.0,
+            # Hvilke kurser som ble rettet eller holdt utenfor, så et tall
+            # i mailen kan spores tilbake til management_price_issues.csv.
+            "price_repaired_tickers": ", ".join(getattr(config, "pris_rettet", [])),
+            "price_excluded_tickers": ", ".join(getattr(config, "pris_utelatt", [])),
             "valgt_terskel_pst": s.terskel,
             "krev_sma50": "JA" if s.krev_sma else "NEI",
             "valg_grunn": grunn,

@@ -33,7 +33,7 @@ PB-ROE eksporterer månedlige verdier. Samlet portefølje bruker derfor fullfør
 
 En feil brukte kursendringen to ganger ved verdsetting av åpne posisjoner. Nå er verdien antall aksjer × siste observerte kurs. Salg utløser ikke et kunstig hopp tilbake i verdikurven. Korte kurshull beholder siste observerte verdi; lengre hull blokkerer publisering. Kurshentingen ber Yahoo om reparerte priser og kontrollerer fortsatt ekstreme prishopp. Den gjetter ikke en korreksjon av mistenkelige kurser.
 
-**Kjør analysen på nytt:** gamle ledelsessentimentfiler mangler den nye regnskapsversjonen og kan ikke brukes til ny samlet avkastning. Lagrede BSP.OL-kurser hadde også et separat, nøyaktig 100-gangers prishopp. Dersom ny nedlasting ikke løser det, viser `management_price_issues.csv` hvilket kursgrunnlag som må avklares. Kjøringen gir da en ufullstendig rapport fremfor å presentere kursfeilen som avkastning.
+**Kjør analysen på nytt:** gamle ledelsessentimentfiler mangler den nye regnskapsversjonen og kan ikke brukes til ny samlet avkastning. Lagrede BSP.OL-kurser hadde også et separat, nøyaktig 100-gangers prishopp. Et slikt sprang på en eksakt tierpotens er et enhetsavvik og rettes bakover, så de nyeste kursene aldri endres. En ticker med et sprang på 4× eller mer som ikke er en tierpotens, holdes utenfor universet i stedet for å stanse hele analysen; kursene gjettes eller klippes aldri. `management_price_issues.csv` viser hver retting og hver utelatt ticker. Flere enn 5 slike tickere (eller 5 %) tyder på en feil i nedlastingen, og da gir kjøringen fortsatt en ufullstendig rapport.
 
 Automatikken sammenligner fortsatt de eksisterende 384 inngangs-/utgangskombinasjonene og velger høyest kvalifisert trenings-CAGR, med krav til historikk og handler. Senere resultater brukes ikke til dette valget. Mailen viser faktisk valgt inngangs- og salgsregel, konsistente risikotall og samlet beholdning for aksjer med flere innganger.
 
@@ -42,6 +42,8 @@ Automatikken sammenligner fortsatt de eksisterende 384 inngangs-/utgangskombinas
 Mailen viser de tre høyeste historiske CAGR-ene, presise regler for hver og varianten som brukes videre. Automatisk valg krever minst 252 treningsobservasjoner, 20 nye innganger og fem forskjellige aksjer. Kvalifiserte varianter må ha positiv trenings-CAGR med 0,15 % kostnad per kjøp/salg. Blant dem velges høyest CAGR i den svakeste treningshalvdelen med 0,80 % per kjøp/salg; lavere omsetning avgjør ved likhet. Hvis ingen kvalifiserer, brukes daglig baseline med tydelig forbehold. Topp-tre-rangeringen over hele historikken bestemmer ikke valget.
 
 På siste lagrede datagrunnlag ble scorevektet valgt. Alle variantene tapte under den høye kostnadsantakelsen. Dette opplyses i mailen og dokumenterer ingen bevist MOAT. Neste normale kjøring kan velge annerledes hvis datagrunnlaget endres. De originale kostnadene beholdes i verdikurvene som kombineres; kostnadsstressen vises separat. Ekstra kapitaloverføringer mellom strategiene har ingen modellerte kostnader.
+
+Noen få selskaper som feiler i nedlastingen fra Euronext (høyst 3 eller 10 % av selskapene, det som er størst) stanser ikke lenger kjeden før backtesten; de prøves igjen neste gang og vises som merknad i mailen. Masteren kontrollerer i `status.json` at backtesten faktisk kjørte, og navngir steget som stanset den hvis ikke.
 
 Gjennomsnittlig inngangskurs ved påfyll er rettet, slik at beholdningen viser faktisk avkastning. Tidligere rettelser for ufullstendige nedlastinger, kronologiske signaler og faktisk sluttbeholdning er beholdt.
 
