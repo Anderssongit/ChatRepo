@@ -3092,4 +3092,201 @@ def finnDødsboScraperv18(maks_annonser=None):
 
     conn.close()
     log.info("Total kjøretid: %.1f min.", (time.time() - t_start) / 60)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# FILTRERING + JSON-EKSPORT — v3
+# ══════════════════════════════════════════════════════════════════════
+def filtrerDodsboOgLagJsonv3(kilde_fil=None, ta_med=("dodsbo", "tvangssalg")):
+    """
+    Leser Excel-filen scraperen skrev, beholder BÅDE dødsbo og tvangssalg,
+    og skriver .xlsx + .json med en 'kategori'-kolonne kartet kan farge på.
+
+    ★ v3 vs. v2 — nesten ingenting, med vilje.
+
+      v2 trengte strengt tatt ingen endring: den leser hele
+      dataframen, så nye kolonner fra scraper v18 (pdf_url) blir
+      båret videre helt av seg selv.
+
+      v3 legger på ÉN utledet kolonne:
+        er_advokatsalg — True hvis salgsoppgaven ble hentet rett fra
+                         FINN, eller megleren er et advokatkontor.
+                         Sier noe om HVORDAN PDF-en ble skaffet, ikke
+                         noe om hva som står i den.
+
+      Filtrering, kategorier og sortering er uendret fra v2.
+
+    ★ v13 vs. forrige versjon:
+      - Filtrerer på kolonnene er_dodsbo / er_tvangssalg (0/1) i stedet for
+        tekstsøk i kolonne T. Kolonnenavn brukes, ikke posisjon 19, så
+        filteret overlever at KOLONNER endrer rekkefølge.
+      - Tvangssalg forkastes ikke lenger.
+      - Legger på 'kategori': dodsbo | tvangssalg | dodsbo_tvangssalg.
+      - Fungerer også på gamle filer uten kategori-kolonne (utledes),
+        og faller tilbake på tekstsøk i treff_ord hvis er_*-kolonnene
+        mangler helt.
+
+    Parametre:
+        kilde_fil : full sti til Excel-fil. None = nyeste finn_dodsbo_*.xlsx
+                    i EXCEL_DIR (filtrert/komplett/fase1 holdes utenfor).
+        ta_med    : hvilke kategorier som skal med. Standard begge.
+                    ("dodsbo",) = kun dødsbo, ("tvangssalg",) = kun tvangssalg.
+
+    Returnerer:
+        (sti_til_excel, sti_til_json) — begge None ved feil.
+    """
+    import os
+    import re
+    import glob
+    import pandas as pd
+    from datetime import datetime
+
+    EXCEL_DIR     = r"C:\Users\ander\Desktop\Python_K4\ExcelData\DataFinnDødsbo"
+    DODSBO_NOKLER = ("dødsbo", "dodsbo", "doedsbo", "uskiftet bo",
+                     "arvinger", "avdøde", "avdød", "dødsfall")
+    TVANG_NOKLER  = ("tvangssalg", "medhjelpersalg", "konkursbo", "konkurs",
+                     "namsfogd", "namsmann", "medhjelper", "tingretten")
+
+    print("╔════════════════════════════════════════════════╗")
+    print("║  Filtrerer dødsbo + tvangssalg → xlsx / json   ║")
+    print("╚════════════════════════════════════════════════╝")
+
+    # 1) Finn kildefil
+    if kilde_fil is None:
+        kandidater = [
+            f for f in glob.glob(os.path.join(EXCEL_DIR, "finn_dodsbo_*.xlsx"))
+            if not any(x in os.path.basename(f).lower()
+                       for x in ("filtrert", "komplett", "fase1", ".tmp"))
+        ]
+        if not kandidater:
+            print(f"⚠ Fant ingen finn_dodsbo_*.xlsx-fil i {EXCEL_DIR}")
+            return None, None
+        kilde_fil = max(kandidater, key=os.path.getmtime)
+        print(f"ℹ Kildefil: {kilde_fil}")
+
+    if not os.path.exists(kilde_fil):
+        print(f"⚠ Fant ikke filen: {kilde_fil}")
+        return None, None
+
+    # 2) Les
+    try:
+        df = pd.read_excel(kilde_fil, engine="openpyxl")
+    except Exception as e:
+        print(f"⚠ Klarte ikke å lese {kilde_fil}: {e}")
+        return None, None
+    print(f"ℹ {len(df)} rader, {df.shape[1]} kolonner før filter")
+
+    # 3) Utled dødsbo/tvangssalg-flagg
+    def som_bool(kolonne):
+        if kolonne in df.columns:
+            return (pd.to_numeric(df[kolonne], errors="coerce")
+                      .fillna(0).astype(int) == 1)
+        return None
+
+    d = som_bool("er_dodsbo")
+    t = som_bool("er_tvangssalg")
+
+    if d is None or t is None:
+        # Fallback for gamle filer uten er_*-kolonner: tekstsøk i treff_ord
+        tekstkol = None
+        for kandidat in ("treff_ord", "analyse_begrunnelse"):
+            if kandidat in df.columns:
+                tekstkol = kandidat
+                break
+        if tekstkol is None:
+            print("⚠ Fant verken er_dodsbo/er_tvangssalg eller treff_ord.")
+            return None, None
+        print(f"ℹ er_*-kolonner mangler — faller tilbake på tekstsøk i '{tekstkol}'")
+        # fillna(""): pandas 3 lar tomme celler forbli NaN etter astype(str)
+        v = df[tekstkol].fillna("").astype(str).str.lower()
+        if d is None:
+            d = v.apply(lambda s: any(n in s for n in DODSBO_NOKLER))
+        if t is None:
+            t = v.apply(lambda s: any(n in s for n in TVANG_NOKLER))
+
+    # 4) Kategori
+    kategori = pd.Series("vanlig", index=df.index, dtype=object)
+    kategori[t] = "tvangssalg"
+    kategori[d] = "dodsbo"
+    kategori[d & t] = "dodsbo_tvangssalg"
+    df["kategori"] = kategori
+
+    # ★ v3 — 4b) Hvordan ble PDF-en hentet?
+    # Rent sporbarhetsfelt: sier ingenting om innholdet, kun om ruta.
+    if "pdf_url" not in df.columns:
+        df["pdf_url"] = None
+    _kjede = (df["pdf_kjede"].fillna("").astype(str).str.lower()
+              if "pdf_kjede" in df.columns else pd.Series("", index=df.index))
+    _megler = (df["broker"].fillna("").astype(str).str.lower()
+               if "broker" in df.columns else pd.Series("", index=df.index))
+    _pdfurl = df["pdf_url"].fillna("").astype(str).str.lower()
+    df["er_advokatsalg"] = (
+        _kjede.isin(["advokat", "direkte_pdf"])
+        | _megler.str.contains("advokat|bostyrer|bobestyrer", regex=True)
+        | _pdfurl.str.contains("finncdn", regex=False)
+    )
+
+    # 5) Filtrer
+    maske = pd.Series(False, index=df.index)
+    if "dodsbo" in ta_med:
+        maske |= d
+    if "tvangssalg" in ta_med:
+        maske |= t
+    df_filtrert = df[maske].copy()
+
+    ant = df_filtrert["kategori"].value_counts()
+    print(f"✅ {len(df_filtrert)} av {len(df)} rader beholdt")
+    for k in ("dodsbo", "tvangssalg", "dodsbo_tvangssalg"):
+        if k in ant.index:
+            print(f"     {k:20s} {ant[k]}")
+    if df_filtrert.empty:
+        print("⚠ Ingen rader matchet — skriver tomme filer.")
+    else:
+        # ★ v3 — hvor mange kom via advokat-/direkte-PDF-ruta?
+        print(f"     {'advokat/direkte-PDF':20s} "
+              f"{int(df_filtrert['er_advokatsalg'].sum())}")
+
+    # 6) Sorter: dødsbo+tvangssalg først, så dødsbo, så tvangssalg
+    rang = {"dodsbo_tvangssalg": 0, "dodsbo": 1, "tvangssalg": 2}
+    if not df_filtrert.empty:
+        df_filtrert = (df_filtrert
+                       .assign(_r=df_filtrert["kategori"].map(rang).fillna(9))
+                       .sort_values("_r")
+                       .drop(columns=["_r"]))
+
+    # 7) Filnavn
+    mappe = os.path.dirname(kilde_fil) or "."
+    grunnnavn = os.path.splitext(os.path.basename(kilde_fil))[0]
+    excel_ut = os.path.join(mappe, f"{grunnnavn}_filtrert.xlsx")
+    json_ut  = os.path.join(mappe, f"{grunnnavn}_filtrert.json")
+
+    # 8) Skriv Excel
+    try:
+        df_filtrert.to_excel(excel_ut, index=False, engine="openpyxl")
+        print(f"✅ Excel: {excel_ut}")
+    except PermissionError:
+        stamp = datetime.now().strftime("%H%M%S")
+        excel_ut = excel_ut.replace(".xlsx", f"_{stamp}.xlsx")
+        df_filtrert.to_excel(excel_ut, index=False, engine="openpyxl")
+        print(f"⚠ Låst fil — lagret som {excel_ut}")
+    except Exception as e:
+        print(f"⚠ Klarte ikke å skrive Excel: {e}")
+        excel_ut = None
+
+    # 9) Skriv JSON
+    try:
+        df_filtrert.to_json(json_ut, orient="records",
+                            force_ascii=False, indent=2)
+        print(f"✅ JSON: {json_ut}")
+    except Exception as e:
+        print(f"⚠ Klarte ikke å skrive JSON: {e}")
+        json_ut = None
+
+    return excel_ut, json_ut
+
+
+# ══════════════════════════════════════════════════════════════════════
+# KJØR
+# ══════════════════════════════════════════════════════════════════════
 finnDødsboScraperv18(maks_annonser=None)
+# filtrerDodsboOgLagJsonv3()    # ← fjern # for å lage filtrert xlsx + json etterpå
