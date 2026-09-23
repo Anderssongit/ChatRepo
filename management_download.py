@@ -1,0 +1,1205 @@
+# -*- coding: utf-8 -*-
+"""
+MANAGEMENT SENTIMENT - PRICE DOWNLOAD, STEP BY STEP
+
+This is the part of SentimentHendelseLab() in Only_260820.py that stopped the
+2026-09-23 run: reading the article list, downloading prices from Yahoo and
+checking them. The download settings and the 4x price check are the lab's own.
+What is new:
+
+  * Every step prints OK, WARN or FAILED to the console. A failure names the
+    function and the line it failed on, the error, and what to do about it.
+  * One bad company no longer stops all the others. An exact x10/x100/x1000
+    jump is a unit error from the data provider and is rescaled. Any other
+    jump of 4x or more excludes that company, and price_issues.csv says why.
+    --strict gives the lab's behaviour: any unresolved jump stops the run.
+  * You can run 5 companies (any number, or named ones) instead of all.
+
+USAGE
+    python management_download.py            the COMPANIES setting below
+    python management_download.py 5          the first 5 in the article list
+    python management_download.py all        every company, as the lab does
+    python management_download.py BSP EAM    named companies from the same list
+                                             (write 2020.OL for 2020 Bulkers,
+                                             since a bare 2020 is a count)
+
+    --excel-dir PATH     ExcelData folder (default: AKSJE_BASE_DIR, then the usual)
+    --start DATE         first price date, default 2019-01-01 as in the lab
+    --strict             stop at any unresolved price jump, as the lab does
+    --accept T1,T2       tickers whose jumps you have checked and accept
+    --batch-size N       tickers per Yahoo request, default 50
+    --retries N          attempts per request, default 3
+
+STEPS
+    1  Check setup           Python packages and folders
+    2  Read article files    NLP_Sentiment_Detail_*.xlsx in DataNLP
+    3  Select companies      5, all, or named - from that same list
+    4  Download prices       Yahoo Finance, in batches, with retries
+    5  Check price quality   the lab's 4x rule; repair, exclude or stop
+    6  Build indicators      ATR20, SMA10, SMA50, EMA20, market index
+    7  Save results          CSV files, then summary.json and a log
+
+Exit code: 0 every step OK, 2 finished with warnings, 1 a step failed.
+Output:    ExcelData/StrategyResults_v5_Sentiment_Exit/management_download/
+           all/ for a full run, subset/ for 5 or named companies.
+
+The lab itself is not changed. It still downloads and checks its own prices.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import importlib
+import json
+import logging
+import math
+import os
+import sys
+import time
+import traceback
+import warnings
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+THIS_FILE = Path(__file__).resolve()
+# Where the log goes when the output folder could not be made (step 1 failed).
+FALLBACK_LOG_DIR = THIS_FILE.parent
+
+# Which companies to run when none are given on the command line: "all", a
+# number such as "5", or tickers such as "BSP EAM". Handy when the script is
+# started from an editor rather than a terminal.
+COMPANIES = "all"
+
+LEGACY_EXCEL_DIR = r"C:\Users\ander\Desktop\Python_K4\ExcelData"
+NLP_DIR = "DataNLP"
+OUTPUT_DIR = "StrategyResults_v5_Sentiment_Exit"
+OSLO_SUFFIX = ".OL"
+PRICE_START = "2019-01-01"          # hent_kurser() in the lab
+
+# The lab's price check: a move of 4x or more between two actual observations
+# needs verification before it may become a return.
+UPPER_RATIO = 4.0
+LOWER_RATIO = 0.25
+# A jump this close to an exact power of ten is a unit change at the provider
+# (ore/krone), not a price move. Same rule and tolerance as price_repair.py.
+UNIT_FACTORS = (1000.0, 100.0, 10.0, 0.1, 0.01, 0.001)
+UNIT_TOLERANCE = 0.005
+
+# Indicator settings, as in the lab's Config.
+ATR_DAYS = 20
+SMA_DAYS = 50
+MIN_HISTORY_DAYS = 120              # the lab skips signals with less history
+
+FIELDS = ("Close", "High", "Low")
+TOTAL_STEPS = 7
+WIDE = "=" * 74
+THIN = "-" * 74
+
+# Replaced by the tests, so retries do not really wait.
+_sleep = time.sleep
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# SETTINGS AND REPORTING
+# ══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Settings:
+    base_dir: Path
+    companies: List[str]
+    start: str = PRICE_START
+    batch_size: int = 50
+    retries: int = 3
+    pause: float = 2.0
+    strict: bool = False
+    accept: Tuple[str, ...] = ()
+
+    @property
+    def nlp_dir(self) -> Path:
+        return self.base_dir / NLP_DIR
+
+    @property
+    def full_run(self) -> bool:
+        return [c.lower() for c in self.companies] == ["all"]
+
+    @property
+    def out_dir(self) -> Path:
+        # A five-company test must never overwrite the files of a full run.
+        return (self.base_dir / OUTPUT_DIR / "management_download"
+                / ("all" if self.full_run else "subset"))
+
+
+class StepError(Exception):
+    """A failure the console can explain: what happened, and what to do."""
+
+    def __init__(self, message: str, hint: str = ""):
+        super().__init__(message)
+        self.hint = hint
+
+
+class Step:
+    """What a step function gets: somewhere to report progress and warnings."""
+
+    def __init__(self, report: "Report", number: int, title: str):
+        self.report, self.number, self.title = report, number, title
+        self.warnings: List[str] = []
+        self.summary = ""
+
+    def info(self, text: str) -> None:
+        self.report.say("    " + text)
+
+    def warn(self, text: str) -> None:
+        self.warnings.append(text)
+        self.report.say("    WARNING: " + text)
+
+
+def locate(exc: BaseException) -> str:
+    """
+    Where an exception came from, as «function() -> function(), line N».
+
+    The chain lists the functions in this file the error passed through, so
+    the console says which step function and which helper failed. If the
+    error was raised inside a library (pandas, yfinance), that is named too.
+    """
+    frames = traceback.extract_tb(exc.__traceback__)
+    if not frames:
+        return "unknown location"
+    own = [f for f in frames if _same_file(f.filename)]
+    text = ""
+    if own:
+        chain = [f"{f.name}()" for f in own if f.name not in ("run", "<module>", "main")]
+        text = (" -> ".join(chain) or f"{own[-1].name}()") + \
+            f", {THIS_FILE.name} line {own[-1].lineno}"
+    deepest = frames[-1]
+    if not own or not _same_file(deepest.filename):
+        text += ("; " if text else "") + (f"raised inside {Path(deepest.filename).name} "
+                                          f"line {deepest.lineno}, in {deepest.name}()")
+    return text
+
+
+def _same_file(name: str) -> bool:
+    try:
+        return Path(name).resolve() == THIS_FILE
+    except (OSError, ValueError):
+        return False
+
+
+def describe(exc: Optional[BaseException]) -> str:
+    if exc is None:
+        return "no error recorded"
+    text = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
+    name = type(exc).__name__
+    return text if isinstance(exc, StepError) else (f"{name}: {text}" if text else name)
+
+
+def hint_for(exc: BaseException) -> str:
+    """Plain advice for the errors that have one obvious cause."""
+    if isinstance(exc, ModuleNotFoundError):
+        return f"Install the missing package: pip install {exc.name or '<package>'}"
+    if isinstance(exc, ImportError):
+        return "A package is installed but broken or too old: pip install -U <package>"
+    if isinstance(exc, PermissionError):
+        return ("The file is open in another program (often Excel) or the folder is "
+                "read-only. Close it and run again.")
+    if isinstance(exc, FileNotFoundError):
+        return "Check the path. Use --excel-dir to point at your ExcelData folder."
+    if isinstance(exc, MemoryError):
+        return "Too much data at once. Test with fewer companies: python management_download.py 5"
+    if isinstance(exc, (ConnectionError, TimeoutError)) or "curl" in str(exc).lower():
+        return ("Network problem. Check the internet connection, proxy or firewall, "
+                "then run again.")
+    if isinstance(exc, KeyError):
+        return "A column or ticker the code expects is missing from the data."
+    return ""
+
+
+class Report:
+    """Runs the steps, prints each result, and keeps everything for the log."""
+
+    def __init__(self) -> None:
+        self.lines: List[str] = []
+        self.steps: List[Dict[str, Any]] = []
+        self.failed_step: Optional[int] = None
+        self.interrupted = False
+        self.facts: Dict[str, Any] = {}
+
+    def say(self, text: str = "") -> None:
+        print(text, flush=True)
+        self.lines.append(text)
+
+    def log_only(self, text: str) -> None:
+        self.lines.append(text)
+
+    def run(self, number: int, title: str, func: Callable[..., Any], *args: Any) -> Any:
+        head = f"[STEP {number}/{TOTAL_STEPS}]"
+        if self.failed_step is not None or self.interrupted:
+            reason = ("stopped by the user" if self.interrupted
+                      else f"step {self.failed_step} failed")
+            self.say(f"{head} {title} - SKIPPED ({reason})")
+            self.steps.append({"step": number, "title": title, "status": "SKIPPED",
+                               "seconds": 0.0, "summary": reason})
+            return None
+
+        self.say()
+        self.say(f"{head} {title}")
+        step = Step(self, number, title)
+        start = time.perf_counter()
+        try:
+            value = func(step, *args)
+        except KeyboardInterrupt:
+            seconds = time.perf_counter() - start
+            self.say(f"{head} INTERRUPTED after {seconds:.1f} s")
+            self.steps.append({"step": number, "title": title, "status": "INTERRUPTED",
+                               "seconds": round(seconds, 1), "summary": "Ctrl+C"})
+            self.interrupted = True
+            raise
+        except Exception as exc:        # every step failure ends up here
+            seconds = time.perf_counter() - start
+            where = locate(exc)
+            hint = getattr(exc, "hint", "") or hint_for(exc)
+            self.say(f"{head} FAILED  ({seconds:.1f} s)")
+            self.say(f"    Where : {where}")
+            self.say(f"    Error : {describe(exc)}")
+            if hint:
+                self.say(f"    Hint  : {hint}")
+            self.say("    The full traceback is in management_download.log.")
+            self.log_only(f"--- traceback, step {number} ({title}) ---")
+            self.log_only("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)))
+            self.steps.append({"step": number, "title": title, "status": "FAILED",
+                               "seconds": round(seconds, 1), "summary": describe(exc),
+                               "where": where, "hint": hint})
+            self.failed_step = number
+            return None
+
+        seconds = time.perf_counter() - start
+        status = "WARN" if step.warnings else "OK"
+        self.say(f"{head} {status}  ({seconds:.1f} s)"
+                 + (f" - {step.summary}" if step.summary else ""))
+        self.steps.append({"step": number, "title": title, "status": status,
+                           "seconds": round(seconds, 1), "summary": step.summary,
+                           "warnings": list(step.warnings)})
+        return value
+
+    def exit_code(self) -> int:
+        if self.interrupted:
+            return 130
+        if self.failed_step is not None:
+            return 1
+        return 2 if any(s["status"] == "WARN" for s in self.steps) else 0
+
+    def finish(self, settings: Settings) -> int:
+        code = self.exit_code()
+        self.say()
+        self.say(WIDE)
+        self.say(" SUMMARY")
+        self.say(WIDE)
+        for s in self.steps:
+            self.say(f"  {s['step']}  {s['title']:<34} {s['status']:<11} "
+                     f"{s['seconds']:>6.1f} s  {str(s.get('summary', ''))[:60]}")
+        self.say(THIN)
+        if self.interrupted:
+            verdict = "STOPPED by the user"
+        elif self.failed_step is not None:
+            failed = next(s for s in self.steps if s["status"] == "FAILED")
+            verdict = f"FAILED at step {failed['step']} ({failed['title']})"
+        elif code == 2:
+            verdict = "FINISHED WITH WARNINGS - read the WARNING lines above"
+        else:
+            verdict = "FINISHED - every step OK"
+        self.say(f" RESULT : {verdict} - exit code {code}")
+
+        # Without an output folder (step 1 failed) the log goes next to the script.
+        folder = settings.out_dir if settings.out_dir.is_dir() else FALLBACK_LOG_DIR
+        log_path = folder / "management_download.log"
+        self.say(f" LOG    : {log_path}")
+        self.say(WIDE)
+        summary = {"finished": datetime.now().isoformat(timespec="seconds"),
+                   "exit_code": code, "result": verdict,
+                   "companies_argument": settings.companies,
+                   "excel_dir": str(settings.base_dir), "strict": settings.strict,
+                   "accepted": list(settings.accept), "steps": self.steps, **self.facts}
+        for path, text in (
+                (folder / "summary.json",
+                 json.dumps(summary, indent=2, ensure_ascii=False, default=str)),
+                (log_path, "\n".join(self.lines) + "\n")):
+            try:
+                path.write_text(text, encoding="utf-8")
+            except OSError as exc:
+                print(f" Could not write {path}: {describe(exc)}", flush=True)
+        return code
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 1 - CHECK SETUP
+# ══════════════════════════════════════════════════════════════════════════
+
+def check_setup(step: Step, s: Settings) -> Dict[str, Any]:
+    step.info(f"Python     : {sys.version.split()[0]}")
+    modules: Dict[str, Any] = {}
+    missing: List[str] = []
+    for name in ("pandas", "numpy", "yfinance", "openpyxl"):
+        try:
+            modules[name] = importlib.import_module(name)
+            step.info(f"{name:<11}: {getattr(modules[name], '__version__', 'installed')}")
+        except Exception as exc:
+            missing.append(name)
+            step.info(f"{name:<11}: MISSING ({describe(exc)})")
+    if missing:
+        raise StepError(f"Missing Python package(s): {', '.join(missing)}",
+                        hint="Install with: pip install " + " ".join(missing)
+                             + "   (or run SETUP.cmd)")
+
+    # yfinance only needs scipy for repair=True, which the lab uses. Without
+    # scipy that repair fails for every ticker, so it is switched off instead.
+    try:
+        scipy = importlib.import_module("scipy")
+        repair = True
+        step.info(f"scipy      : {getattr(scipy, '__version__', 'installed')} "
+                  f"(Yahoo price repair on, as in the lab)")
+    except Exception:
+        repair = False
+        step.warn("scipy is not installed, so Yahoo's own price repair (repair=True in "
+                  "the lab) is switched off. Install it with: pip install scipy")
+
+    # yfinance prints its own «Failed download» lines. They are caught here
+    # instead, so each missing ticker is reported once, with its reason.
+    yahoo_log = YahooLog()
+    logger = logging.getLogger("yfinance")
+    for old in [h for h in logger.handlers if isinstance(h, YahooLog)]:
+        logger.removeHandler(old)
+    logger.addHandler(yahoo_log)
+    logger.setLevel(logging.ERROR)
+    logger.propagate = False
+
+    if not s.base_dir.is_dir():
+        raise StepError(f"ExcelData folder not found: {s.base_dir}",
+                        hint="Use --excel-dir PATH, or set AKSJE_BASE_DIR.")
+    step.info(f"ExcelData  : {s.base_dir}")
+    if not s.nlp_dir.is_dir():
+        raise StepError(f"Article folder not found: {s.nlp_dir}",
+                        hint="The articles are written by SentimentManagement(), the "
+                             "scraper. Run it first, or check --excel-dir.")
+    step.info(f"Articles   : {s.nlp_dir}")
+    try:
+        s.out_dir.mkdir(parents=True, exist_ok=True)
+        probe = s.out_dir / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+    except OSError as exc:
+        raise StepError(f"Cannot write to the output folder {s.out_dir}: {describe(exc)}",
+                        hint="Check that the folder is not read-only or locked by "
+                             "OneDrive or antivirus.") from exc
+    step.info(f"Output     : {s.out_dir}")
+    step.summary = (f"pandas {modules['pandas'].__version__}, "
+                    f"yfinance {getattr(modules['yfinance'], '__version__', '?')}")
+    return {"pd": modules["pandas"], "np": modules["numpy"],
+            "yf": modules["yfinance"], "repair": repair, "yahoo_log": yahoo_log}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 2 - READ ARTICLE FILES
+# ══════════════════════════════════════════════════════════════════════════
+
+REQUIRED_ARTICLE_COLUMNS = ("Company", "Article_Date", "Final_Score")
+
+
+def article_files(folder: Path) -> List[Path]:
+    """The same files les_artikler() in the lab reads."""
+    def wanted(p: Path) -> bool:
+        tail = p.stem.rsplit("_", 1)[-1]
+        return (not p.name.startswith("~$")
+                and ("_FINAL" in p.name or not any(ch.isdigit() for ch in tail)
+                     or len(tail) <= 8))
+    return sorted(p for p in folder.glob("NLP_Sentiment_Detail_*.xlsx") if wanted(p))
+
+
+def parse_article_dates(pd: Any, column: Any) -> Any:
+    raw = column.astype(str).str.replace(r"\n.*$", "", regex=True).str.strip()
+    first = pd.to_datetime(raw, format="%d %b %Y", errors="coerce")
+    try:
+        rest = pd.to_datetime(raw, format="mixed", errors="coerce")
+    except (TypeError, ValueError):     # pandas older than 2.0 has no «mixed»
+        rest = pd.to_datetime(raw, errors="coerce")
+    return first.fillna(rest)
+
+
+def clean_company(value: Any) -> str:
+    # Excel can store the ticker 2020 as the number 2020.0.
+    if isinstance(value, float) and value.is_integer():
+        value = int(value)
+    text = str(value).strip() if value is not None else ""
+    return "" if text.lower() in ("", "nan", "none", "nat") else text
+
+
+def read_articles(step: Step, s: Settings, mods: Dict[str, Any]) -> Any:
+    pd = mods["pd"]
+    files = article_files(s.nlp_dir)
+    if not files:
+        raise StepError(f"No NLP_Sentiment_Detail_*.xlsx files in {s.nlp_dir}",
+                        hint="Run SentimentManagement() (the article scraper) first.")
+    step.info(f"{len(files)} article file(s) found")
+
+    parts = []
+    for f in files:
+        try:
+            d = pd.read_excel(f)
+        except PermissionError as exc:
+            step.warn(f"{f.name}: cannot be opened ({describe(exc)}). Is it open in "
+                      f"Excel? Skipped.")
+            continue
+        except Exception as exc:
+            step.warn(f"{f.name}: cannot be read ({describe(exc)}). Skipped.")
+            continue
+        if d.empty:
+            step.warn(f"{f.name}: the sheet is empty. Skipped.")
+            continue
+        absent = [c for c in REQUIRED_ARTICLE_COLUMNS if c not in d.columns]
+        if absent:
+            step.warn(f"{f.name}: missing column(s) {', '.join(absent)}. Skipped.")
+            continue
+        d["_file"] = f.name
+        parts.append(d)
+        step.info(f"  read {f.name}: {len(d)} rows")
+    if not parts:
+        raise StepError("None of the article files could be used (see the warnings above)",
+                        hint="Close the files in Excel, or run SentimentManagement() "
+                             "again to rewrite them.")
+
+    df = pd.concat(parts, ignore_index=True)
+    total = len(df)
+    df["Article_Date"] = parse_article_dates(pd, df["Article_Date"])
+    no_date = int(df["Article_Date"].isna().sum())
+    df = df.dropna(subset=["Article_Date"])
+    no_text = 0
+    if "Text_Length" in df.columns:
+        length = pd.to_numeric(df["Text_Length"], errors="coerce")
+        no_text = int((~(length > 0)).sum())
+        df = df[length > 0]
+    df["Final_Score"] = pd.to_numeric(df["Final_Score"], errors="coerce")
+    no_score = int(df["Final_Score"].isna().sum())
+    df = df.dropna(subset=["Final_Score"])
+    df["Company"] = df["Company"].map(clean_company)
+    no_company = int((df["Company"] == "").sum())
+    df = df[df["Company"] != ""]
+    keys = [k for k in ("Company", "Article_Date", "Article_Title") if k in df.columns]
+    before = len(df)
+    df = df.sort_values("_file").drop_duplicates(subset=keys, keep="last")
+    duplicates = before - len(df)
+    df = df.sort_values(["Company", "Article_Date"]).reset_index(drop=True)
+
+    dropped = {"date could not be read": no_date, "no text": no_text,
+               "no Final_Score": no_score, "no company": no_company,
+               "duplicate": duplicates}
+    step.info(f"{total} rows read; removed: "
+              + ", ".join(f"{n} {why}" for why, n in dropped.items()))
+    if df.empty:
+        raise StepError("No usable articles left after cleaning",
+                        hint="Every row lacked a readable date, a score or a company. "
+                             "Open one of the files and check the columns "
+                             + ", ".join(REQUIRED_ARTICLE_COLUMNS) + ".")
+    if total and len(df) < 0.5 * total:
+        step.warn(f"Only {len(df)} of {total} rows are usable. Check the article files.")
+
+    reports = df.groupby("Company").size()
+    step.info(f"{len(df)} articles, {len(reports)} companies, "
+              f"{df['Article_Date'].min().date()} -> {df['Article_Date'].max().date()}")
+    step.info(f"{int((reports >= 2).sum())} companies have two or more reports "
+              f"(a signal needs a previous report to compare with)")
+    step.summary = f"{len(df)} articles, {len(reports)} companies"
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 3 - SELECT COMPANIES
+# ══════════════════════════════════════════════════════════════════════════
+
+def to_ticker(company: str) -> str:
+    company = company.strip()
+    return company if company.upper().endswith(OSLO_SUFFIX) else company + OSLO_SUFFIX
+
+
+def select_companies(step: Step, s: Settings, articles: Any) -> List[str]:
+    names = sorted({clean_company(c) for c in articles["Company"].unique()} - {""})
+    if not names:
+        raise StepError("The article list has no company names")
+    wanted = [w.strip() for w in s.companies if w.strip()]
+
+    if [w.lower() for w in wanted] == ["all"]:
+        chosen = names
+        step.info(f"all {len(names)} companies in the article list")
+    elif len(wanted) == 1 and wanted[0].isdigit():
+        n = int(wanted[0])
+        if n <= 0:
+            raise StepError("The number of companies must be 1 or more",
+                            hint="For example: python management_download.py 5")
+        if n > len(names):
+            step.warn(f"Asked for {n} companies, but the list has {len(names)}. Using all "
+                      f"of them."
+                      + (f" To run the company {wanted[0]}, write {wanted[0]}{OSLO_SUFFIX}."
+                         if wanted[0] in names else ""))
+        chosen = names[:n]
+        step.info(f"the first {len(chosen)} of {len(names)} companies (alphabetical)")
+    else:
+        lookup: Dict[str, str] = {}
+        for name in names:
+            lookup[name.upper()] = name
+            lookup[to_ticker(name).upper()] = name
+        chosen, unknown = [], []
+        for w in wanted:
+            hit = lookup.get(w.upper())
+            if hit is None:
+                unknown.append(w)
+            elif hit not in chosen:
+                chosen.append(hit)
+        if unknown:
+            step.warn(f"Not in the article list, ignored: {', '.join(unknown)}")
+        if not chosen:
+            raise StepError("None of the named companies are in the article list",
+                            hint="Names come from the Company column. Examples: "
+                                 + ", ".join(names[:12]))
+        step.info(f"{len(chosen)} named companies")
+
+    tickers = [to_ticker(n) for n in chosen]
+    shown = tickers if len(tickers) <= 20 else tickers[:10] + ["..."] + tickers[-5:]
+    step.info("tickers: " + ", ".join(shown))
+    step.summary = f"{len(tickers)} of {len(names)} companies"
+    return tickers
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 4 - DOWNLOAD PRICES
+# ══════════════════════════════════════════════════════════════════════════
+
+def normalise_index(pd: Any, index: Any) -> Any:
+    idx = pd.to_datetime(index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    return idx.normalize()
+
+
+def extract_fields(pd: Any, data: Any, batch: Sequence[str]) -> Dict[str, Any]:
+    """
+    Close, High and Low as one column per ticker, whatever shape Yahoo sent.
+
+    yfinance returns (field, ticker) columns, sometimes (ticker, field), and
+    for one ticker in older versions just flat field names.
+    """
+    out: Dict[str, Any] = {}
+    if data is None or getattr(data, "empty", True):
+        return {f: pd.DataFrame() for f in FIELDS}
+    cols = data.columns
+    for f in FIELDS:
+        if isinstance(cols, pd.MultiIndex):
+            if f in cols.get_level_values(0):
+                x = data.xs(f, axis=1, level=0)
+            elif cols.nlevels > 1 and f in cols.get_level_values(1):
+                x = data.xs(f, axis=1, level=1)
+            else:
+                x = pd.DataFrame(index=data.index)
+        elif f in cols:
+            if len(batch) != 1:
+                raise ValueError(f"Yahoo returned one flat table for {len(batch)} tickers, "
+                                 f"so the prices cannot be matched to tickers")
+            x = data[[f]].copy()
+            x.columns = [batch[0]]
+        else:
+            x = pd.DataFrame(index=data.index)
+        if isinstance(x, pd.Series):
+            x = x.to_frame(batch[0])
+        x = x.apply(pd.to_numeric, errors="coerce")
+        x.columns = [str(c) for c in x.columns]
+        x.index = normalise_index(pd, x.index)
+        out[f] = x[~x.index.duplicated(keep="last")].sort_index()
+    return out
+
+
+def with_prices(close: Any, tickers: Sequence[str]) -> List[str]:
+    return [t for t in tickers if t in close.columns and close[t].notna().any()]
+
+
+class YahooLog(logging.Handler):
+    """
+    yfinance's own reason per failed ticker, from its log.
+
+    yfinance 1.x keeps the reasons only in its log. Two kinds of line matter:
+    «Failed to get ticker 'BSP.OL' reason: <cause>», and the summary
+    «['BSP.OL', 'EAM.OL']: <error>». The summary can say «possibly delisted»
+    when the real cause is a blocked network, so the cause line wins. Older
+    versions also keep them in yf.shared._ERRORS; yahoo_reasons() reads both.
+    """
+
+    CAUSE = "Failed to get ticker '"
+
+    def __init__(self) -> None:
+        super().__init__(logging.ERROR)
+        self.reasons: Dict[str, str] = {}
+        self.causes: Dict[str, str] = {}
+
+    def clear(self) -> None:
+        self.reasons.clear()
+        self.causes.clear()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            text = record.getMessage().strip()
+            if text.startswith(self.CAUSE):
+                ticker, _, cause = text[len(self.CAUSE):].partition("' reason: ")
+                self.causes[ticker.upper()] = cause.strip()
+                return
+            head, sep, reason = text.partition("]: ")
+            if sep and head.startswith("["):
+                for t in ast.literal_eval(head + "]"):
+                    self.reasons[str(t).upper()] = reason.strip()
+        except Exception:
+            pass        # an unexpected log line must never break a download
+
+
+def yahoo_reasons(mods: Dict[str, Any], tickers: Sequence[str]) -> Dict[str, str]:
+    """yfinance's own reason per failed ticker, from whichever place has it."""
+    found: Dict[str, str] = {}
+    try:
+        shared = getattr(getattr(mods["yf"], "shared", None), "_ERRORS", None) or {}
+        found.update({str(t).upper(): str(e) for t, e in shared.items()})
+    except Exception:
+        pass
+    log = mods.get("yahoo_log")
+    if log is not None:
+        found.update(log.reasons)
+        found.update(log.causes)
+    # curl appends «See https://curl.se/...»; the cause is what comes before.
+    return {t: found[t.upper()].strip().splitlines()[0].split(" See http")[0][:160]
+            for t in tickers if found.get(t.upper(), "").strip()}
+
+
+def fetch(step: Step, s: Settings, mods: Dict[str, Any], batch: Sequence[str],
+          label: str, attempts: int) -> Tuple[Optional[Dict[str, Any]], Optional[BaseException]]:
+    """One Yahoo request, retried with a doubling pause. Never raises."""
+    pd, yf = mods["pd"], mods["yf"]
+    last: Optional[BaseException] = None
+    for attempt in range(1, attempts + 1):
+        if mods.get("yahoo_log") is not None:
+            mods["yahoo_log"].clear()
+        try:
+            data = yf.download(list(batch), start=s.start, auto_adjust=True,
+                               repair=mods["repair"], progress=False, threads=True)
+            fields = extract_fields(pd, data, batch)
+            if with_prices(fields["Close"], batch):
+                if attempt > 1:
+                    step.info(f"{label}: succeeded on attempt {attempt}")
+                return fields, None
+            reasons = yahoo_reasons(mods, batch)
+            last = StepError("Yahoo returned no prices"
+                             + (f" ({next(iter(reasons.values()))})" if reasons else ""))
+        except Exception as exc:
+            last = exc
+        if attempt < attempts:
+            wait = s.pause * 2 ** (attempt - 1)
+            step.info(f"{label}: attempt {attempt}/{attempts} failed ({describe(last)}); "
+                      f"waiting {wait:.0f} s")
+            _sleep(wait)
+    return None, last
+
+
+def combine(pd: Any, frames: Sequence[Any]) -> Any:
+    frames = [f for f in frames if len(f.columns)]
+    if not frames:
+        return pd.DataFrame()
+    x = pd.concat(frames, axis=1)
+    # A ticker retried on its own comes last, so its column wins.
+    return x.loc[:, ~x.columns.duplicated(keep="last")].sort_index()
+
+
+def download_prices(step: Step, s: Settings, mods: Dict[str, Any],
+                    tickers: List[str]) -> Dict[str, Any]:
+    pd = mods["pd"]
+    batches = [tickers[i:i + s.batch_size] for i in range(0, len(tickers), s.batch_size)]
+    step.info(f"{len(tickers)} tickers in {len(batches)} batch(es) of up to {s.batch_size}; "
+              f"from {s.start}, auto_adjust=True, repair={mods['repair']}")
+
+    frames: Dict[str, List[Any]] = {f: [] for f in FIELDS}
+    reasons: Dict[str, str] = {}
+    last_error: Optional[BaseException] = None
+    for no, batch in enumerate(batches, 1):
+        label = f"batch {no}/{len(batches)}"
+        fields, exc = fetch(step, s, mods, batch, label, s.retries)
+        if fields is None:
+            last_error = exc
+            step.warn(f"{label} FAILED after {s.retries} attempt(s): {describe(exc)}")
+            reasons.update({t: describe(exc) for t in batch})
+            continue
+        for f in FIELDS:
+            frames[f].append(fields[f])
+        got = with_prices(fields["Close"], batch)
+        reasons.update(yahoo_reasons(mods, [t for t in batch if t not in got]))
+        step.info(f"{label}: {len(got)}/{len(batch)} tickers with prices")
+
+    close = combine(pd, frames["Close"])
+    have = with_prices(close, tickers)
+    if not have:
+        raise StepError(
+            f"Yahoo Finance returned no prices for any of the {len(tickers)} tickers. "
+            f"Last error: {describe(last_error)}",
+            hint="Check the internet connection, proxy or firewall. Yahoo may also be "
+                 "rate limiting: wait 15-60 minutes. Updating yfinance often helps: "
+                 "pip install -U yfinance. Test quickly with: "
+                 "python management_download.py 5")
+
+    missing = [t for t in tickers if t not in have]
+    if missing:
+        step.info(f"retrying {len(missing)} ticker(s) without prices, one at a time")
+        for t in missing:
+            fields, exc = fetch(step, s, mods, [t], t, 1)
+            if fields is not None:
+                for f in FIELDS:
+                    frames[f].append(fields[f])
+                reasons.pop(t, None)
+                step.info(f"{t}: prices found on its own")
+            else:
+                reasons[t] = (yahoo_reasons(mods, [t]).get(t)
+                              or reasons.get(t) or describe(exc))
+        close = combine(pd, frames["Close"])
+        have = with_prices(close, tickers)
+
+    close = close[have].copy()
+    high = combine(pd, frames["High"]).reindex(index=close.index, columns=have)
+    low = combine(pd, frames["Low"]).reindex(index=close.index, columns=have)
+    no_prices = {t: reasons.get(t, "Yahoo returned no prices") for t in tickers
+                 if t not in have}
+    if no_prices:
+        step.warn(f"{len(no_prices)} of {len(tickers)} ticker(s) have no prices and are "
+                  f"left out (often delisted or renamed):")
+        for t, why in list(no_prices.items())[:15]:
+            step.info(f"  {t:<12} {why}")
+        if len(no_prices) > 15:
+            step.info(f"  ... and {len(no_prices) - 15} more, see ticker_status.csv")
+    no_range = [t for t in have if high[t].isna().all() or low[t].isna().all()]
+    if no_range:
+        step.warn(f"No High/Low prices for {', '.join(no_range[:10])}"
+                  f"{' ...' if len(no_range) > 10 else ''}: ATR stops cannot work for them")
+
+    step.info(f"prices: {len(have)} tickers, {close.index[0].date()} -> "
+              f"{close.index[-1].date()}, {len(close.index)} trading days")
+    step.summary = f"{len(have)}/{len(tickers)} tickers with prices"
+    return {"close": close, "high": high, "low": low, "no_prices": no_prices,
+            "requested": list(tickers)}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 5 - CHECK PRICE QUALITY
+# ══════════════════════════════════════════════════════════════════════════
+
+def unit_factor(ratio: float) -> Optional[float]:
+    """The power of ten a jump matches within UNIT_TOLERANCE, or None."""
+    if not math.isfinite(ratio) or ratio <= 0:
+        return None
+    for f in UNIT_FACTORS:
+        if abs(ratio / f - 1.0) <= UNIT_TOLERANCE:
+            return f
+    return None
+
+
+def find_jumps(pd: Any, np: Any, series: Any) -> Tuple[Any, Any]:
+    """(invalid prices, flagged jumps) exactly as kontroller_priser() finds them."""
+    prices = pd.to_numeric(series, errors="coerce").dropna()
+    invalid = prices[~np.isfinite(prices) | (prices <= 0)]
+    good = prices[np.isfinite(prices) & (prices > 0)]
+    previous = good.shift(1)
+    ratio = good / previous
+    hit = (ratio >= UPPER_RATIO) | (ratio <= LOWER_RATIO)
+    jumps = pd.DataFrame({"previous_price": previous[hit], "price": good[hit],
+                          "ratio": ratio[hit]})
+    return invalid, jumps
+
+
+def check_one(pd: Any, np: Any, ticker: str, close: Any, high: Any, low: Any
+              ) -> Dict[str, Any]:
+    """
+    Check one ticker. Returns the (possibly repaired) columns and the issues.
+
+    Invalid prices (zero, negative, infinite) are not prices; they are removed,
+    which leaves a gap the lab already knows how to handle. Unit jumps are
+    rescaled BACKWARDS, so the newest prices - the ones open positions are
+    valued at - never change. Everything else is left for the caller to decide.
+    """
+    rows: List[Dict[str, Any]] = []
+    invalid, jumps = find_jumps(pd, np, close)
+    for day, price in invalid.items():
+        rows.append({"ticker": ticker, "date": str(day.date()),
+                     "issue": "non_positive_or_non_finite", "price": float(price)})
+    if len(invalid):
+        close, high, low = close.copy(), high.copy(), low.copy()
+        close[invalid.index] = np.nan
+        high[invalid.index] = np.nan
+        low[invalid.index] = np.nan
+
+    units = [(day, r, unit_factor(float(r["ratio"]))) for day, r in jumps.iterrows()]
+    units = [(day, r, f) for day, r, f in units if f is not None]
+    if units:
+        multiplier = pd.Series(1.0, index=close.index)
+        for day, _, f in units:
+            multiplier[multiplier.index < day] *= f
+        close, high, low = close * multiplier, high * multiplier, low * multiplier
+        for day, r, f in units:
+            rows.append({"ticker": ticker, "date": str(day.date()),
+                         "issue": "unit_scale_artifact",
+                         "previous_price": float(r["previous_price"]),
+                         "price": float(r["price"]), "ratio": float(r["ratio"]),
+                         "factor": f})
+        # Verify rather than assume: check the repaired series again.
+        _, jumps = find_jumps(pd, np, close)
+
+    unresolved = []
+    for day, r in jumps.iterrows():
+        row = {"ticker": ticker, "date": str(day.date()),
+               "issue": "unverified_adjusted_price_discontinuity",
+               "previous_price": float(r["previous_price"]),
+               "price": float(r["price"]), "ratio": float(r["ratio"])}
+        rows.append(row)
+        unresolved.append(row)
+    return {"close": close, "high": high, "low": low, "rows": rows,
+            "invalid": len(invalid), "units": len(units), "unresolved": unresolved}
+
+
+def check_prices(step: Step, s: Settings, mods: Dict[str, Any],
+                 prices: Dict[str, Any]) -> Dict[str, Any]:
+    pd, np = mods["pd"], mods["np"]
+    close, high, low = prices["close"].copy(), prices["high"].copy(), prices["low"].copy()
+    accepted = {a.strip().upper() for a in s.accept if a.strip()}
+    accepted |= {to_ticker(a).upper() for a in accepted}
+    step.info(f"rule: a move of {UPPER_RATIO:g}x or more between two observations needs "
+              f"verification; an exact x10/x100/x1000 jump is rescaled")
+
+    issues: List[Dict[str, Any]] = []
+    status: Dict[str, str] = {}
+    blocked: List[str] = []
+    for t in list(close.columns):
+        try:
+            r = check_one(pd, np, t, close[t], high[t], low[t])
+        except Exception as exc:
+            # A problem in one ticker must not stop the others.
+            issues.append({"ticker": t, "issue": "check_failed",
+                           "action": "ticker_excluded", "note": describe(exc)})
+            status[t] = "excluded: the price check itself failed"
+            step.warn(f"{t}: the price check failed ({describe(exc)}) at {locate(exc)}. "
+                      f"Ticker excluded.")
+            continue
+        close[t], high[t], low[t] = r["close"], r["high"], r["low"]
+        notes = []
+        for row in r["rows"]:
+            if row["issue"] == "unit_scale_artifact":
+                row["action"] = f"earlier_prices_rescaled_x{row['factor']:g}"
+                notes.append(f"{row['date']} ratio {row['ratio']:.4g} -> earlier prices "
+                             f"x{row['factor']:g}")
+            elif row["issue"] == "non_positive_or_non_finite":
+                row["action"] = "blocks_run" if s.strict else "observation_removed"
+            elif t.upper() in accepted:
+                row["action"] = "accepted_by_user"
+            else:
+                row["action"] = "blocks_run" if s.strict else "ticker_excluded"
+            issues.append(row)
+        if r["units"]:
+            step.info(f"{t:<12} repaired unit error: " + "; ".join(notes))
+        if r["invalid"]:
+            (step.warn if not s.strict else step.info)(
+                f"{t:<12} {r['invalid']} zero/negative/invalid price(s)"
+                + (" removed" if not s.strict else ""))
+        if r["unresolved"] and t.upper() in accepted:
+            step.warn(f"{t:<12} {len(r['unresolved'])} large jump(s) kept, accepted "
+                      f"with --accept")
+            status[t] = "accepted"
+        elif r["unresolved"] or (s.strict and r["invalid"]):
+            blocked.append(t)
+            status[t] = "blocked" if s.strict else "excluded: unverified price jump"
+        else:
+            status[t] = "repaired" if (r["units"] or r["invalid"]) else "ok"
+
+    if blocked:
+        (step.info if s.strict else step.warn)(
+            f"{len(blocked)} ticker(s) need verification (a jump of {UPPER_RATIO:g}x or "
+            f"more that is not a unit error)" + ("" if s.strict else " - excluded:"))
+        for t in blocked[:20]:
+            first = next(i for i in issues if i["ticker"] == t and i.get("action")
+                         in ("ticker_excluded", "blocks_run"))
+            where = (f"{first.get('previous_price', float('nan')):.4g} -> "
+                     f"{first.get('price', float('nan')):.4g} "
+                     f"(x{first.get('ratio', float('nan')):.3g})"
+                     if "ratio" in first else first["issue"])
+            step.info(f"  {t:<12} {first.get('date', '')}  {where}")
+        if len(blocked) > 20:
+            step.info(f"  ... and {len(blocked) - 20} more")
+
+    issue_file = s.out_dir / "price_issues.csv"
+    columns = ["ticker", "date", "issue", "previous_price", "price", "ratio",
+               "factor", "action", "note"]
+    try:
+        pd.DataFrame(issues, columns=columns).to_csv(issue_file, index=False)
+        step.info(f"{len(issues)} issue(s) written to {issue_file.name}")
+    except Exception as exc:
+        step.warn(f"Could not write {issue_file.name}: {describe(exc)}")
+
+    if s.strict and blocked:
+        raise StepError(
+            f"--strict: {len(blocked)} ticker(s) need verification: "
+            + ", ".join(blocked[:8]) + (" ..." if len(blocked) > 8 else ""),
+            hint=f"Check the dates in {issue_file.name} on another source. "
+                 f"Accept checked tickers with --accept T1,T2, or run without --strict "
+                 f"to exclude them and continue.")
+
+    keep = [t for t in close.columns if not status.get(t, "").startswith("excluded")]
+    if not keep:
+        raise StepError("Every ticker failed the price check, so there is nothing to use",
+                        hint=f"Open {issue_file.name}. If the jumps are real, accept them "
+                             f"with --accept.")
+    counts = {k: sum(1 for v in status.values() if v.startswith(k))
+              for k in ("ok", "repaired", "accepted", "excluded")}
+    step.summary = ", ".join(f"{n} {k}" for k, n in counts.items() if n)
+    return {"close": close[keep], "high": high[keep], "low": low[keep],
+            "status": status, "no_prices": prices["no_prices"],
+            "requested": prices["requested"], "issues": issues}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 6 - BUILD INDICATORS
+# ══════════════════════════════════════════════════════════════════════════
+
+def build_indicators(step: Step, s: Settings, mods: Dict[str, Any],
+                     checked: Dict[str, Any]) -> Dict[str, Any]:
+    """The same indicators hent_kurser() builds, with the same settings."""
+    pd, np = mods["pd"], mods["np"]
+    close, high, low = checked["close"], checked["high"], checked["low"]
+
+    try:
+        previous = close.shift(1)
+        # fmax skips a missing value instead of warning about it, as nanmax does.
+        tr = np.fmax(np.fmax((high - low).abs().to_numpy(),
+                             (high - previous).abs().to_numpy()),
+                     (low - previous).abs().to_numpy())
+        tr = pd.DataFrame(tr, index=close.index, columns=close.columns)
+        atr20 = tr.rolling(ATR_DAYS, min_periods=max(5, ATR_DAYS // 2)).mean()
+    except Exception as exc:
+        raise StepError(f"ATR{ATR_DAYS} could not be calculated: {describe(exc)}",
+                        hint="High/Low prices may be missing or misaligned with Close.") from exc
+    try:
+        sma10 = close.rolling(10).mean()
+        sma50 = close.rolling(SMA_DAYS).mean()
+        ema20 = close.ewm(span=20, adjust=False, min_periods=20).mean()
+    except Exception as exc:
+        raise StepError(f"Moving averages could not be calculated: {describe(exc)}") from exc
+    try:
+        daily = close.pct_change(fill_method=None).replace([np.inf, -np.inf], np.nan)
+        market_index = (1.0 + daily.mean(axis=1).fillna(0.0)).cumprod()
+    except Exception as exc:
+        raise StepError(f"The market index could not be calculated: {describe(exc)}") from exc
+
+    if not np.isfinite(market_index.to_numpy()).all() or (market_index <= 0).any():
+        step.warn("The equal-weight market index has invalid values; check the prices.")
+    history = close.notna().sum()
+    short = history[history < MIN_HISTORY_DAYS]
+    if len(short):
+        step.info(f"{len(short)} ticker(s) have under {MIN_HISTORY_DAYS} days of prices, "
+                  f"so the lab cannot use them for a signal yet: "
+                  + ", ".join(short.index[:10]) + (" ..." if len(short) > 10 else ""))
+    with_sma = int(sma50.iloc[-1].notna().sum()) if len(sma50) else 0
+    step.info(f"ATR{ATR_DAYS}, SMA10, SMA{SMA_DAYS}, EMA20 for {len(close.columns)} "
+              f"tickers; SMA{SMA_DAYS} available today for {with_sma}")
+    step.info(f"market index: {market_index.iloc[-1]:.3f} on "
+              f"{market_index.index[-1].date()} (1.000 on {market_index.index[0].date()})")
+
+    last = pd.DataFrame({
+        "ticker": close.columns,
+        "last_date": [str(close[t].last_valid_index().date())
+                      if close[t].last_valid_index() is not None else ""
+                      for t in close.columns],
+        "close": close.ffill().iloc[-1].to_numpy(),
+        "sma10": sma10.iloc[-1].to_numpy(), "sma50": sma50.iloc[-1].to_numpy(),
+        "ema20": ema20.iloc[-1].to_numpy(), "atr20": atr20.iloc[-1].to_numpy(),
+        "observations": history.to_numpy()})
+    step.summary = f"{len(close.columns)} tickers"
+    return {"last": last, "market_index": market_index}
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 7 - SAVE RESULTS
+# ══════════════════════════════════════════════════════════════════════════
+
+def save_results(step: Step, s: Settings, mods: Dict[str, Any], checked: Dict[str, Any],
+                 indicators: Dict[str, Any]) -> List[Path]:
+    pd = mods["pd"]
+    close = checked["close"]
+
+    rows = []
+    for t in checked["requested"]:
+        if t in checked["no_prices"]:
+            rows.append({"ticker": t, "status": "no_prices", "note": checked["no_prices"][t]})
+            continue
+        state = checked["status"].get(t, "ok")
+        series = close[t].dropna() if t in close.columns else None
+        rows.append({"ticker": t, "status": state.split(":")[0],
+                     "first_date": str(series.index[0].date()) if series is not None and len(series) else "",
+                     "last_date": str(series.index[-1].date()) if series is not None and len(series) else "",
+                     "observations": int(len(series)) if series is not None else 0,
+                     "note": state.split(": ", 1)[1] if ": " in state else ""})
+
+    jobs = [
+        ("management_prices_close.csv", lambda p: checked["close"].to_csv(p, index_label="Date")),
+        ("management_prices_high.csv", lambda p: checked["high"].to_csv(p, index_label="Date")),
+        ("management_prices_low.csv", lambda p: checked["low"].to_csv(p, index_label="Date")),
+        ("indicators_last.csv", lambda p: indicators["last"].to_csv(p, index=False)),
+        ("market_index.csv", lambda p: indicators["market_index"].rename("market_index")
+         .to_csv(p, index_label="Date")),
+        ("ticker_status.csv", lambda p: pd.DataFrame(rows).to_csv(p, index=False)),
+    ]
+    written: List[Path] = []
+    failed: List[str] = []
+    for name, write in jobs:
+        path = s.out_dir / name
+        try:
+            write(path)
+        except PermissionError:
+            # Almost always the file is open in Excel. Keep the result anyway.
+            alt = path.with_name(f"{path.stem}_{datetime.now():%Y%m%d_%H%M%S}{path.suffix}")
+            try:
+                write(alt)
+                step.warn(f"{name} is locked (open in Excel?); wrote {alt.name} instead")
+                path = alt
+            except Exception as exc:
+                failed.append(f"{name} ({describe(exc)})")
+                continue
+        except Exception as exc:
+            failed.append(f"{name} ({describe(exc)} at {locate(exc)})")
+            continue
+        written.append(path)
+        step.info(f"wrote {path.name}")
+    if failed:
+        raise StepError(f"{len(failed)} file(s) could not be written: " + "; ".join(failed),
+                        hint="Close the files in Excel and check free disk space.")
+    step.info(f"folder: {s.out_dir}")
+    step.summary = f"{len(written)} files in {s.out_dir.name}/"
+    return written
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════
+
+def default_excel_dir(explicit: Optional[str]) -> Path:
+    """The same ExcelData the rest of the system uses."""
+    try:
+        from runtime_config import data_root
+        return Path(data_root(explicit))
+    except Exception:
+        pass
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    if os.environ.get("AKSJE_BASE_DIR"):
+        return Path(os.environ["AKSJE_BASE_DIR"]).expanduser().resolve()
+    local = THIS_FILE.parent / "ExcelData"
+    return local if local.is_dir() else Path(LEGACY_EXCEL_DIR)
+
+
+def parse_args(argv: Optional[Sequence[str]]) -> Settings:
+    p = argparse.ArgumentParser(
+        prog="management_download",
+        description="Management sentiment: download and check prices, step by step.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="examples:\n"
+               "  python management_download.py 5\n"
+               "  python management_download.py all\n"
+               "  python management_download.py BSP EAM 2020.OL\n"
+               "  python management_download.py all --strict\n"
+               "  python management_download.py all --accept BSP.OL,EAM.OL")
+    p.add_argument("companies", nargs="*",
+                   help='"all", a number such as 5, or companies from the article list')
+    p.add_argument("--excel-dir", metavar="PATH", help="the ExcelData folder")
+    p.add_argument("--start", default=PRICE_START, metavar="YYYY-MM-DD",
+                   help=f"first price date (default {PRICE_START}, as in the lab)")
+    p.add_argument("--strict", action="store_true",
+                   help="stop at any unverified price jump, as the lab does")
+    p.add_argument("--accept", default="", metavar="T1,T2",
+                   help="comma-separated tickers whose price jumps you have checked")
+    p.add_argument("--batch-size", type=int, default=50, metavar="N")
+    p.add_argument("--retries", type=int, default=3, metavar="N")
+    p.add_argument("--pause", type=float, default=2.0, metavar="SECONDS",
+                   help="wait before the first retry; doubles each time")
+    a = p.parse_args(list(argv) if argv is not None else None)
+
+    try:
+        date.fromisoformat(a.start)
+    except ValueError:
+        p.error(f"--start must be a date like 2019-01-01, not {a.start!r}")
+    if a.batch_size < 1 or a.retries < 1 or a.pause < 0:
+        p.error("--batch-size and --retries must be 1 or more, --pause 0 or more")
+    companies = [c for arg in (a.companies or [COMPANIES])
+                 for c in str(arg).replace(",", " ").split()] or ["all"]
+    return Settings(base_dir=default_excel_dir(a.excel_dir), companies=companies,
+                    start=a.start, batch_size=a.batch_size, retries=a.retries,
+                    pause=a.pause, strict=a.strict,
+                    accept=tuple(x for x in a.accept.replace(" ", ",").split(",") if x))
+
+
+def configure_console() -> None:
+    """Keep the console readable when Windows redirects output to a file."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    configure_console()
+    warnings.filterwarnings("ignore", category=FutureWarning)
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
+    settings = parse_args(argv)
+    report = Report()
+
+    report.say(WIDE)
+    report.say(" MANAGEMENT SENTIMENT - PRICE DOWNLOAD  (from SentimentHendelseLab)")
+    report.say(WIDE)
+    report.say(f" Started   : {datetime.now():%Y-%m-%d %H:%M:%S}")
+    report.say(f" Companies : {' '.join(settings.companies)}")
+    report.say(f" ExcelData : {settings.base_dir}")
+    report.say(" Price jump: " + ("--strict, any unverified jump stops the run"
+                                  if settings.strict else
+                                  "unverified jumps exclude that company, the rest continue"))
+    if settings.accept:
+        report.say(f" Accepted  : {', '.join(settings.accept)}")
+
+    try:
+        mods = report.run(1, "Check setup", check_setup, settings)
+        articles = report.run(2, "Read article files", read_articles, settings, mods)
+        tickers = report.run(3, "Select companies", select_companies, settings, articles)
+        prices = report.run(4, "Download prices from Yahoo", download_prices,
+                            settings, mods, tickers)
+        checked = report.run(5, "Check price quality", check_prices, settings, mods, prices)
+        indicators = report.run(6, "Build indicators", build_indicators,
+                                settings, mods, checked)
+        report.run(7, "Save results", save_results, settings, mods, checked, indicators)
+        if checked:
+            report.facts = {
+                "tickers_with_prices": len(checked["close"].columns),
+                "tickers_without_prices": sorted(checked["no_prices"]),
+                "tickers_excluded": sorted(t for t, v in checked["status"].items()
+                                           if v.startswith("excluded")),
+                "tickers_repaired": sorted(t for t, v in checked["status"].items()
+                                           if v == "repaired")}
+    except KeyboardInterrupt:
+        report.interrupted = True
+        report.say()
+        report.say("Stopped by the user (Ctrl+C).")
+    return report.finish(settings)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except SystemExit:
+        raise
+    except BaseException as exc:    # a bug in the reporting itself
+        print(f"\nINTERNAL ERROR in {THIS_FILE.name} at {locate(exc)}: {describe(exc)}",
+              file=sys.stderr, flush=True)
+        traceback.print_exc()
+        sys.exit(1)
