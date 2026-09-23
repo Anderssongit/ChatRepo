@@ -228,16 +228,41 @@ class ManagementDownload(unittest.TestCase):
         self.assertTrue(all(c[1]["repair"] is False for c in self.yahoo.calls))
 
     # ── inputs and outputs ──────────────────────────────────────────────
-    def test_missing_article_folder_fails_step_one_with_a_hint(self):
+    def remove_articles(self):
         for f in self.nlp.iterdir():
             f.unlink()
         self.nlp.rmdir()
+
+    def test_no_articles_and_no_ticker_list_fails_step_one_with_a_hint(self):
+        self.remove_articles()
         code, out = self.run_main("5")
         self.assertEqual(code, 1)
         self.assertIn("[STEP 1/7] FAILED", out)
-        self.assertIn("Article folder not found", out)
-        self.assertIn("SentimentManagement()", out)
+        self.assertIn("Neither articles", out)
+        self.assertIn("--excel-dir", out)
         self.assertTrue((self.base / "management_download.log").exists())
+
+    def test_without_articles_the_ticker_list_is_downloaded(self):
+        self.remove_articles()
+        (self.base / "Data_BT").mkdir()
+        # Laid out as PBROE_All3 reads it: an index column, then Company.
+        pd.DataFrame({"Company": ["AAA", "CCC", "DDD"]}).to_excel(
+            self.base / MD.TICKER_LIST)
+        code, out = self.run_main("all")
+        self.assertIn("No article files", out)
+        self.assertIn("[STEP 7/7] OK", out)
+        self.assertEqual(list(self.status()), ["AAA.OL", "CCC.OL", "DDD.OL"])
+
+    def test_an_empty_exceldata_next_to_the_script_is_skipped(self):
+        empty = self.base / "script" / "ExcelData"
+        empty.mkdir(parents=True)
+        with patch.object(MD, "THIS_FILE", self.base / "script" / "x.py"), \
+                patch.object(MD, "LEGACY_EXCEL_DIR", str(self.base)), \
+                patch.dict(MD.os.environ, {}, clear=False):
+            MD.os.environ.pop("AKSJE_BASE_DIR", None)
+            found, searched = MD.find_excel_dir(None)
+        self.assertEqual(found, self.base.resolve())
+        self.assertIn("no articles or ticker list", searched[0])
 
     def test_an_unreadable_article_file_is_skipped_not_fatal(self):
         (self.nlp / "NLP_Sentiment_Detail_bad.xlsx").write_bytes(b"not an excel file")

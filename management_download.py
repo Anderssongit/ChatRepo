@@ -23,7 +23,10 @@ USAGE
                                              (write 2020.OL for 2020 Bulkers,
                                              since a bare 2020 is a count)
 
-    --excel-dir PATH     ExcelData folder (default: AKSJE_BASE_DIR, then the usual)
+    --excel-dir PATH     ExcelData folder. Without it the script looks in
+                         AKSJE_BASE_DIR, ExcelData next to the script and
+                         the Desktop ExcelData (LEGACY_EXCEL_DIR), and uses
+                         the first one that actually has the data.
     --start DATE         first price date, default 2019-01-01 as in the lab
     --strict             stop at any unresolved price jump, as the lab does
     --accept T1,T2       tickers whose jumps you have checked and accept
@@ -32,7 +35,8 @@ USAGE
 
 STEPS
     1  Check setup           Python packages and folders
-    2  Read article files    NLP_Sentiment_Detail_*.xlsx in DataNLP
+    2  Read company list     the articles in DataNLP; without them, the
+                             OSEBX ticker list the scraper itself reads
     3  Select companies      5, all, or named - from that same list
     4  Download prices       Yahoo Finance, in batches, with retries
     5  Check price quality   the lab's 4x rule; repair, exclude or stop
@@ -75,6 +79,9 @@ COMPANIES = "all"
 
 LEGACY_EXCEL_DIR = r"C:\Users\ander\Desktop\Python_K4\ExcelData"
 NLP_DIR = "DataNLP"
+# The list SentimentManagement() scrapes articles for. Used when there are no
+# articles yet, so prices can still be downloaded.
+TICKER_LIST = Path("Data_BT") / "AllTickers_OSEBX_TW_260428.xlsx"
 OUTPUT_DIR = "StrategyResults_v5_Sentiment_Exit"
 OSLO_SUFFIX = ".OL"
 PRICE_START = "2019-01-01"          # hent_kurser() in the lab
@@ -116,10 +123,15 @@ class Settings:
     pause: float = 2.0
     strict: bool = False
     accept: Tuple[str, ...] = ()
+    searched: Tuple[str, ...] = ()
 
     @property
     def nlp_dir(self) -> Path:
         return self.base_dir / NLP_DIR
+
+    @property
+    def ticker_list(self) -> Path:
+        return self.base_dir / TICKER_LIST
 
     @property
     def full_run(self) -> bool:
@@ -374,15 +386,24 @@ def check_setup(step: Step, s: Settings) -> Dict[str, Any]:
     logger.setLevel(logging.ERROR)
     logger.propagate = False
 
+    for line in s.searched:
+        step.info(f"searched   : {line}")
     if not s.base_dir.is_dir():
         raise StepError(f"ExcelData folder not found: {s.base_dir}",
                         hint="Use --excel-dir PATH, or set AKSJE_BASE_DIR.")
     step.info(f"ExcelData  : {s.base_dir}")
-    if not s.nlp_dir.is_dir():
-        raise StepError(f"Article folder not found: {s.nlp_dir}",
-                        hint="The articles are written by SentimentManagement(), the "
-                             "scraper. Run it first, or check --excel-dir.")
-    step.info(f"Articles   : {s.nlp_dir}")
+    has_articles = bool(article_files(s.nlp_dir)) if s.nlp_dir.is_dir() else False
+    if has_articles:
+        step.info(f"Articles   : {s.nlp_dir}")
+    elif s.ticker_list.is_file():
+        step.warn(f"No article files in {s.nlp_dir}. Prices are downloaded for the "
+                  f"ticker list {TICKER_LIST} instead (the list the scraper reads).")
+    else:
+        raise StepError(
+            f"Neither articles ({s.nlp_dir}) nor the ticker list ({s.ticker_list}) "
+            f"exist, so there is no list of companies to download",
+            hint="Point --excel-dir at the ExcelData folder that has DataNLP or "
+                 "Data_BT, e.g. --excel-dir " + LEGACY_EXCEL_DIR)
     try:
         s.out_dir.mkdir(parents=True, exist_ok=True)
         probe = s.out_dir / ".write_test"
@@ -434,12 +455,31 @@ def clean_company(value: Any) -> str:
     return "" if text.lower() in ("", "nan", "none", "nat") else text
 
 
+def read_ticker_list(step: Step, s: Settings, mods: Dict[str, Any]) -> Any:
+    """The OSEBX list, read as PBROE_All3() and SentimentManagement() read it."""
+    pd = mods["pd"]
+    try:
+        df = pd.read_excel(s.ticker_list)
+    except PermissionError as exc:
+        raise StepError(f"{s.ticker_list.name} cannot be opened: {describe(exc)}",
+                        hint="Close it in Excel and run again.") from exc
+    if "Company" not in df.columns:
+        raise StepError(f"{s.ticker_list.name} has no Company column "
+                        f"(columns: {', '.join(map(str, df.columns))})")
+    companies = sorted({clean_company(c) for c in df["Company"]} - {""})
+    if not companies:
+        raise StepError(f"{s.ticker_list.name} lists no companies")
+    step.info(f"read {s.ticker_list}: {len(companies)} companies")
+    step.summary = f"{len(companies)} companies from {s.ticker_list.name}"
+    return pd.DataFrame({"Company": companies})
+
+
 def read_articles(step: Step, s: Settings, mods: Dict[str, Any]) -> Any:
     pd = mods["pd"]
-    files = article_files(s.nlp_dir)
+    files = article_files(s.nlp_dir) if s.nlp_dir.is_dir() else []
     if not files:
-        raise StepError(f"No NLP_Sentiment_Detail_*.xlsx files in {s.nlp_dir}",
-                        hint="Run SentimentManagement() (the article scraper) first.")
+        step.info(f"no article files in {s.nlp_dir}; using the ticker list")
+        return read_ticker_list(step, s, mods)
     step.info(f"{len(files)} article file(s) found")
 
     parts = []
@@ -1085,19 +1125,35 @@ def save_results(step: Step, s: Settings, mods: Dict[str, Any], checked: Dict[st
 # MAIN
 # ══════════════════════════════════════════════════════════════════════════
 
-def default_excel_dir(explicit: Optional[str]) -> Path:
-    """The same ExcelData the rest of the system uses."""
+def has_data(folder: Path) -> bool:
     try:
-        from runtime_config import data_root
-        return Path(data_root(explicit))
-    except Exception:
-        pass
+        return bool(article_files(folder / NLP_DIR)) or (folder / TICKER_LIST).is_file()
+    except OSError:
+        return False
+
+
+def find_excel_dir(explicit: Optional[str]) -> Tuple[Path, Tuple[str, ...]]:
+    """
+    (ExcelData folder, what was searched).
+
+    --excel-dir is used as given. Otherwise the first candidate that actually
+    has articles or the ticker list wins. An empty ExcelData folder next to
+    the script must not hide the real one on the Desktop.
+    """
     if explicit:
-        return Path(explicit).expanduser().resolve()
+        return Path(explicit).expanduser().resolve(), ()
+    candidates: List[Path] = []
     if os.environ.get("AKSJE_BASE_DIR"):
-        return Path(os.environ["AKSJE_BASE_DIR"]).expanduser().resolve()
-    local = THIS_FILE.parent / "ExcelData"
-    return local if local.is_dir() else Path(LEGACY_EXCEL_DIR)
+        candidates.append(Path(os.environ["AKSJE_BASE_DIR"]).expanduser())
+    candidates += [THIS_FILE.parent / "ExcelData", Path(LEGACY_EXCEL_DIR)]
+    searched = []
+    for c in candidates:
+        found = has_data(c)
+        searched.append(f"{c} - {'has data' if found else 'no articles or ticker list'}")
+        if found:
+            return c.resolve(), tuple(searched)
+    first = next((c for c in candidates if c.is_dir()), candidates[-1])
+    return first.resolve(), tuple(searched)
 
 
 def parse_args(argv: Optional[Sequence[str]]) -> Settings:
@@ -1134,7 +1190,8 @@ def parse_args(argv: Optional[Sequence[str]]) -> Settings:
         p.error("--batch-size and --retries must be 1 or more, --pause 0 or more")
     companies = [c for arg in (a.companies or [COMPANIES])
                  for c in str(arg).replace(",", " ").split()] or ["all"]
-    return Settings(base_dir=default_excel_dir(a.excel_dir), companies=companies,
+    base_dir, searched = find_excel_dir(a.excel_dir)
+    return Settings(base_dir=base_dir, searched=searched, companies=companies,
                     start=a.start, batch_size=a.batch_size, retries=a.retries,
                     pause=a.pause, strict=a.strict,
                     accept=tuple(x for x in a.accept.replace(" ", ",").split(",") if x))
@@ -1170,7 +1227,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         mods = report.run(1, "Check setup", check_setup, settings)
-        articles = report.run(2, "Read article files", read_articles, settings, mods)
+        articles = report.run(2, "Read company list", read_articles, settings, mods)
         tickers = report.run(3, "Select companies", select_companies, settings, articles)
         prices = report.run(4, "Download prices from Yahoo", download_prices,
                             settings, mods, tickers)
