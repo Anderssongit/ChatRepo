@@ -59,10 +59,13 @@ from __future__ import annotations
 import argparse
 import ast
 import importlib
+import importlib.util
 import json
+import linecache
 import logging
 import math
 import os
+import re
 import sys
 import time
 import traceback
@@ -636,6 +639,340 @@ def article_snapshot(pd: Any, folder: Path) -> Tuple[set, str]:
     return keys, (str(max(dates).date()) if dates else "-")
 
 
+# The changes that make the v4.1 scraper fetch only new articles: pairs of
+# (text in the old Only_260820.py, text it becomes). Taken from the
+# difference between the original file and the fixed one, and checked
+# against the original in test_management_download.py.
+SCRAPER_PATCHES: List[Tuple[str, str]] = [
+    # 1
+    (r'''            force_rerun: bool       = True''',
+     r'''            force_rerun: bool       = True
+            # Bare nye artikler: hvert selskap blas bare fram til første side der
+            # alt allerede ligger i DataNLP. AKSJE_NLP_ALLE=1 henter alt på nytt.
+            incremental: bool       = not _miljo_paa("AKSJE_NLP_ALLE")
+            # Kommaseparert utvalg, f.eks. "BSP,EAM". Tomt = hele Excel-lista.
+            only_companies: str     = os.environ.get("AKSJE_NLP_SELSKAPER", "")'''),
+    # 2
+    (r'''
+        async def collect_all_article_rows(page, config: Config, sl: StepLogger) -> List[dict]:''',
+     r'''
+        # ─────────────────────────────────────────────────────────────────────────────
+        # BARE NYE ARTIKLER
+        # ─────────────────────────────────────────────────────────────────────────────
+
+        def _selskapsnokkel(company) -> str:
+            # Excel kan lagre tickeren 2020 som tallet 2020.0.
+            if isinstance(company, float) and company.is_integer():
+                company = int(company)
+            return str(company).strip().upper()
+
+        def _artikkel_url(row: dict, config: Config) -> str:
+            """Den samme Article_URL som scrape_company skriver for raden."""
+            nid, href = row.get("nid", "") or "", row.get("href", "") or ""
+            url = config.euronext_base + href if href.startswith("/") else href
+            return url or (f"modal://{nid}" if nid else "")
+
+        def _er_kjent(row: dict, kjente: Set, config: Config) -> bool:
+            url = _artikkel_url(row, config)
+            if url and ("url", url) in kjente:
+                return True
+            return ("tittel", str(row.get("title", "")).strip(),
+                    str(row.get("date", "")).strip()) in kjente
+
+        def load_known_articles(config: Config):
+            """
+            (kjente nøkler per selskap, alle lagrede rader uten duplikater).
+
+            Leser hver NLP_Sentiment_Detail_*.xlsx i DataNLP. En fil som ikke kan
+            leses hoppes over med en advarsel; det koster bare at artiklene i
+            den hentes på nytt.
+            """
+            deler = []
+            for f in sorted(config.nlp_dir.glob("NLP_Sentiment_Detail_*.xlsx")):
+                if f.name.startswith("~$"):
+                    continue
+                try:
+                    d = pd.read_excel(f)
+                except Exception as e:
+                    log.warning("  Hoppet over %s: %s", f.name, e)
+                    continue
+                if not d.empty and "Company" in d.columns:
+                    deler.append(d)
+            if not deler:
+                return {}, []
+            df = pd.concat(deler, ignore_index=True).dropna(subset=["Company"])
+            df["Company"] = df["Company"].map(
+                lambda c: int(c) if isinstance(c, float) and c.is_integer() else c)
+            if "Article_Title" in df.columns:
+                df = df[df["Article_Title"].astype(str) != "INGEN ARTIKLER"]
+            nokler = [k for k in ("Company", "Article_Date", "Article_Title") if k in df.columns]
+            df = df.drop_duplicates(subset=nokler, keep="last")
+            rader = df.to_dict("records")
+            kjente = {}
+            for r in rader:
+                s = kjente.setdefault(_selskapsnokkel(r["Company"]), set())
+                url = str(r.get("Article_URL") or "").strip()
+                if url and url.lower() != "nan" and url != "modal://":
+                    s.add(("url", url))
+                s.add(("tittel", str(r.get("Article_Title") or "").strip(),
+                       str(r.get("Article_Date") or "").strip()))
+            return kjente, rader
+        async def collect_all_article_rows(page, config: Config, sl: StepLogger,
+                                           kjente: Optional[Set] = None,
+                                           stats: Optional[dict] = None) -> List[dict]:'''),
+    # 3
+    (r'''                sl.info(f"  Side {page_num}: {len(rows)} rader, {new_count} nye → totalt {len(all_rows)}")''',
+     r'''                sl.info(f"  Side {page_num}: {len(rows)} rader, {new_count} nye → totalt {len(all_rows)}")
+                # Bare nye artikler: de nyeste står øverst, så når en hel side
+                # allerede ligger i DataNLP, gjør resten av sidene det også.
+                if kjente is not None and new_count:
+                    denne_siden = all_rows[-new_count:]
+                    ukjente = sum(1 for r in denne_siden if not _er_kjent(r, kjente, config))
+                    if stats is not None:
+                        stats["kjente"] = stats.get("kjente", 0) + new_count - ukjente
+                    if ukjente == 0:
+                        sl.info("  Hele siden ligger allerede i DataNLP — stopper bladingen")
+                        break'''),
+    # 4
+    (r'''
+            return all_rows[:config.max_articles_per_company]''',
+     r'''
+            rader = all_rows[:config.max_articles_per_company]
+            if kjente is not None:
+                rader = [r for r in rader if not _er_kjent(r, kjente, config)]
+            return rader'''),
+    # 5
+    (r'''            is_first: bool,''',
+     r'''            is_first: bool,
+            kjente: Optional[Set] = None,
+            stats: Optional[dict] = None,'''),
+    # 6
+    (r'''
+            row_data = await collect_all_article_rows(page, config, sl)''',
+     r'''
+            row_data = await collect_all_article_rows(page, config, sl, kjente, stats)'''),
+    # 7
+    (r'''                    sl.info(f"  ... og {len(row_data)-3} til")''',
+     r'''                    sl.info(f"  ... og {len(row_data)-3} til")
+            elif stats is not None and stats.get("kjente"):
+                sl.ok(f"Ingen nye artikler — {stats['kjente']} ligger allerede i DataNLP")
+                stats["oppdatert"] = True
+                try:
+                    await page.goto(config.start_url, wait_until="networkidle",
+                                    timeout=config.page_timeout)
+                    await page.wait_for_timeout(1_500)
+                except Exception:
+                    pass
+                return articles'''),
+    # 8
+    (r'''            companies = load_companies(config)''',
+     r'''            companies = load_companies(config)
+            if config.only_companies.strip():
+                valgt = {_selskapsnokkel(w).removesuffix(".OL")
+                         for w in config.only_companies.split(",") if w.strip()}
+                companies = [c for c in companies if _selskapsnokkel(c) in valgt]
+                print(f"   Utvalg fra AKSJE_NLP_SELSKAPER: {len(companies)} selskaper")'''),
+    # 9
+    (r'''            print(f"   ✅ STEG C FERDIG: {len(remaining)} selskaper gjenstår")''',
+     r'''            print(f"   ✅ STEG C FERDIG: {len(remaining)} selskaper gjenstår")
+            # STEG C2: Bare nye artikler
+            known, existing_rows = {}, []
+            if config.incremental:
+                print(f"\n📚 STEG C2: Leser artiklene som allerede ligger i DataNLP...")
+                try:
+                    known, existing_rows = load_known_articles(config)
+                    print(f"   ✅ STEG C2 FERDIG: {len(existing_rows)} lagrede artikler for "
+                          f"{len(known)} selskaper — bare nye hentes og analyseres")
+                except Exception as e:
+                    print(f"   ⚠️  STEG C2 FEILET ({type(e).__name__}: {e}) — henter alle "
+                          f"artikler på nytt")
+                    known, existing_rows = {}, []
+                    config.incremental = False
+            else:
+                print(f"\n📚 STEG C2: AKSJE_NLP_ALLE=1 — henter alle artikler på nytt")
+
+            def kjente_for(company):
+                return known.get(_selskapsnokkel(company)) if config.incremental else None'''),
+    # 10
+    (r'''                failed_companies = []''',
+     r'''                failed_companies = []
+                oppdatert = []'''),
+    # 11
+    (r'''                    print(f"{'▓'*70}")
+''',
+     r'''                    print(f"{'▓'*70}")
+
+                    stats = {}'''),
+    # 12
+    (r'''                    try:
+                        articles = await scrape_company(page, company, config, is_first)''',
+     r'''                    try:
+                        articles = await scrape_company(page, company, config, is_first,
+                                                        kjente_for(company), stats)'''),
+    # 13
+    (r'''                            await page.wait_for_timeout(1_500)
+                        except Exception:
+                            pass
+''',
+     r'''                            await page.wait_for_timeout(1_500)
+                        except Exception:
+                            pass
+
+                    if not articles and stats.get("oppdatert"):
+                        oppdatert.append(company)
+                        mark_company_complete(company, config, today)
+                        print(f"  ✓ {company}: ingen nye artikler — allerede oppdatert")
+                        continue'''),
+    # 14
+    (r'''                                try:
+                                    articles = await scrape_company(page, company, config, False)''',
+     r'''                                try:
+                                    articles = await scrape_company(page, company, config, False,
+                                                                    kjente_for(company), stats)'''),
+    # 15
+    (r'''            print(f"{'='*80}")
+            save_results(all_results, config, today, final=not failed_companies)''',
+     r'''            print(f"{'='*80}")
+            # Filen får både det som lå der og det nye, så den nyeste filen alene
+            # er hele datagrunnlaget (data_acquisition.py leser bare den). Den er
+            # _FINAL også når noen selskaper feilet: den inneholder alt fra før,
+            # og en fil med tidsstempel leses ikke av ledelses-laben.
+            save_results(existing_rows + all_results, config, today,
+                         final=not failed_companies or config.incremental)'''),
+    # 16
+    (r'''            print(f"  Artikler analysert:      {arts_total}")''',
+     r'''            print(f"  Artikler analysert:      {arts_total}")
+            if config.incremental:
+                print(f"  Allerede oppdatert:      {len(oppdatert)} selskaper (ingen nye artikler)")
+                print(f"  Lagret fra før:          {len(existing_rows)} artikler (tatt med i filen)")'''),
+]
+
+# ── Loading the scraper ───────────────────────────────────────────────────
+#
+# Only_260820.py stays exactly as it is on disk. It is read, fixed in memory
+# and run from there, so this works with the file you already have:
+#
+#   1. Every scraper ends with «if __name__ == "__main__": asyncio.run(main())».
+#      Started from another script, __name__ is «Only_260820», and the scraper
+#      returned without downloading anything. The check is replaced by a call.
+#   2. The v4.1 scraper gets «only new articles» (SCRAPER_PATCHES below). If
+#      your file differs where a change goes, none of them are applied: the
+#      scraper still runs, but downloads every article again, and step 4 warns.
+
+SCRAPER_FILE = "Only_260820.py"
+SCRAPER_START = "    def NLP_Euronext_Quarter4_v41():"
+SCRAPER_END = "    def NlpSentimentTrader4_v41():"
+MAIN_GUARD = re.compile(r'^([ \t]+)if __name__ == ["\']__main__["\']:[ \t]*\n'
+                        r'\1[ \t]+asyncio\.run\(main\(\)\)[ \t]*$', re.M)
+GUARD_COMMENT = (
+    "# Kjøres også når fila importeres, slik master.py gjør. En sperre med",
+    "# «if __name__ == \"__main__\"» her gjorde at skrapingen stille ble hoppet",
+    "# over: da er __name__ «Only_260820», og ingen artikler ble hentet.")
+KJOR_ASYNC = """
+
+
+def _kjor_async(coro):
+    # Added by management_download.py: asyncio.run, also where a loop runs.
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    import nest_asyncio
+    nest_asyncio.apply()
+    return asyncio.get_event_loop().run_until_complete(coro)
+"""
+
+
+def patch_scraper_source(text: str) -> Tuple[str, List[str], List[str]]:
+    """(fixed source, what was changed, what could not be changed)."""
+    text = text.replace("\r\n", "\n")
+    if "def _kjor_async" in text:
+        return text, ["already the fixed version, used as it is"], []
+    done: List[str] = []
+    missing: List[str] = []
+    text, guards = MAIN_GUARD.subn(lambda m: "".join(
+        m.group(1) + line + "\n" for line in GUARD_COMMENT) + m.group(1)
+        + "_kjor_async(main())", text)
+    if guards:
+        done.append(f"scraper start fixed in {guards} place(s)")
+    else:
+        missing.append("the scraper start («if __name__ ... asyncio.run(main())») was "
+                       "not found")
+    text += KJOR_ASYNC
+
+    start = text.find(SCRAPER_START)
+    end = text.find(SCRAPER_END, start + 1) if start >= 0 else -1
+    if start < 0 or end < 0:
+        missing.append("the v4.1 scraper was not found, so every article is downloaded "
+                       "again (slow)")
+        return text, done, missing
+    part = text[start:end]
+    for number, (old, new) in enumerate(SCRAPER_PATCHES, 1):
+        if part.count(old + "\n") != 1:
+            last = next((x.strip() for x in reversed(old.splitlines()) if x.strip()), "")
+            missing.append(f"change {number}/{len(SCRAPER_PATCHES)} does not match your "
+                           f"file (near «{last[:60]}»), so every article is downloaded "
+                           f"again (slow)")
+            return text, done, missing
+        part = part.replace(old + "\n", new + "\n", 1)
+    done.append(f"only new articles: all {len(SCRAPER_PATCHES)} changes applied")
+    return text[:start] + part + text[end:], done, missing
+
+
+def find_scraper_file() -> Optional[Path]:
+    for folder in [THIS_FILE.parent] + [Path(p) for p in sys.path if p]:
+        candidate = folder / SCRAPER_FILE
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_scraper(step: Step) -> Any:
+    """Only_260820 as a module, fixed in memory. The file is never written."""
+    if "Only_260820" in sys.modules:
+        module = sys.modules["Only_260820"]
+        step.info(f"scraper file: {getattr(module, '__file__', '?')} (already loaded)")
+        if not hasattr(module, "_kjor_async"):
+            raise StepError(
+                f"{getattr(module, '__file__', SCRAPER_FILE)} is the old version and was "
+                f"loaded before this step, so it cannot be fixed now",
+                hint="Start this script on its own, not from a program that already "
+                     "imported Only_260820.")
+        return module
+    path = find_scraper_file()
+    if path is None:
+        raise StepError(f"{SCRAPER_FILE} not found next to {THIS_FILE.name}",
+                        hint=f"Put {SCRAPER_FILE} in {THIS_FILE.parent}.")
+    step.info(f"scraper file: {path}")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        raw = path.read_text(encoding="cp1252")
+    text, done, missing = patch_scraper_source(raw)
+    for line in done:
+        step.info(f"scraper: {line}")
+    for line in missing:
+        step.warn(f"scraper: {line}")
+    if "_kjor_async(main())" not in text:
+        raise StepError("the scraper cannot be started from here: its start was not found",
+                        hint=f"Send me the last 20 lines of NLP_Euronext_Quarter4_v41() "
+                             f"in {path.name}.")
+
+    spec = importlib.util.spec_from_loader("Only_260820", loader=None, origin=str(path))
+    module = importlib.util.module_from_spec(spec)
+    module.__file__ = str(path)
+    # Tracebacks then show the fixed lines that actually ran.
+    linecache.cache[str(path)] = (len(text), None, text.splitlines(True), str(path))
+    sys.modules["Only_260820"] = module
+    try:
+        exec(compile(text, str(path), "exec", dont_inherit=True), module.__dict__)
+    except BaseException:
+        sys.modules.pop("Only_260820", None)
+        raise
+    return module
+
+
 def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
                       tickers: List[str]) -> Optional[int]:
     """
@@ -668,15 +1005,7 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
     try:
         if str(THIS_FILE.parent) not in sys.path:
             sys.path.insert(0, str(THIS_FILE.parent))
-        models = importlib.import_module("Only_260820")
-        step.info(f"scraper file: {getattr(models, '__file__', '?')}")
-        if not hasattr(models, "_kjor_async"):
-            # The old file ends each scraper with «if __name__ == "__main__"»,
-            # so an imported scraper returns without downloading anything.
-            raise StepError(
-                f"{getattr(models, '__file__', 'Only_260820.py')} is the old version: "
-                f"its scraper does nothing when another script starts it",
-                hint="Copy the new Only_260820.py from the branch into this folder.")
+        models = load_scraper(step)
         try:
             from runtime_config import configure_paths
             configure_paths(models.__dict__, s.base_dir)

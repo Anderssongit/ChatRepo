@@ -361,13 +361,105 @@ class ArticleStep(unittest.TestCase):
         code, out = self.run_with(scraper, "5")
         self.assertEqual(scraper.calls, [], "the old scraper must not be started")
         self.assertIn("is the old version", out)
-        self.assertIn("Copy the new Only_260820.py", out)
+        self.assertIn("loaded before this step", out)
         self.assertIn("[STEP 4/8] WARN", out)
 
     def test_no_articles_skips_the_download(self):
         code, out = self.run_main("5")
         self.assertIn("skipped (--no-articles)", out)
         self.assertIn("[STEP 4/8] OK", out)
+
+
+OLD_STYLE_SCRAPER = """
+import asyncio
+import os
+
+calls = []
+
+
+def SentimentManagement():
+    def NLP_Euronext_Quarter4_v41():
+        async def main():
+            calls.append(os.environ.get("AKSJE_NLP_SELSKAPER"))
+
+        if __name__ == "__main__":
+            asyncio.run(main())
+    NLP_Euronext_Quarter4_v41()
+
+
+if __name__ == "__main__":
+    raise SystemExit("the module-level check must stay")
+"""
+
+
+def repo_original():
+    """Only_260820.py as it was before the fix, from git history."""
+    import subprocess
+    try:
+        return subprocess.run(["git", "show", "7c21574:Only_260820.py"], check=True,
+                              capture_output=True, cwd=Path(__file__).resolve().parent
+                              ).stdout.decode("utf-8")
+    except Exception:
+        return None
+
+
+def v41(text):
+    text = text.replace("\r\n", "\n")
+    return text[text.index(MD.SCRAPER_START):text.index(MD.SCRAPER_END)]
+
+
+class ScraperFixedInMemory(unittest.TestCase):
+    def test_the_original_file_becomes_the_fixed_scraper(self):
+        original = repo_original()
+        if original is None:
+            self.skipTest("git history not available")
+        text, done, missing = MD.patch_scraper_source(original)
+        self.assertEqual(missing, [])
+        self.assertIn("only new articles: all 16 changes applied", done)
+        self.assertIn("scraper start fixed in 2 place(s)", done)
+        fixed = (Path(__file__).resolve().parent / "Only_260820.py").read_text(encoding="utf-8")
+        self.assertEqual(v41(text), v41(fixed))
+        compile(text, "Only_260820.py", "exec", dont_inherit=True)
+
+    def test_a_file_that_differs_still_runs_but_downloads_everything(self):
+        original = repo_original()
+        if original is None:
+            self.skipTest("git history not available")
+        changed = original.replace(
+            "row_data = await collect_all_article_rows(page, config, sl)",
+            "row_data = await collect_all_article_rows(page, config,  sl)", 1)
+        text, done, missing = MD.patch_scraper_source(changed)
+        self.assertIn("scraper start fixed in 2 place(s)", done)
+        self.assertTrue(any("does not match your file" in m for m in missing), missing)
+        self.assertNotIn("def load_known_articles", text)
+        compile(text, "Only_260820.py", "exec", dont_inherit=True)
+
+    def test_the_fixed_file_is_used_as_it_is(self):
+        fixed = (Path(__file__).resolve().parent / "Only_260820.py").read_text(encoding="utf-8")
+        text, done, missing = MD.patch_scraper_source(fixed)
+        self.assertEqual(done, ["already the fixed version, used as it is"])
+        self.assertEqual(text, fixed.replace("\r\n", "\n"))
+
+    def test_an_old_style_file_on_disk_is_run_and_left_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "Only_260820.py"
+            path.write_text(OLD_STYLE_SCRAPER, encoding="utf-8")
+            before = path.read_bytes()
+            log = io.StringIO()
+            report = MD.Report()
+            step = MD.Step(report, 4, "test")
+            with patch.object(MD, "find_scraper_file", lambda: path), \
+                    patch.dict(sys.modules), contextlib.redirect_stdout(log):
+                sys.modules.pop("Only_260820", None)
+                module = MD.load_scraper(step)
+                os.environ["AKSJE_NLP_SELSKAPER"] = "BSP"
+                try:
+                    module.SentimentManagement()
+                finally:
+                    os.environ.pop("AKSJE_NLP_SELSKAPER", None)
+            self.assertEqual(module.calls, ["BSP"], "the scraper must really run")
+            self.assertEqual(path.read_bytes(), before, "the file on disk is not changed")
+            self.assertTrue(any("v4.1 scraper was not found" in w for w in step.warnings))
 
 
 class YahooReasons(unittest.TestCase):
