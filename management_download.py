@@ -101,6 +101,12 @@ LOWER_RATIO = 0.25
 # (ore/krone), not a price move. Same rule and tolerance as price_repair.py.
 UNIT_FACTORS = (1000.0, 100.0, 10.0, 0.1, 0.01, 0.001)
 UNIT_TOLERANCE = 0.005
+# One bad day: a jump followed by the jump back. When the two ratios multiply
+# to within 10 % of 1, the price in between is a bad print, not a move.
+SPIKE_TOLERANCE = 0.10
+# A ticker where more than this share of the prices are zero, negative or
+# not numbers is not a usable series, whatever is left after removing them.
+MAX_INVALID_SHARE = 0.05
 
 # Indicator settings, as in the lab's Config.
 ATR_DAYS = 20
@@ -518,8 +524,13 @@ def read_articles(step: Step, s: Settings, mods: Dict[str, Any]) -> Any:
 
     df = pd.concat(parts, ignore_index=True)
     total = len(df)
+    raw_dates = df["Article_Date"].astype(str)
     df["Article_Date"] = parse_article_dates(pd, df["Article_Date"])
     no_date = int(df["Article_Date"].isna().sum())
+    if no_date:
+        examples = raw_dates[df["Article_Date"].isna()].str.strip().drop_duplicates().head(5)
+        step.info("dates that could not be read, e.g.: "
+                  + " | ".join(repr(x[:40]) for x in examples))
     df = df.dropna(subset=["Article_Date"])
     no_text = 0
     if "Text_Length" in df.columns:
@@ -850,6 +861,9 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
 #      the scraper reads that list instead. Data_BT is not touched.
 
 SCRAPER_FILE = "Only_260820.py"
+# What the article scraper needs: the browser, the language model and its
+# sentence splitter.
+SCRAPER_PACKAGES = ("playwright", "transformers", "torch", "nltk")
 SCRAPER_START = "    def NLP_Euronext_Quarter4_v41():"
 SCRAPER_END = "    def NlpSentimentTrader4_v41():"
 MAIN_GUARD = re.compile(r'^([ \t]+)if __name__ == ["\']__main__["\']:[ \t]*\n'
@@ -942,7 +956,10 @@ def point_at_company_list(step: Step, s: Settings, text: str, names: List[str]) 
         return text
     target = s.out_dir / "scraper_companies.xlsx"
     import pandas as pd
-    pd.DataFrame({"Company": names}).to_excel(target, index=False)
+    # Same layout as AllTickers_OSEBX_TW_*.xlsx: an index column, then Company.
+    # Readers that drop the first column and readers that drop «Unnamed»
+    # columns both find Company.
+    pd.DataFrame({"Company": names}).to_excel(target)
     why = (f"{own.name} is missing" if not own.is_file() else "only the chosen companies")
     (step.warn if not own.is_file() else step.info)(
         f"scraper: {why} - it reads {len(names)} companies from {target} instead")
@@ -1022,6 +1039,18 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
     pd = mods["pd"]
     before, newest_before = article_snapshot(pd, s.nlp_dir)
     step.info(f"on disk now: {len(before)} articles, newest {newest_before}")
+
+    # Without FinBERT the scraper does not stop: it gives every new article
+    # a neutral default score, saves it, and later runs skip it as known.
+    # So nothing is started unless everything it needs is installed.
+    absent = [name for name in SCRAPER_PACKAGES if importlib.util.find_spec(name) is None]
+    if absent:
+        step.warn(f"Article download skipped: the scraper needs {', '.join(absent)}, which "
+                  f"is not installed (without it, new articles would get a fake neutral "
+                  f"score). Install with: pip install {' '.join(absent)}, then run "
+                  f"'python -m playwright install chromium' once.")
+        step.summary = "skipped - packages missing"
+        return None
     names = [t[:-len(OSLO_SUFFIX)] if t.upper().endswith(OSLO_SUFFIX) else t
              for t in tickers]
     step.info(("all companies" if s.full_run else f"{len(names)} companies")
@@ -1176,7 +1205,8 @@ def yahoo_reasons(mods: Dict[str, Any], tickers: Sequence[str]) -> Dict[str, str
 
 
 def fetch(step: Step, s: Settings, mods: Dict[str, Any], batch: Sequence[str],
-          label: str, attempts: int) -> Tuple[Optional[Dict[str, Any]], Optional[BaseException]]:
+          label: str, attempts: int, repair: Optional[bool] = None
+          ) -> Tuple[Optional[Dict[str, Any]], Optional[BaseException]]:
     """One Yahoo request, retried with a doubling pause. Never raises."""
     pd, yf = mods["pd"], mods["yf"]
     last: Optional[BaseException] = None
@@ -1185,7 +1215,8 @@ def fetch(step: Step, s: Settings, mods: Dict[str, Any], batch: Sequence[str],
             mods["yahoo_log"].clear()
         try:
             data = yf.download(list(batch), start=s.start, auto_adjust=True,
-                               repair=mods["repair"], progress=False, threads=True)
+                               repair=mods["repair"] if repair is None else repair,
+                               progress=False, threads=True)
             fields = extract_fields(pd, data, batch)
             if with_prices(fields["Close"], batch):
                 if attempt > 1:
@@ -1253,11 +1284,18 @@ def download_prices(step: Step, s: Settings, mods: Dict[str, Any],
         step.info(f"retrying {len(missing)} ticker(s) without prices, one at a time")
         for t in missing:
             fields, exc = fetch(step, s, mods, [t], t, 1)
+            how = "on its own"
+            if fields is None and mods["repair"]:
+                # Some tickers fail inside yfinance's own repair (for example
+                # «Period 'max' is invalid» or «Cannot convert non-finite
+                # values»). One try without it; the price check still runs.
+                fields, exc = fetch(step, s, mods, [t], t, 1, repair=False)
+                how = "without Yahoo's price repair"
             if fields is not None:
                 for f in FIELDS:
                     frames[f].append(fields[f])
                 reasons.pop(t, None)
-                step.info(f"{t}: prices found on its own")
+                step.info(f"{t}: prices found {how}")
             else:
                 reasons[t] = (yahoo_reasons(mods, [t]).get(t)
                               or reasons.get(t) or describe(exc))
@@ -1315,6 +1353,27 @@ def find_jumps(pd: Any, np: Any, series: Any) -> Tuple[Any, Any]:
     return invalid, jumps
 
 
+def find_spikes(pd: Any, np: Any, series: Any) -> List[Tuple[Any, float, float, float]]:
+    """(day, price before, price, price after) for each one-day bad print."""
+    good = pd.to_numeric(series, errors="coerce")
+    good = good[np.isfinite(good) & (good > 0)]
+    values = good.to_numpy(dtype=float)
+    found = []
+    i = 1
+    while i < len(values) - 1:
+        up = values[i] / values[i - 1]
+        back = values[i + 1] / values[i]
+        flagged = (up >= UPPER_RATIO or up <= LOWER_RATIO) and \
+            (back >= UPPER_RATIO or back <= LOWER_RATIO)
+        if flagged and abs(up * back - 1.0) <= SPIKE_TOLERANCE:
+            found.append((good.index[i], float(values[i - 1]), float(values[i]),
+                          float(values[i + 1])))
+            i += 2
+            continue
+        i += 1
+    return found
+
+
 def check_one(pd: Any, np: Any, ticker: str, close: Any, high: Any, low: Any
               ) -> Dict[str, Any]:
     """
@@ -1327,6 +1386,7 @@ def check_one(pd: Any, np: Any, ticker: str, close: Any, high: Any, low: Any
     """
     rows: List[Dict[str, Any]] = []
     invalid, jumps = find_jumps(pd, np, close)
+    observations = int(pd.to_numeric(close, errors="coerce").notna().sum())
     for day, price in invalid.items():
         rows.append({"ticker": ticker, "date": str(day.date()),
                      "issue": "non_positive_or_non_finite", "price": float(price)})
@@ -1335,6 +1395,20 @@ def check_one(pd: Any, np: Any, ticker: str, close: Any, high: Any, low: Any
         close[invalid.index] = np.nan
         high[invalid.index] = np.nan
         low[invalid.index] = np.nan
+
+    # One bad day: remove that price, instead of taking either jump as real.
+    spikes = find_spikes(pd, np, close)
+    for day, before, price, after in spikes:
+        rows.append({"ticker": ticker, "date": str(day.date()), "issue": "single_day_spike",
+                     "previous_price": before, "price": price,
+                     "ratio": price / before, "note": f"next price {after:.6g}"})
+    if spikes:
+        days = [d for d, *_ in spikes]
+        close, high, low = close.copy(), high.copy(), low.copy()
+        close[days] = np.nan
+        high[days] = np.nan
+        low[days] = np.nan
+        _, jumps = find_jumps(pd, np, close)
 
     units = [(day, r, unit_factor(float(r["ratio"]))) for day, r in jumps.iterrows()]
     units = [(day, r, f) for day, r, f in units if f is not None]
@@ -1361,7 +1435,11 @@ def check_one(pd: Any, np: Any, ticker: str, close: Any, high: Any, low: Any
         rows.append(row)
         unresolved.append(row)
     return {"close": close, "high": high, "low": low, "rows": rows,
-            "invalid": len(invalid), "units": len(units), "unresolved": unresolved}
+            "invalid": len(invalid), "spikes": len(spikes), "units": len(units),
+            "unresolved": unresolved,
+            "mostly_invalid": observations > 0
+            and len(invalid) > MAX_INVALID_SHARE * observations,
+            "observations": observations}
 
 
 def check_prices(step: Step, s: Settings, mods: Dict[str, Any],
@@ -1395,7 +1473,10 @@ def check_prices(step: Step, s: Settings, mods: Dict[str, Any],
                 notes.append(f"{row['date']} ratio {row['ratio']:.4g} -> earlier prices "
                              f"x{row['factor']:g}")
             elif row["issue"] == "non_positive_or_non_finite":
-                row["action"] = "blocks_run" if s.strict else "observation_removed"
+                row["action"] = ("ticker_excluded" if r["mostly_invalid"] else
+                                 "blocks_run" if s.strict else "observation_removed")
+            elif row["issue"] == "single_day_spike":
+                row["action"] = "observation_removed"
             elif t.upper() in accepted:
                 row["action"] = "accepted_by_user"
             else:
@@ -1403,6 +1484,14 @@ def check_prices(step: Step, s: Settings, mods: Dict[str, Any],
             issues.append(row)
         if r["units"]:
             step.info(f"{t:<12} repaired unit error: " + "; ".join(notes))
+        if r["spikes"]:
+            step.info(f"{t:<12} removed {r['spikes']} one-day bad price(s) (jump there "
+                      f"and straight back)")
+        if r["mostly_invalid"]:
+            step.warn(f"{t:<12} {r['invalid']} of {r['observations']} prices are zero, "
+                      f"negative or not numbers - ticker excluded")
+            status[t] = "excluded: mostly invalid prices"
+            continue
         if r["invalid"]:
             (step.warn if not s.strict else step.info)(
                 f"{t:<12} {r['invalid']} zero/negative/invalid price(s)"
@@ -1415,7 +1504,7 @@ def check_prices(step: Step, s: Settings, mods: Dict[str, Any],
             blocked.append(t)
             status[t] = "blocked" if s.strict else "excluded: unverified price jump"
         else:
-            status[t] = "repaired" if (r["units"] or r["invalid"]) else "ok"
+            status[t] = "repaired" if (r["units"] or r["invalid"] or r["spikes"]) else "ok"
 
     if blocked:
         (step.info if s.strict else step.warn)(

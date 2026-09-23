@@ -40,8 +40,9 @@ def universe():
 
 
 class FakeYahoo(types.ModuleType):
-    def __init__(self, prices, fail_first=0, always_fail=False):
+    def __init__(self, prices, fail_first=0, always_fail=False, fail_with_repair=()):
         super().__init__("yfinance")
+        self.fail_with_repair = set(fail_with_repair)
         self.__version__ = "fake"
         self.shared = types.SimpleNamespace(_ERRORS={})
         self.prices, self.fail_first, self.always_fail = prices, fail_first, always_fail
@@ -57,6 +58,9 @@ class FakeYahoo(types.ModuleType):
         columns = {}
         for t in tickers:
             close = self.prices.get(t)
+            if t in self.fail_with_repair and kwargs.get("repair"):
+                self.shared._ERRORS[t] = "IntCastingNaNError('Cannot convert non-finite')"
+                close = None
             if close is None:
                 self.shared._ERRORS[t] = "YFTzMissingError('possibly delisted')"
                 close = pd.Series(np.nan, index=DAYS)
@@ -314,14 +318,69 @@ def fake_scraper(nlp, fail=None):
     return module
 
 
+class PriceFixes(unittest.TestCase):
+    setUp, tearDown = ManagementDownload.setUp, ManagementDownload.tearDown
+    run_main, folder, status = (ManagementDownload.run_main, ManagementDownload.folder,
+                                ManagementDownload.status)
+
+    def test_a_one_day_bad_price_is_removed_not_rescaled(self):
+        # ELABS.OL 2021-09-29: 242 -> 23.9 -> 238.5, one bad day.
+        elabs = walk(240.0, 20)
+        elabs.iloc[150] = elabs.iloc[149] * 0.0988
+        elabs.iloc[151] = elabs.iloc[150] * 9.979
+        self.yahoo.prices = {**universe(), "AAA.OL": elabs}
+        code, out = self.run_main("AAA")
+        self.assertIn("removed 1 one-day bad price(s)", out)
+        self.assertNotIn("repaired unit error", out)
+        self.assertEqual(self.status("subset")["AAA.OL"], "repaired")
+        close = pd.read_csv(self.folder("subset") / "management_prices_close.csv",
+                            index_col="Date", parse_dates=True)["AAA.OL"]
+        self.assertTrue(np.isnan(close.iloc[150]))
+        self.assertAlmostEqual(close.iloc[0], elabs.iloc[0])      # nothing rescaled
+        self.assertLess((close / close.shift(1)).max(), MD.UPPER_RATIO)
+
+    def test_a_series_that_is_mostly_zeros_is_excluded(self):
+        # OTEC.OL: 902 of 1940 prices were zero.
+        otec = walk(5.0, 21)
+        otec.iloc[::2] = 0.0
+        self.yahoo.prices = {**universe(), "AAA.OL": otec}
+        code, out = self.run_main("AAA", "BSP")
+        self.assertIn("prices are zero, negative or not numbers - ticker excluded", out)
+        self.assertEqual(self.status("subset")["AAA.OL"], "excluded")
+
+    def test_a_ticker_failing_inside_yahoos_repair_is_retried_without_it(self):
+        self.yahoo.fail_with_repair = {"CCC.OL"}
+        code, out = self.run_main("5")
+        self.assertIn("CCC.OL: prices found without Yahoo's price repair", out)
+        self.assertEqual(self.status("subset")["CCC.OL"], "ok")
+
+    def test_unreadable_dates_are_shown(self):
+        rows = pd.read_excel(self.nlp / "NLP_Sentiment_Detail_2026.xlsx")
+        rows.loc[0, "Article_Date"] = "12 mai 2025"
+        rows.to_excel(self.nlp / "NLP_Sentiment_Detail_2026.xlsx", index=False)
+        code, out = self.run_main("5")
+        self.assertIn("dates that could not be read, e.g.: '12 mai 2025'", out)
+
+
 class ArticleStep(unittest.TestCase):
     setUp, tearDown = ManagementDownload.setUp, ManagementDownload.tearDown
     run_main, folder, status = (ManagementDownload.run_main, ManagementDownload.folder,
                                 ManagementDownload.status)
 
     def run_with(self, scraper, *args):
-        with patch.dict(sys.modules, {"Only_260820": scraper}):
+        with patch.dict(sys.modules, {"Only_260820": scraper}), \
+                patch.object(MD, "SCRAPER_PACKAGES", ()):
             return self.run_main(*args, "--articles")
+
+    def test_missing_scraper_packages_skip_the_download(self):
+        scraper = fake_scraper(self.nlp)
+        with patch.dict(sys.modules, {"Only_260820": scraper}), \
+                patch.object(MD, "SCRAPER_PACKAGES", ("no_such_package_xyz",)):
+            code, out = self.run_main("5", "--articles")
+        self.assertEqual(scraper.calls, [], "the scraper must not start")
+        self.assertIn("Article download skipped: the scraper needs no_such_package_xyz", out)
+        self.assertIn("[STEP 4/8] WARN", out)
+        self.assertIn("[STEP 8/8] OK", out)
 
     def test_new_articles_are_downloaded_for_the_chosen_companies(self):
         scraper = fake_scraper(self.nlp)
@@ -490,8 +549,10 @@ class ScraperCompanyList(unittest.TestCase):
         target = self.base / MD.OUTPUT_DIR / "management_download" / "all" / "scraper_companies.xlsx"
         self.assertIn(repr(str(target)), text)
         self.assertNotIn("TW_current", text)
-        self.assertEqual(pd.read_excel(target)["Company"].astype(str).tolist(),
-                         ["2020", "ABG", "BSP"])
+        saved = pd.read_excel(target)
+        self.assertEqual(saved["Company"].astype(str).tolist(), ["2020", "ABG", "BSP"])
+        # Same layout as AllTickers: dropping the first column leaves Company.
+        self.assertEqual(list(saved.drop(columns=saved.columns[0]).columns), ["Company"])
         self.assertTrue(any("is missing" in w for w in step.warnings))
 
     def test_a_full_run_keeps_its_own_list_when_it_exists(self):
