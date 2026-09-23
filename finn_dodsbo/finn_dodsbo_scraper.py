@@ -49,6 +49,11 @@ def finnDødsboScraperv19(maks_annonser=None):
       - Hele kjøringen gjenopptas automatisk (inntil 3 ganger) etter en
         uventet krasj.
       - Ctrl+C i Fase 2 lar workerne lagre annonsen de holder på med.
+      - Diagnostikk: loggen skrives også til finn_scraper.log. Dør Python
+        uten feilmelding, skriver faulthandler hver tråds stakk til
+        finn_krasj.log. Hvert 5. minutt logges fremdrift og minnebruk.
+        Et Node.js-krasj med "EPIPE" betyr at Python-prosessen allerede
+        var borte — årsaken står i loggen FØR det.
       - Feilretting: Chromium-fallbacken for direkte PDF fanget aldri
         nedlastingen, fordi goto() kaster "Download is starting" inne
         i expect_download-blokken.
@@ -319,6 +324,14 @@ def finnDødsboScraperv19(maks_annonser=None):
     MAKS_AUTO_GJENOPPTAK    = 3
     AUTO_GJENOPPTAK_PAUSE_S = 30
 
+    # DIAGNOSTIKK: loggen skrives også til fil, linje for linje. Dør Python
+    # uten feilmelding (tomt for minne, krasj i C-kode), skriver faulthandler
+    # hvor hver tråd var, til KRASJLOGG_PATH. En statuslinje med fremdrift
+    # og minnebruk logges hvert STATUS_HVER_S sekund (0 = av).
+    LOGG_PATH               = "finn_scraper.log"
+    KRASJLOGG_PATH          = "finn_krasj.log"
+    STATUS_HVER_S           = 300
+
     # ══════════════════════════════════════════════
     # TRÅDSIKKERHET
     # ══════════════════════════════════════════════
@@ -329,18 +342,35 @@ def finnDødsboScraperv19(maks_annonser=None):
     _kjede_sperret = set()
     # ★ v19: settes ved Ctrl+C i Fase 2, så workerne avslutter pent.
     _STOPP         = threading.Event()
+    # ★ v19: fremdrift til statuslinjen
+    _fremdrift     = {"tekst": "starter", "fase2_gjort": 0, "fase2_totalt": 0}
 
     # ══════════════════════════════════════════════
     # LOGGING
     # ══════════════════════════════════════════════
     log = logging.getLogger("finn_scraper")
     log.setLevel(logging.INFO)
+    # ★ v19: lukk loggfilen fra en tidligere kjøring i samme Python-økt
+    for _h in list(log.handlers):
+        try:
+            _h.close()
+        except Exception:
+            pass
     log.handlers.clear()
     fmt = logging.Formatter("%(asctime)s  %(levelname)-8s  %(message)s",
                             datefmt="%H:%M:%S")
     ch = logging.StreamHandler(sys.stdout)
     ch.setFormatter(fmt)
     log.addHandler(ch)
+    # ★ v19: loggen også til fil, så du ser hva som skjedde FØR et krasj
+    try:
+        fh = logging.FileHandler(LOGG_PATH, encoding="utf-8")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s  %(levelname)-8s  %(threadName)-12s  %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S"))
+        log.addHandler(fh)
+    except Exception as e:
+        log.warning("Kunne ikke åpne loggfilen %s: %s", LOGG_PATH, e)
 
     # ══════════════════════════════════════════════
     # ★ v16 — ENCODING-REPARASJON
@@ -2021,11 +2051,68 @@ def finnDødsboScraperv19(maks_annonser=None):
                 continue
         return drept
 
+    def _ressurs_tekst():
+        """Minnebruk for maskinen og for skraperen (Python + Node + Chromium)."""
+        ps = _psutil()
+        if ps is None:
+            return "minne ukjent (psutil mangler)"
+        try:
+            vm = ps.virtual_memory()
+            meg = ps.Process()
+            rss = meg.memory_info().rss
+            chromium = 0
+            for b in meg.children(recursive=True):
+                try:
+                    rss += b.memory_info().rss
+                    navn = (b.name() or "").lower()
+                    if "chrom" in navn or "headless" in navn:
+                        chromium += 1
+                except Exception:
+                    continue
+            return (f"RAM {vm.percent:.0f} % brukt av {vm.total / 2**30:.0f} GB, "
+                    f"skraperen bruker {rss / 2**30:.1f} GB, "
+                    f"{chromium} Chromium-prosesser")
+        except Exception as e:
+            return f"minne ukjent ({e})"
+
+    def _fremdrift_tekst():
+        if _fremdrift.get("fase2_totalt"):
+            return (f"Fase 2: {_fremdrift['fase2_gjort']}/"
+                    f"{_fremdrift['fase2_totalt']} annonser")
+        return _fremdrift.get("tekst") or "?"
+
+    def _miljo_tekst():
+        deler = [f"Python {sys.version.split()[0]}"]
+        try:
+            from importlib.metadata import version
+            for pakke in ("playwright", "pymupdf", "psutil"):
+                try:
+                    deler.append(f"{pakke} {version(pakke)}")
+                except Exception:
+                    deler.append(f"{pakke} MANGLER")
+        except Exception:
+            pass
+        return ", ".join(deler)
+
     def _vakt_loop():
+        neste_status = time.time() + STATUS_HVER_S if STATUS_HVER_S else None
         while not _vakt_stopp.wait(VAKT_SJEKK_S):
             na = time.time()
             with _vakt_lock:
                 aktive = list(_vakt_scrapere.items())
+            # ★ v19: statuslinje — viser at kjøringen lever, også under
+            # lange pauser, og om minnet er i ferd med å ta slutt.
+            if neste_status and na >= neste_status:
+                neste_status = na + STATUS_HVER_S
+                try:
+                    stille = max((na - s._sist_puls for _, s in aktive
+                                  if s._vakt_aktiv), default=0)
+                    log.info("📊 %s | %s | %d nettleser(e), lengste stillhet %.0fs",
+                             _fremdrift_tekst(), _ressurs_tekst(), len(aktive), stille)
+                except Exception as e:
+                    log.debug("Status-feil: %s", e)
+            if not BRUK_VAKTHUND:
+                continue
             for merke, s in aktive:
                 try:
                     if not s._vakt_aktiv or (na - s._sist_puls) < VAKT_HENG_S:
@@ -2043,9 +2130,9 @@ def finnDødsboScraperv19(maks_annonser=None):
                     log.debug("Vakthund-feil: %s", e)
 
     def start_vakthund():
-        if not BRUK_VAKTHUND:
+        if not BRUK_VAKTHUND and not STATUS_HVER_S:
             return
-        if _psutil() is None:
+        if BRUK_VAKTHUND and _psutil() is None:
             log.warning("⚠ psutil mangler — vakthunden kan ikke drepe en "
                         "hengende Chromium. Installer: pip install psutil")
         _vakt_stopp.clear()
@@ -3442,6 +3529,7 @@ def finnDødsboScraperv19(maks_annonser=None):
                         treff = list(result.get("pdf_treff") or [])
                         listing["treff_ord"] = ", ".join(sorted(set(treff))) if treff else None
                         listing["kategori"] = beregn_kategori(listing)
+                        _fremdrift["fase2_gjort"] += 1
 
                     if listing["er_dodsbo"] or listing["er_tvangssalg"]:
                         truffet += 1
@@ -3649,6 +3737,8 @@ def finnDødsboScraperv19(maks_annonser=None):
                     cp["fase1_per_side"] = per_side
 
                     nye = ta_imot(sidelisting)
+                    _fremdrift["tekst"] = (f"Fase 1: partisjon {pidx + 1}/{len(partisjoner)}, "
+                                           f"side {page_num}, {len(all_listings)} annonser")
 
                     if page_num % 10 == 0 or not nye:
                         log.info("  Part %d side %d: %d nye (totalt %d, %.0f/min)",
@@ -3749,6 +3839,8 @@ def finnDødsboScraperv19(maks_annonser=None):
 
     def _kjor_workers(kandidater, antall_workers):
         """Fordeler kandidatene på workere og venter til alle er ferdige."""
+        _fremdrift["fase2_gjort"] = 0
+        _fremdrift["fase2_totalt"] = len(kandidater)
         antall_workers = max(1, min(antall_workers, len(kandidater)))
         chunks = [[] for _ in range(antall_workers)]
         for idx, l in enumerate(kandidater):
@@ -3789,6 +3881,9 @@ def finnDødsboScraperv19(maks_annonser=None):
     log.info("  Innbygd PDF-søk ...... %s", "PÅ" if BRUK_INNBYGD_PDF_SOK else "AV")
     log.info("  Vakthund ............. %s", "PÅ" if BRUK_VAKTHUND else "AV")
     log.info("  Sider pr. partisjon .. %d", FINN_SIDE_CAP)
+    log.info("  Miljø ................ %s", _miljo_tekst())
+    log.info("  Maskin ............... %s", _ressurs_tekst())
+    log.info("  Loggfil .............. %s", os.path.abspath(LOGG_PATH))
 
     try:
         import fitz  # noqa: F401
@@ -3815,6 +3910,18 @@ def finnDødsboScraperv19(maks_annonser=None):
                   "eller flytt prosjektet ut av OneDrive-mappa.")
         return
     cp = load_checkpoint()
+
+    # ★ v19: dør Python uten feilmelding (tomt for minne, krasj i C-kode),
+    # skriver faulthandler hvor hver tråd var, til KRASJLOGG_PATH.
+    _krasj_fil = None
+    try:
+        import faulthandler
+        _krasj_fil = open(KRASJLOGG_PATH, "a", encoding="utf-8")
+        _krasj_fil.write(f"\n=== Kjøring startet {datetime.now():%Y-%m-%d %H:%M:%S} ===\n")
+        _krasj_fil.flush()
+        faulthandler.enable(file=_krasj_fil, all_threads=True)
+    except Exception as e:
+        log.debug("faulthandler ikke aktivert: %s", e)
     start_vakthund()
 
     listings = []
@@ -3905,4 +4012,11 @@ def finnDødsboScraperv19(maks_annonser=None):
     except Exception:
         pass
     log.info("Total kjøretid: %.1f min.", (time.time() - t_start) / 60)
+    try:
+        import faulthandler
+        faulthandler.disable()
+        if _krasj_fil:
+            _krasj_fil.close()
+    except Exception:
+        pass
 #finnDødsboScraperv19(maks_annonser=None)
