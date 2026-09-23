@@ -2,6 +2,7 @@
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import types
@@ -98,9 +99,13 @@ class ManagementDownload(unittest.TestCase):
         self.tmp.cleanup()
 
     def run_main(self, *args):
+        """Runs without the article download unless the test passes --articles."""
+        wanted = [a for a in args if a != "--articles"]
+        if "--articles" not in args:
+            wanted.append("--no-articles")
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            code = MD.main([*args, "--excel-dir", str(self.base)])
+            code = MD.main([*wanted, "--excel-dir", str(self.base)])
         return code, out.getvalue()
 
     def folder(self, name="all"):
@@ -129,18 +134,18 @@ class ManagementDownload(unittest.TestCase):
     def test_zero_companies_fails_in_step_three_and_skips_the_rest(self):
         code, out = self.run_main("0")
         self.assertEqual(code, 1)
-        self.assertIn("[STEP 3/7] FAILED", out)
+        self.assertIn("[STEP 3/8] FAILED", out)
         self.assertIn("select_companies()", out)
-        for n in (4, 5, 6, 7):
-            self.assertIn(f"[STEP {n}/7] ", out)
-            self.assertRegex(out, rf"\[STEP {n}/7\] .* - SKIPPED \(step 3 failed\)")
+        for n in (4, 5, 6, 7, 8):
+            self.assertIn(f"[STEP {n}/8] ", out)
+            self.assertRegex(out, rf"\[STEP {n}/8\] .* - SKIPPED \(step 3 failed\)")
 
     # ── the full run ────────────────────────────────────────────────────
     def test_all_repairs_units_excludes_jumps_and_continues(self):
         code, out = self.run_main("all")
         self.assertEqual(code, 2)
-        for n in range(1, 8):
-            self.assertRegex(out, rf"\[STEP {n}/7\] (OK|WARN)")
+        for n in range(1, 9):
+            self.assertRegex(out, rf"\[STEP {n}/8\] (OK|WARN)")
         self.assertEqual(self.status(), {
             "2020.OL": "ok", "AAA.OL": "ok", "BSP.OL": "repaired", "CCC.OL": "ok",
             "DDD.OL": "ok", "GONE.OL": "no_prices", "JMP.OL": "excluded",
@@ -183,10 +188,10 @@ class ManagementDownload(unittest.TestCase):
     def test_strict_stops_like_the_lab_but_still_writes_the_issue_list(self):
         code, out = self.run_main("all", "--strict")
         self.assertEqual(code, 1)
-        self.assertIn("[STEP 5/7] FAILED", out)
+        self.assertIn("[STEP 6/8] FAILED", out)
         self.assertIn("check_prices()", out)
         self.assertIn("JMP.OL", out)
-        self.assertRegex(out, r"\[STEP 6/7\] .* - SKIPPED")
+        self.assertRegex(out, r"\[STEP 7/8\] .* - SKIPPED")
         self.assertTrue((self.folder() / "price_issues.csv").exists())
         self.assertFalse((self.folder() / "management_prices_close.csv").exists())
 
@@ -201,7 +206,7 @@ class ManagementDownload(unittest.TestCase):
         self.yahoo.always_fail = True
         code, out = self.run_main("5", "--retries", "3")
         self.assertEqual(code, 1)
-        self.assertIn("[STEP 4/7] FAILED", out)
+        self.assertIn("[STEP 5/8] FAILED", out)
         self.assertIn("Where : download_prices()", out)
         self.assertIn("ConnectionError", out)
         self.assertIn("Hint  : Check the internet connection", out)
@@ -214,7 +219,7 @@ class ManagementDownload(unittest.TestCase):
         code, out = self.run_main("5")
         self.assertIn("attempt 1/3 failed", out)
         self.assertIn("succeeded on attempt 2", out)
-        self.assertIn("[STEP 4/7] OK", out)
+        self.assertIn("[STEP 5/8] OK", out)
 
     def test_batches_split_the_tickers(self):
         self.run_main("all", "--batch-size", "3")
@@ -237,7 +242,7 @@ class ManagementDownload(unittest.TestCase):
         self.remove_articles()
         code, out = self.run_main("5")
         self.assertEqual(code, 1)
-        self.assertIn("[STEP 1/7] FAILED", out)
+        self.assertIn("[STEP 1/8] FAILED", out)
         self.assertIn("Neither articles", out)
         self.assertIn("--excel-dir", out)
         self.assertTrue((self.base / "management_download.log").exists())
@@ -250,7 +255,7 @@ class ManagementDownload(unittest.TestCase):
             self.base / MD.TICKER_LIST)
         code, out = self.run_main("all")
         self.assertIn("No article files", out)
-        self.assertIn("[STEP 7/7] OK", out)
+        self.assertIn("[STEP 8/8] OK", out)
         self.assertEqual(list(self.status()), ["AAA.OL", "CCC.OL", "DDD.OL"])
 
     def test_an_empty_exceldata_next_to_the_script_is_skipped(self):
@@ -268,8 +273,8 @@ class ManagementDownload(unittest.TestCase):
         (self.nlp / "NLP_Sentiment_Detail_bad.xlsx").write_bytes(b"not an excel file")
         code, out = self.run_main("5")
         self.assertIn("NLP_Sentiment_Detail_bad.xlsx: cannot be read", out)
-        self.assertIn("[STEP 2/7] WARN", out)
-        self.assertIn("[STEP 7/7] OK", out)
+        self.assertIn("[STEP 2/8] WARN", out)
+        self.assertIn("[STEP 8/8] OK", out)
 
     def test_a_file_open_in_excel_is_written_under_another_name(self):
         original = pd.DataFrame.to_csv
@@ -283,7 +288,76 @@ class ManagementDownload(unittest.TestCase):
             code, out = self.run_main("5")
         self.assertIn("management_prices_close.csv is locked", out)
         self.assertTrue(list(self.folder("subset").glob("management_prices_close_*.csv")))
-        self.assertIn("[STEP 7/7] WARN", out)
+        self.assertIn("[STEP 8/8] WARN", out)
+
+
+def fake_scraper(nlp, fail=None):
+    """An Only_260820 module whose scraper adds one new BSP article, as the real one does."""
+    module = types.ModuleType("Only_260820")
+    module.calls = []
+
+    def SentimentManagement():
+        keys = ("AKSJE_NLP_HENT", "AKSJE_NLP_ONLY_DOWNLOAD", "AKSJE_NLP_SELSKAPER",
+                "AKSJE_BASE_DIR")
+        module.calls.append({k: os.environ.get(k) for k in keys})
+        old = pd.read_excel(nlp / "NLP_Sentiment_Detail_2026.xlsx")
+        new = pd.DataFrame([{"Company": "BSP", "Article_Date": "22 Sep 2026",
+                             "Final_Score": 0.4, "Article_Title": "BSP Q3",
+                             "Text_Length": 900}])
+        pd.concat([old, new]).to_excel(nlp / "NLP_Sentiment_Detail_2026-09-23_FINAL.xlsx",
+                                       index=False)
+        if fail is not None:
+            raise fail
+
+    module.SentimentManagement = SentimentManagement
+    return module
+
+
+class ArticleStep(unittest.TestCase):
+    setUp, tearDown = ManagementDownload.setUp, ManagementDownload.tearDown
+    run_main, folder, status = (ManagementDownload.run_main, ManagementDownload.folder,
+                                ManagementDownload.status)
+
+    def run_with(self, scraper, *args):
+        with patch.dict(sys.modules, {"Only_260820": scraper}):
+            return self.run_main(*args, "--articles")
+
+    def test_new_articles_are_downloaded_for_the_chosen_companies(self):
+        scraper = fake_scraper(self.nlp)
+        before = os.environ.get("AKSJE_NLP_SELSKAPER")
+        code, out = self.run_with(scraper, "5")
+        self.assertEqual(scraper.calls[0]["AKSJE_NLP_SELSKAPER"], "2020,AAA,BSP,CCC,DDD")
+        self.assertEqual(scraper.calls[0]["AKSJE_NLP_HENT"], "1")
+        self.assertEqual(scraper.calls[0]["AKSJE_NLP_ONLY_DOWNLOAD"], "1")
+        self.assertIn("[STEP 4/8] OK", out)
+        self.assertIn("1 new article(s); newest article is now 2026-09-22", out)
+        self.assertIn("[STEP 8/8] OK", out)
+        self.assertEqual(os.environ.get("AKSJE_NLP_SELSKAPER"), before, "env restored")
+
+    def test_all_means_every_company_in_the_scrapers_own_list(self):
+        scraper = fake_scraper(self.nlp)
+        self.run_with(scraper, "all")
+        self.assertEqual(scraper.calls[0]["AKSJE_NLP_SELSKAPER"], "")
+
+    def test_a_failed_download_warns_and_prices_are_still_downloaded(self):
+        scraper = fake_scraper(self.nlp, RuntimeError("Management download incomplete: EAM"))
+        code, out = self.run_with(scraper, "5")
+        self.assertIn("[STEP 4/8] WARN", out)
+        self.assertIn("Article download failed: RuntimeError: Management download "
+                      "incomplete: EAM", out)
+        self.assertIn("(1 new ones were saved first)", out)
+        self.assertIn("[STEP 8/8] OK", out)
+        self.assertEqual(code, 2)
+
+    def test_the_scraper_calling_sys_exit_does_not_end_the_run(self):
+        code, out = self.run_with(fake_scraper(self.nlp, SystemExit(1)), "5")
+        self.assertIn("the scraper stopped with exit code 1", out)
+        self.assertIn("[STEP 8/8] OK", out)
+
+    def test_no_articles_skips_the_download(self):
+        code, out = self.run_main("5")
+        self.assertIn("skipped (--no-articles)", out)
+        self.assertIn("[STEP 4/8] OK", out)
 
 
 class YahooReasons(unittest.TestCase):

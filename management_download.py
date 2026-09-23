@@ -32,16 +32,20 @@ USAGE
     --accept T1,T2       tickers whose jumps you have checked and accept
     --batch-size N       tickers per Yahoo request, default 50
     --retries N          attempts per request, default 3
+    --no-articles        skip the article download (step 4) and use the
+                         articles already in DataNLP
 
 STEPS
     1  Check setup           Python packages and folders
     2  Read company list     the articles in DataNLP; without them, the
                              OSEBX ticker list the scraper itself reads
     3  Select companies      5, all, or named - from that same list
-    4  Download prices       Yahoo Finance, in batches, with retries
-    5  Check price quality   the lab's 4x rule; repair, exclude or stop
-    6  Build indicators      ATR20, SMA10, SMA50, EMA20, market index
-    7  Save results          CSV files, then summary.json and a log
+    4  Download articles     only articles newer than those in DataNLP,
+                             for the chosen companies (Euronext, can be slow)
+    5  Download prices       Yahoo Finance, in batches, with retries
+    6  Check price quality   the lab's 4x rule; repair, exclude or stop
+    7  Build indicators      ATR20, SMA10, SMA50, EMA20, market index
+    8  Save results          CSV files, then summary.json and a log
 
 Exit code: 0 every step OK, 2 finished with warnings, 1 a step failed.
 Output:    ExcelData/StrategyResults_v5_Sentiment_Exit/management_download/
@@ -101,7 +105,7 @@ SMA_DAYS = 50
 MIN_HISTORY_DAYS = 120              # the lab skips signals with less history
 
 FIELDS = ("Close", "High", "Low")
-TOTAL_STEPS = 7
+TOTAL_STEPS = 8
 WIDE = "=" * 74
 THIN = "-" * 74
 
@@ -124,6 +128,7 @@ class Settings:
     strict: bool = False
     accept: Tuple[str, ...] = ()
     searched: Tuple[str, ...] = ()
+    articles: bool = True
 
     @property
     def nlp_dir(self) -> Path:
@@ -610,7 +615,92 @@ def select_companies(step: Step, s: Settings, articles: Any) -> List[str]:
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 4 - DOWNLOAD PRICES
+# STEP 4 - DOWNLOAD NEW ARTICLES
+# ══════════════════════════════════════════════════════════════════════════
+
+def article_snapshot(pd: Any, folder: Path) -> Tuple[set, str]:
+    """(one key per article the lab can read, newest article date)."""
+    keys: set = set()
+    dates = []
+    for f in (article_files(folder) if folder.is_dir() else []):
+        try:
+            d = pd.read_excel(f)
+        except Exception:
+            continue
+        if "Company" not in d.columns or "Article_Date" not in d.columns:
+            continue
+        d = d.reindex(columns=["Company", "Article_Date", "Article_Title"])
+        keys.update(tuple(clean_company(v) for v in r) for r in d.itertuples(index=False))
+        dates.append(parse_article_dates(pd, d["Article_Date"]).max())
+    dates = [x for x in dates if x == x and x is not None]
+    return keys, (str(max(dates).date()) if dates else "-")
+
+
+def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
+                      tickers: List[str]) -> Optional[int]:
+    """
+    Run the article scraper, SentimentManagement() in Only_260820.py.
+
+    For each company it only opens articles newer than those already in
+    DataNLP, and it saves one new file holding the old and the new articles.
+    If it fails, the articles already saved are still valid: the step warns,
+    and the prices are downloaded anyway.
+    """
+    if not s.articles:
+        step.info("skipped (--no-articles): using the articles already in DataNLP")
+        step.summary = "skipped"
+        return None
+    pd = mods["pd"]
+    before, newest_before = article_snapshot(pd, s.nlp_dir)
+    step.info(f"on disk now: {len(before)} articles, newest {newest_before}")
+    names = [t[:-len(OSLO_SUFFIX)] if t.upper().endswith(OSLO_SUFFIX) else t
+             for t in tickers]
+    step.info(("all companies" if s.full_run else f"{len(names)} companies")
+              + " - only articles newer than those saved are opened. The scraper "
+                "prints its own progress below; this can take a long time.")
+
+    settings_env = {"AKSJE_BASE_DIR": str(s.base_dir), "AKSJE_NLP_HENT": "1",
+                    "AKSJE_NLP_ONLY_DOWNLOAD": "1",
+                    "AKSJE_NLP_SELSKAPER": "" if s.full_run else ",".join(names)}
+    previous = {k: os.environ.get(k) for k in settings_env}
+    os.environ.update(settings_env)
+    error = ""
+    try:
+        if str(THIS_FILE.parent) not in sys.path:
+            sys.path.insert(0, str(THIS_FILE.parent))
+        models = importlib.import_module("Only_260820")
+        try:
+            from runtime_config import configure_paths
+            configure_paths(models.__dict__, s.base_dir)
+        except ImportError:
+            step.info("runtime_config.py not found: the scraper uses its own ExcelData path")
+        models.SentimentManagement()
+    except SystemExit as exc:           # the scraper calls sys.exit when its list is missing
+        error = (f"the scraper stopped with exit code {exc.code} (its own message is "
+                 f"just above)")
+    except Exception as exc:
+        hint = hint_for(exc)
+        error = f"{describe(exc)} at {locate(exc)}" + (f". {hint}" if hint else "")
+    finally:
+        for k, v in previous.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    after, newest_after = article_snapshot(pd, s.nlp_dir)
+    new = len(after - before)
+    if error:
+        step.warn(f"Article download failed: {error}. Continuing with the articles "
+                  f"already saved" + (f" ({new} new ones were saved first)" if new else "")
+                  + ".")
+    step.info(f"{new} new article(s); newest article is now {newest_after}")
+    step.summary = f"{new} new articles, newest {newest_after}"
+    return new
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# STEP 5 - DOWNLOAD PRICES
 # ══════════════════════════════════════════════════════════════════════════
 
 def normalise_index(pd: Any, index: Any) -> Any:
@@ -828,7 +918,7 @@ def download_prices(step: Step, s: Settings, mods: Dict[str, Any],
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 5 - CHECK PRICE QUALITY
+# STEP 6 - CHECK PRICE QUALITY
 # ══════════════════════════════════════════════════════════════════════════
 
 def unit_factor(ratio: float) -> Optional[float]:
@@ -1002,7 +1092,7 @@ def check_prices(step: Step, s: Settings, mods: Dict[str, Any],
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 6 - BUILD INDICATORS
+# STEP 7 - BUILD INDICATORS
 # ══════════════════════════════════════════════════════════════════════════
 
 def build_indicators(step: Step, s: Settings, mods: Dict[str, Any],
@@ -1062,7 +1152,7 @@ def build_indicators(step: Step, s: Settings, mods: Dict[str, Any],
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# STEP 7 - SAVE RESULTS
+# STEP 8 - SAVE RESULTS
 # ══════════════════════════════════════════════════════════════════════════
 
 def save_results(step: Step, s: Settings, mods: Dict[str, Any], checked: Dict[str, Any],
@@ -1178,6 +1268,8 @@ def parse_args(argv: Optional[Sequence[str]]) -> Settings:
                    help="comma-separated tickers whose price jumps you have checked")
     p.add_argument("--batch-size", type=int, default=50, metavar="N")
     p.add_argument("--retries", type=int, default=3, metavar="N")
+    p.add_argument("--no-articles", action="store_true",
+                   help="skip the article download and use the articles in DataNLP")
     p.add_argument("--pause", type=float, default=2.0, metavar="SECONDS",
                    help="wait before the first retry; doubles each time")
     a = p.parse_args(list(argv) if argv is not None else None)
@@ -1193,7 +1285,7 @@ def parse_args(argv: Optional[Sequence[str]]) -> Settings:
     base_dir, searched = find_excel_dir(a.excel_dir)
     return Settings(base_dir=base_dir, searched=searched, companies=companies,
                     start=a.start, batch_size=a.batch_size, retries=a.retries,
-                    pause=a.pause, strict=a.strict,
+                    pause=a.pause, strict=a.strict, articles=not a.no_articles,
                     accept=tuple(x for x in a.accept.replace(" ", ",").split(",") if x))
 
 
@@ -1229,12 +1321,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         mods = report.run(1, "Check setup", check_setup, settings)
         articles = report.run(2, "Read company list", read_articles, settings, mods)
         tickers = report.run(3, "Select companies", select_companies, settings, articles)
-        prices = report.run(4, "Download prices from Yahoo", download_prices,
+        report.run(4, "Download new articles", download_articles, settings, mods, tickers)
+        prices = report.run(5, "Download prices from Yahoo", download_prices,
                             settings, mods, tickers)
-        checked = report.run(5, "Check price quality", check_prices, settings, mods, prices)
-        indicators = report.run(6, "Build indicators", build_indicators,
+        checked = report.run(6, "Check price quality", check_prices, settings, mods, prices)
+        indicators = report.run(7, "Build indicators", build_indicators,
                                 settings, mods, checked)
-        report.run(7, "Save results", save_results, settings, mods, checked, indicators)
+        report.run(8, "Save results", save_results, settings, mods, checked, indicators)
         if checked:
             report.facts = {
                 "tickers_with_prices": len(checked["close"].columns),

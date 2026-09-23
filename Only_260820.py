@@ -197,6 +197,15 @@ def _miljo_paa(navn: str, standard: bool = False) -> bool:
     if v is None or not str(v).strip():
         return standard
     return str(v).strip().lower() in ("1", "ja", "j", "true", "yes", "y", "on")
+def _kjor_async(coro):
+    """asyncio.run, også i Spyder og Jupyter der en hendelsesløkke allerede går."""
+    import asyncio
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    nest_asyncio.apply()
+    return asyncio.get_event_loop().run_until_complete(coro)
 
 
 def _mail_passord(datamappe=None) -> str:
@@ -4503,8 +4512,10 @@ def SentimentManagement():
             print(f"  Screenshots:             {config.screenshot_dir}")
 
 
-        if __name__ == "__main__":
-            asyncio.run(main())
+        # Kjøres også når fila importeres, slik master.py gjør. En sperre med
+        # «if __name__ == "__main__"» her gjorde at skrapingen stille ble hoppet
+        # over: da er __name__ «Only_260820», og ingen artikler ble hentet.
+        _kjor_async(main())
     # Kalles fra dispatchen nederst når HENT_NYE_ARTIKLER er på.
 
     ### Public sentriment
@@ -5612,6 +5623,11 @@ def SentimentManagement():
             finbert_model: str      = "yiyanghkust/finbert-tone"
             max_sentences: int      = 100
             force_rerun: bool       = True
+            # Bare nye artikler: hvert selskap blas bare fram til første side der
+            # alt allerede ligger i DataNLP. AKSJE_NLP_ALLE=1 henter alt på nytt.
+            incremental: bool       = not _miljo_paa("AKSJE_NLP_ALLE")
+            # Kommaseparert utvalg, f.eks. "BSP,EAM". Tomt = hele Excel-lista.
+            only_companies: str     = os.environ.get("AKSJE_NLP_SELSKAPER", "")
 
             search_retry_variants: bool = True
 
@@ -6325,7 +6341,70 @@ def SentimentManagement():
             return False
 
 
-        async def collect_all_article_rows(page, config: Config, sl: StepLogger) -> List[dict]:
+        # ─────────────────────────────────────────────────────────────────────────────
+        # BARE NYE ARTIKLER
+        # ─────────────────────────────────────────────────────────────────────────────
+
+        def _selskapsnokkel(company) -> str:
+            # Excel kan lagre tickeren 2020 som tallet 2020.0.
+            if isinstance(company, float) and company.is_integer():
+                company = int(company)
+            return str(company).strip().upper()
+
+        def _artikkel_url(row: dict, config: Config) -> str:
+            """Den samme Article_URL som scrape_company skriver for raden."""
+            nid, href = row.get("nid", "") or "", row.get("href", "") or ""
+            url = config.euronext_base + href if href.startswith("/") else href
+            return url or (f"modal://{nid}" if nid else "")
+
+        def _er_kjent(row: dict, kjente: Set, config: Config) -> bool:
+            url = _artikkel_url(row, config)
+            if url and ("url", url) in kjente:
+                return True
+            return ("tittel", str(row.get("title", "")).strip(),
+                    str(row.get("date", "")).strip()) in kjente
+
+        def load_known_articles(config: Config):
+            """
+            (kjente nøkler per selskap, alle lagrede rader uten duplikater).
+
+            Leser hver NLP_Sentiment_Detail_*.xlsx i DataNLP. En fil som ikke kan
+            leses hoppes over med en advarsel; det koster bare at artiklene i
+            den hentes på nytt.
+            """
+            deler = []
+            for f in sorted(config.nlp_dir.glob("NLP_Sentiment_Detail_*.xlsx")):
+                if f.name.startswith("~$"):
+                    continue
+                try:
+                    d = pd.read_excel(f)
+                except Exception as e:
+                    log.warning("  Hoppet over %s: %s", f.name, e)
+                    continue
+                if not d.empty and "Company" in d.columns:
+                    deler.append(d)
+            if not deler:
+                return {}, []
+            df = pd.concat(deler, ignore_index=True).dropna(subset=["Company"])
+            df["Company"] = df["Company"].map(
+                lambda c: int(c) if isinstance(c, float) and c.is_integer() else c)
+            if "Article_Title" in df.columns:
+                df = df[df["Article_Title"].astype(str) != "INGEN ARTIKLER"]
+            nokler = [k for k in ("Company", "Article_Date", "Article_Title") if k in df.columns]
+            df = df.drop_duplicates(subset=nokler, keep="last")
+            rader = df.to_dict("records")
+            kjente = {}
+            for r in rader:
+                s = kjente.setdefault(_selskapsnokkel(r["Company"]), set())
+                url = str(r.get("Article_URL") or "").strip()
+                if url and url.lower() != "nan" and url != "modal://":
+                    s.add(("url", url))
+                s.add(("tittel", str(r.get("Article_Title") or "").strip(),
+                       str(r.get("Article_Date") or "").strip()))
+            return kjente, rader
+        async def collect_all_article_rows(page, config: Config, sl: StepLogger,
+                                           kjente: Optional[Set] = None,
+                                           stats: Optional[dict] = None) -> List[dict]:
             """
             Walker gjennom hver side av pressemeldings-tabellen og samler artikkelrader.
             Stopper når:
@@ -6410,6 +6489,16 @@ def SentimentManagement():
                     new_count += 1
 
                 sl.info(f"  Side {page_num}: {len(rows)} rader, {new_count} nye → totalt {len(all_rows)}")
+                # Bare nye artikler: de nyeste står øverst, så når en hel side
+                # allerede ligger i DataNLP, gjør resten av sidene det også.
+                if kjente is not None and new_count:
+                    denne_siden = all_rows[-new_count:]
+                    ukjente = sum(1 for r in denne_siden if not _er_kjent(r, kjente, config))
+                    if stats is not None:
+                        stats["kjente"] = stats.get("kjente", 0) + new_count - ukjente
+                    if ukjente == 0:
+                        sl.info("  Hele siden ligger allerede i DataNLP — stopper bladingen")
+                        break
 
                 if len(all_rows) >= config.max_articles_per_company:
                     sl.info(f"  Nådd max_articles_per_company ({config.max_articles_per_company})")
@@ -6430,7 +6519,10 @@ def SentimentManagement():
                     pass
                 await page.wait_for_timeout(1_500)
 
-            return all_rows[:config.max_articles_per_company]
+            rader = all_rows[:config.max_articles_per_company]
+            if kjente is not None:
+                rader = [r for r in rader if not _er_kjent(r, kjente, config)]
+            return rader
 
 
         # ─────────────────────────────────────────────────────────────────────────────
@@ -6458,6 +6550,8 @@ def SentimentManagement():
             company_name: str,
             config: Config,
             is_first: bool,
+            kjente: Optional[Set] = None,
+            stats: Optional[dict] = None,
         ) -> List[Article]:
 
             articles: List[Article] = []
@@ -6735,7 +6829,7 @@ def SentimentManagement():
             # ══════════════════════════════════════════════════════════════════════════
             sl.step(f"Henter artikkelliste fra tabellen (paginering, maks {config.max_pages} sider)")
 
-            row_data = await collect_all_article_rows(page, config, sl)
+            row_data = await collect_all_article_rows(page, config, sl, kjente, stats)
 
             if row_data:
                 sl.ok(f"Fant {len(row_data)} artikler totalt")
@@ -6743,6 +6837,16 @@ def SentimentManagement():
                     sl.info(f"  [{i}] {r['title'][:65]}  ({r.get('date', '')})")
                 if len(row_data) > 3:
                     sl.info(f"  ... og {len(row_data)-3} til")
+            elif stats is not None and stats.get("kjente"):
+                sl.ok(f"Ingen nye artikler — {stats['kjente']} ligger allerede i DataNLP")
+                stats["oppdatert"] = True
+                try:
+                    await page.goto(config.start_url, wait_until="networkidle",
+                                    timeout=config.page_timeout)
+                    await page.wait_for_timeout(1_500)
+                except Exception:
+                    pass
+                return articles
             else:
                 sl.fail("Ingen artikler funnet")
                 await safe_screenshot(
@@ -7021,6 +7125,11 @@ def SentimentManagement():
             # STEG A: Last selskaper
             print(f"\n📋 STEG A: Laster selskaper fra Excel...")
             companies = load_companies(config)
+            if config.only_companies.strip():
+                valgt = {_selskapsnokkel(w).removesuffix(".OL")
+                         for w in config.only_companies.split(",") if w.strip()}
+                companies = [c for c in companies if _selskapsnokkel(c) in valgt]
+                print(f"   Utvalg fra AKSJE_NLP_SELSKAPER: {len(companies)} selskaper")
             if not companies:
                 print("   ❌ Ingen selskaper funnet.")
                 return
@@ -7061,6 +7170,24 @@ def SentimentManagement():
             if done:
                 print(f"   ⏭  Hopper over {len(done)} allerede behandlede")
             print(f"   ✅ STEG C FERDIG: {len(remaining)} selskaper gjenstår")
+            # STEG C2: Bare nye artikler
+            known, existing_rows = {}, []
+            if config.incremental:
+                print(f"\n📚 STEG C2: Leser artiklene som allerede ligger i DataNLP...")
+                try:
+                    known, existing_rows = load_known_articles(config)
+                    print(f"   ✅ STEG C2 FERDIG: {len(existing_rows)} lagrede artikler for "
+                          f"{len(known)} selskaper — bare nye hentes og analyseres")
+                except Exception as e:
+                    print(f"   ⚠️  STEG C2 FEILET ({type(e).__name__}: {e}) — henter alle "
+                          f"artikler på nytt")
+                    known, existing_rows = {}, []
+                    config.incremental = False
+            else:
+                print(f"\n📚 STEG C2: AKSJE_NLP_ALLE=1 — henter alle artikler på nytt")
+
+            def kjente_for(company):
+                return known.get(_selskapsnokkel(company)) if config.incremental else None
 
             if len(remaining) == 0:
                 print(f"\n   ⚠️  Ingen selskaper å behandle!")
@@ -7101,6 +7228,7 @@ def SentimentManagement():
 
                 total = len(remaining)
                 failed_companies = []
+                oppdatert = []
                 for idx, company in enumerate(remaining):
                     is_first  = (idx == 0)
                     comp_num  = idx + 1
@@ -7109,8 +7237,10 @@ def SentimentManagement():
                     print(f"  SELSKAP {comp_num}/{total}: {company}")
                     print(f"{'▓'*70}")
 
+                    stats = {}
                     try:
-                        articles = await scrape_company(page, company, config, is_first)
+                        articles = await scrape_company(page, company, config, is_first,
+                                                        kjente_for(company), stats)
                     except Exception as e:
                         log.error(f"Kritisk feil for {company}: {e}")
                         articles = []
@@ -7121,6 +7251,11 @@ def SentimentManagement():
                         except Exception:
                             pass
 
+                    if not articles and stats.get("oppdatert"):
+                        oppdatert.append(company)
+                        mark_company_complete(company, config, today)
+                        print(f"  ✓ {company}: ingen nye artikler — allerede oppdatert")
+                        continue
                     if not articles:
                         # A loaded page with no parsed articles may be a failed navigation.
                         body = (await page.locator("body").inner_text()).lower()
@@ -7129,7 +7264,8 @@ def SentimentManagement():
                             for retry in range(2):
                                 await page.wait_for_timeout(3000 * (retry + 1))
                                 try:
-                                    articles = await scrape_company(page, company, config, False)
+                                    articles = await scrape_company(page, company, config, False,
+                                                                    kjente_for(company), stats)
                                 except Exception:
                                     articles = []
                                 if articles:
@@ -7199,7 +7335,12 @@ def SentimentManagement():
             print(f"\n{'='*80}")
             print("✅ STEG E: SCRAPING FERDIG — LAGRER ENDELIGE RESULTATER")
             print(f"{'='*80}")
-            save_results(all_results, config, today, final=not failed_companies)
+            # Filen får både det som lå der og det nye, så den nyeste filen alene
+            # er hele datagrunnlaget (data_acquisition.py leser bare den). Den er
+            # _FINAL også når noen selskaper feilet: den inneholder alt fra før,
+            # og en fil med tidsstempel leses ikke av ledelses-laben.
+            save_results(existing_rows + all_results, config, today,
+                         final=not failed_companies or config.incremental)
             if failed_companies:
                 raise RuntimeError("Management download incomplete: " + ", ".join(failed_companies))
 
@@ -7211,14 +7352,19 @@ def SentimentManagement():
             print(f"  Selskaper behandlet:     {total}")
             print(f"  Selskaper med data:      {comps_with_data}")
             print(f"  Artikler analysert:      {arts_total}")
+            if config.incremental:
+                print(f"  Allerede oppdatert:      {len(oppdatert)} selskaper (ingen nye artikler)")
+                print(f"  Lagret fra før:          {len(existing_rows)} artikler (tatt med i filen)")
             print(f"  Artikler via PDF:        {pdfs_used}")
             print(f"  Resultater:              {config.nlp_dir}")
             print(f"  Working data:            {config.work_dir}")
             print(f"  Screenshots:             {config.screenshot_dir}")
 
 
-        if __name__ == "__main__":
-            asyncio.run(main())
+        # Kjøres også når fila importeres, slik master.py gjør. En sperre med
+        # «if __name__ == "__main__"» her gjorde at skrapingen stille ble hoppet
+        # over: da er __name__ «Only_260820», og ingen artikler ble hentet.
+        _kjor_async(main())
     # Kalles fra dispatchen nederst når HENT_NYE_ARTIKLER er på.
 
     #New untestet

@@ -751,7 +751,7 @@ edit("insider_selection.py", "insider_selection.py :: forbehold uten kostnadsstr
 
 
 edit("Only_260820.py", "Only_260820.py :: prisvakten retter enhetsavvik",
-     "repair_price_frames", 10256, 10263, f'''
+     "repair_price_frames", 10402, 10409, f'''
         # Prisrettelse. kontroller_priser flagger ethvert sprang paa 4x eller mer
         # mellom to observasjoner, og dette kallet avbroet hele ledelseskjoringen
         # paa hvilket som helst av dem. Et sprang som er en eksakt tierpotens
