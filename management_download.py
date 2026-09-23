@@ -669,6 +669,14 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
         if str(THIS_FILE.parent) not in sys.path:
             sys.path.insert(0, str(THIS_FILE.parent))
         models = importlib.import_module("Only_260820")
+        step.info(f"scraper file: {getattr(models, '__file__', '?')}")
+        if not hasattr(models, "_kjor_async"):
+            # The old file ends each scraper with «if __name__ == "__main__"»,
+            # so an imported scraper returns without downloading anything.
+            raise StepError(
+                f"{getattr(models, '__file__', 'Only_260820.py')} is the old version: "
+                f"its scraper does nothing when another script starts it",
+                hint="Copy the new Only_260820.py from the branch into this folder.")
         try:
             from runtime_config import configure_paths
             configure_paths(models.__dict__, s.base_dir)
@@ -678,6 +686,8 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
     except SystemExit as exc:           # the scraper calls sys.exit when its list is missing
         error = (f"the scraper stopped with exit code {exc.code} (its own message is "
                  f"just above)")
+    except StepError as exc:
+        error = describe(exc) + (f". {exc.hint}" if exc.hint else "")
     except Exception as exc:
         hint = hint_for(exc)
         error = f"{describe(exc)} at {locate(exc)}" + (f". {hint}" if hint else "")

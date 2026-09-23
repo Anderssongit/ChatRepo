@@ -310,6 +310,7 @@ def fake_scraper(nlp, fail=None):
             raise fail
 
     module.SentimentManagement = SentimentManagement
+    module._kjor_async = lambda coro: None      # marks the fixed scraper
     return module
 
 
@@ -353,6 +354,15 @@ class ArticleStep(unittest.TestCase):
         code, out = self.run_with(fake_scraper(self.nlp, SystemExit(1)), "5")
         self.assertIn("the scraper stopped with exit code 1", out)
         self.assertIn("[STEP 8/8] OK", out)
+
+    def test_an_old_scraper_file_is_reported_not_counted_as_ok(self):
+        scraper = fake_scraper(self.nlp)
+        del scraper._kjor_async
+        code, out = self.run_with(scraper, "5")
+        self.assertEqual(scraper.calls, [], "the old scraper must not be started")
+        self.assertIn("is the old version", out)
+        self.assertIn("Copy the new Only_260820.py", out)
+        self.assertIn("[STEP 4/8] WARN", out)
 
     def test_no_articles_skips_the_download(self):
         code, out = self.run_main("5")
