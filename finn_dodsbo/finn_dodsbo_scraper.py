@@ -1,6 +1,62 @@
-def finnDødsboScraperv18(maks_annonser=None):
+def finnDødsboScraperv19(maks_annonser=None):
     """
-    finn_dodsbo_scraper.py — v18
+    finn_dodsbo_scraper.py — v19
+
+    v19 GJØR ÉN TING: tåler lange kjøringer (FINN_SIDE_CAP = 50).
+
+    DETEKSJONEN ER FORTSATT IKKE RØRT. analyser_pdf_kontekst, _TV_POS,
+    _DB_POS, _NEG_FELLES, _hent_setninger, _vurder, selger-feltene og
+    egenerklæringslesingen er byte-identiske med v18. Det samme gjelder
+    meglerhandlerne, lenkesøket, databaseskjemaet og eksporten. v19
+    endrer KUN hvordan sider lastes, hva som skjer når noe henger eller
+    krasjer, og hvor ofte fremdriften lagres.
+
+    ★ v19 — HVORFOR 5 SIDER VIRKET OG 50 IKKE
+      1. Fase 1 brukte ÉN Chromium-fane for hele søket, uten restart.
+         50 sider × alle prispartisjoner er over tusen navigasjoner på
+         samme fane — ti ganger så mange som med 5 sider.
+      2. Når en søkeside ikke lot seg åpne, gjorde v18 `break` og
+         merket partisjonen som FERDIG. Resten av partisjonen ble aldri
+         hentet, heller ikke ved neste kjøring.
+      3. page.evaluate() har ingen timeout. Én side som henger, låser
+         hele skriptet for alltid.
+      4. En rate-limit-/robotside fra FINN så ut som en tom side. To
+         slike på rad avsluttet partisjonen.
+      5. Fase 2: krasjet en workers nettleser, feilet alle annonsene
+         fram til neste planlagte restart (opptil 80). Startet ikke
+         Chromium eller DB for en worker, ble ALLE dens annonser hoppet
+         over.
+
+    ★ v19 — ENDRINGER
+      - Søkesider hentes med stadig kraftigere grep: vanlig lasting ->
+        full lasting + scroll -> ny fane -> ny nettleser, med pause
+        imellom.
+      - Sider som likevel feiler, legges i kø og prøves på nytt på
+        slutten av Fase 1. Én feil side hopper ikke over resten.
+      - Forventet antall sider regnes ut fra "X treff". En tom side FØR
+        forventet slutt prøves på nytt i stedet for å stoppe søket.
+      - FINN-blokk (403/429/robotside) gir pause med økende ventetid.
+      - Chromium startes på nytt hver 40. søkeside og etter krasj.
+      - VAKTHUND: dreper Chromium hvis en worker ikke har vist livstegn
+        på 3 minutter. Workeren starter en ny nettleser og fortsetter.
+      - MINNEVAKT: nettleseren startes på nytt når maskinen har lite
+        ledig minne.
+      - Fase 2: helsesjekk før hver annonse, nytt forsøk etter
+        nettleserfeil, nettleserfeil teller ikke mot kjedesperren, og
+        én ekstra runde på slutten for annonser som feilet slik.
+      - Lagring underveis: hver søkeside lagres i DB med én gang, og
+        checkpointet husker hvilken SIDE du var på, ikke bare partisjon.
+      - Hele kjøringen gjenopptas automatisk (inntil 3 ganger) etter en
+        uventet krasj.
+      - Ctrl+C i Fase 2 lar workerne lagre annonsen de holder på med.
+      - Feilretting: Chromium-fallbacken for direkte PDF fanget aldri
+        nedlastingen, fordi goto() kaster "Download is starting" inne
+        i expect_download-blokken.
+
+    Nye brytere ligger under "★ v19 — ROBUSTHET" i konfigurasjonen.
+    psutil (pip install psutil) trengs for vakthunden og minnevakten.
+
+    ── ARVET FRA v18, UENDRET ──
 
     v18 GJØR ÉN TING: henter flere PDF-er enn v17.
 
@@ -110,6 +166,8 @@ def finnDødsboScraperv18(maks_annonser=None):
     import re
     import os
     import sys
+    import gc
+    import math
     import time
     import json
     import logging
@@ -207,6 +265,61 @@ def finnDødsboScraperv18(maks_annonser=None):
     FASE2_FERDIG_STATUS   = {"lastet_ned"}
 
     # ══════════════════════════════════════════════
+    # ★ v19 — ROBUSTHET
+    # Alle gjelder KUN lasting, gjenoppretting og lagring. Ingen av dem
+    # påvirker hvilke PDF-er som velges eller hvordan de tolkes.
+    # ══════════════════════════════════════════════
+
+    # Fase 1: ny Chromium etter så mange søkesider. v18 brukte ÉN
+    # nettleser for hele Fase 1.
+    FASE1_RESTART_HVER      = 40
+    # Hver søkeside prøves med stadig kraftigere grep.
+    FASE1_STRATEGIER        = ("normal", "full_lasting", "ny_fane", "ny_nettleser")
+    FASE1_BACKOFF_S         = (2, 5, 10)       # pause før forsøk 2, 3, 4
+    # Så mange sider på rad som ikke lot seg laste, før vi kjøler ned.
+    FASE1_MAKS_FEIL_PA_RAD  = 3
+    FASE1_NEDKJOLING_S      = 60               # ×1, ×2, ×3 (maks 10 min)
+    FASE1_MAKS_NEDKJOLINGER = 3                # pr. partisjon, så går vi videre
+    # Sider som feilet, prøves igjen på slutten av Fase 1.
+    FASE1_RETRY_RUNDER      = 2
+    FASE1_RETRY_PAUSE_S     = 30
+
+    # FINN svarer med 403/429 eller en robotside når vi går for fort.
+    FINN_BLOKK_PAUSE_S      = 30               # ×1, ×2, ×3 ...
+
+    # Fase 2: forsøk pr. annonse når nettleseren eller nettet sviktet.
+    FASE2_ANNONSE_FORSOK    = 2
+    # Statuser som får en ekstra runde på slutten av Fase 2. Det er
+    # nettleser-/nettverksfeil, ikke "fant ingen PDF".
+    FASE2_RETRY_STATUS      = {"feil", "feil_annonse"}
+    FASE2_RETRY_WORKERS     = 4
+    # Chromium-starter pr. restart, og mislykkede restarter på rad før en
+    # worker gir opp (resten tas ved neste kjøring).
+    RESTART_FORSOK          = 3
+    MAKS_RESTART_FEIL       = 3
+    # Tøm fanen (about:blank) mellom annonser. Frigjør minnet fra tunge
+    # meglersider.
+    TOM_FANE_MELLOM         = True
+
+    # VAKTHUND: page.evaluate() har INGEN timeout. Henger en side, henger
+    # workeren for alltid. Vakthunden dreper Chromium-prosessen hvis en
+    # worker ikke har vist livstegn på VAKT_HENG_S sekunder. Workeren får
+    # da en feil, starter ny nettleser og fortsetter. Krever psutil.
+    BRUK_VAKTHUND           = True
+    VAKT_HENG_S             = 180
+    VAKT_SJEKK_S            = 10
+
+    # MINNEVAKT: restart nettleseren når maskinens minnebruk passerer
+    # denne prosenten. 0 = av. Krever psutil.
+    MINNE_VAKT_PROSENT      = 90
+    MINNE_RESTART_MIN_S     = 300
+
+    # Hele kjøringen startes automatisk på nytt etter et uventet krasj.
+    # Fremdriften ligger i checkpoint + DB, så ingenting gjøres to ganger.
+    MAKS_AUTO_GJENOPPTAK    = 3
+    AUTO_GJENOPPTAK_PAUSE_S = 30
+
+    # ══════════════════════════════════════════════
     # TRÅDSIKKERHET
     # ══════════════════════════════════════════════
     _cp_lock       = threading.Lock()
@@ -214,6 +327,8 @@ def finnDødsboScraperv18(maks_annonser=None):
     _listings_lock = threading.Lock()
     _cp_sist       = [0.0]
     _kjede_sperret = set()
+    # ★ v19: settes ved Ctrl+C i Fase 2, så workerne avslutter pent.
+    _STOPP         = threading.Event()
 
     # ══════════════════════════════════════════════
     # LOGGING
@@ -567,11 +682,11 @@ def finnDødsboScraperv18(maks_annonser=None):
     # ══════════════════════════════════════════════
     pdf_stats = {"per_kjede": {}, "epost_vegg_eks": [], "sperrede_kjeder": []}
 
-    def _stats_bump(kjede, felt):
+    def _stats_bump(kjede, felt, delta=1):
         with _stats_lock:
             d = pdf_stats["per_kjede"].setdefault(
                 kjede, {"forsokt": 0, "ok": 0, "feil": 0, "epost_vegg": 0})
-            d[felt] = d.get(felt, 0) + 1
+            d[felt] = d.get(felt, 0) + delta
 
     def save_pdf_stats():
         with _stats_lock:
@@ -1407,30 +1522,73 @@ def finnDødsboScraperv18(maks_annonser=None):
         )
 
     def lagre_til_db(conn, listings, stille=False):
+        """★ v19: returnerer True hvis alt ble lagret, ellers False."""
         if not listings:
-            return
+            return True
         for l in listings:
             for felt in ("signal_kilde", "treff_ord", "analyse_begrunnelse"):
                 v = l.get(felt)
                 if isinstance(v, list):
                     l[felt] = ", ".join(str(x) for x in v) if v else None
             l["kategori"] = beregn_kategori(l)
+        ok = True
         try:
             conn.executemany(_INSERT_SQL, [_rad(l) for l in listings])
             conn.commit()
         except Exception as e:
             log.warning("DB-batch feilet (%s) — faller tilbake til rad-for-rad", e)
+            feil = 0
             for l in listings:
                 try:
                     conn.execute(_INSERT_SQL, _rad(l))
                 except Exception as e2:
+                    feil += 1
                     log.debug("DB-insert feilet for %s: %s", l.get("finn_id"), e2)
             try:
                 conn.commit()
             except Exception:
-                pass
+                feil = len(listings)
+            ok = feil == 0
         if not stille:
             log.info("Lagret %d annonser til DB.", len(listings))
+        return ok
+
+    def _db_med_retry(hvem=""):
+        """★ v19: DB-tilkobling med nye forsøk. None hvis alt feilet."""
+        for forsok in range(3):
+            try:
+                return get_conn()
+            except Exception as e:
+                log.error("%s DB-tilkobling feilet (%d/3): %s", hvem, forsok + 1, e)
+                time.sleep(3 * (forsok + 1))
+        return None
+
+    def _lagre_trygt(conn_ref, listings, stille=True):
+        """
+        ★ v19: lagrer med nye forsøk, og med ny tilkobling hvis den gamle
+        har sluttet å virke. conn_ref er en liste med ett element, så
+        tilkoblingen kan byttes ut. Feiler alt, ligger dataene fortsatt
+        i minnet og lagres på slutten av kjøringen.
+        """
+        for forsok in range(3):
+            if conn_ref[0] is None:
+                try:
+                    conn_ref[0] = get_conn()
+                except Exception as e:
+                    log.debug("DB-tilkobling feilet: %s", e)
+                    time.sleep(1 + 2 * forsok)
+                    continue
+            if lagre_til_db(conn_ref[0], listings, stille=stille):
+                return True
+            try:
+                conn_ref[0].close()
+            except Exception:
+                pass
+            conn_ref[0] = None
+            time.sleep(1 + 2 * forsok)
+        log.warning("⚠ Klarte ikke lagre %d annonse(r) til DB nå — de ligger i "
+                    "minnet og lagres på slutten.", len(listings))
+        return False
 
     def last_listings_fra_db(conn):
         try:
@@ -1448,14 +1606,18 @@ def finnDødsboScraperv18(maks_annonser=None):
                 with open(CHECKPOINT_PATH, "r", encoding="utf-8") as f:
                     cp = json.load(f)
                 log.info("Lastet checkpoint: %d annonser i fil, partisjon=%d, "
-                         "fase1_done=%s, i_db=%s",
+                         "side=%s, fase1_done=%s, i_db=%s",
                          len(cp.get("listings", [])), cp.get("fase1_part_index", 0),
+                         cp.get("fase1_side", 1),
                          cp.get("fase1_done"), cp.get("listings_i_db"))
                 return cp
             except Exception as e:
                 log.warning("Kunne ikke lese checkpoint: %s", e)
+        # ★ v19: fase1_side, fase1_feilede og partisjon_antall er nye.
+        # Eldre checkpoints uten dem virker fortsatt.
         return {"listings": [], "fase1_done": False, "listings_i_db": False,
-                "partisjoner": None, "fase1_part_index": 0}
+                "partisjoner": None, "fase1_part_index": 0,
+                "fase1_side": 1, "fase1_feilede": [], "partisjon_antall": {}}
 
     def save_checkpoint(cp, force=False):
         with _cp_lock:
@@ -1618,7 +1780,7 @@ def finnDødsboScraperv18(maks_annonser=None):
 
         log.info("")
         log.info("╔════════════════════════════════════════════════╗")
-        log.info("║              SLUTTRAPPORT (v17)                  ║")
+        log.info("║              SLUTTRAPPORT (v19)                  ║")
         log.info("╠════════════════════════════════════════════════╣")
         log.info("║  Totalt annonser:            %6d            ║", len(listings))
         log.info("║  PDF lastet ned:             %6d            ║", len(nedlastet))
@@ -1821,6 +1983,133 @@ def finnDødsboScraperv18(maks_annonser=None):
         return n;
     }"""
 
+    _JS_BODY_TEKST = """(n) => (document.body ? document.body.innerText : '')
+        .slice(0, n).toLowerCase()"""
+
+    # ══════════════════════════════════════════════
+    # ★ v19 — VAKTHUND, MINNEVAKT OG BLOKK-GJENKJENNING
+    # ══════════════════════════════════════════════
+    _vakt_lock     = threading.Lock()
+    _vakt_scrapere = {}             # merke i Chromium-cmdline -> FinnScraper
+    _vakt_stopp    = threading.Event()
+    _vakt_teller   = [0]
+    _vakt_advart   = [False]
+
+    def _psutil():
+        try:
+            import psutil
+            return psutil
+        except ImportError:
+            return None
+
+    def _drep_chromium(merke):
+        """
+        Dreper Chromium-prosessen som ble startet med `merke` på
+        kommandolinjen. Et hengende page.evaluate() i workeren kaster da
+        TargetClosedError i stedet for å vente for alltid.
+        """
+        ps = _psutil()
+        if ps is None:
+            return 0
+        drept = 0
+        for p in ps.process_iter(["cmdline"]):
+            try:
+                if merke in (p.info.get("cmdline") or []):
+                    p.kill()
+                    drept += 1
+            except Exception:
+                continue
+        return drept
+
+    def _vakt_loop():
+        while not _vakt_stopp.wait(VAKT_SJEKK_S):
+            na = time.time()
+            with _vakt_lock:
+                aktive = list(_vakt_scrapere.items())
+            for merke, s in aktive:
+                try:
+                    if not s._vakt_aktiv or (na - s._sist_puls) < VAKT_HENG_S:
+                        continue
+                    log.warning("🐕 [w%d] Ingen livstegn på %.0fs (sist: %s) "
+                                "— dreper Chromium.", s.worker_id,
+                                na - s._sist_puls, (s._sist_op or "?")[:80])
+                    s._sist_puls = time.time()      # ikke drep igjen med en gang
+                    s._drept_av_vakt = True
+                    if _drep_chromium(merke) == 0 and not _vakt_advart[0]:
+                        _vakt_advart[0] = True
+                        log.warning("🐕 Fant ikke Chromium-prosessen (mangler "
+                                    "psutil? pip install psutil).")
+                except Exception as e:
+                    log.debug("Vakthund-feil: %s", e)
+
+    def start_vakthund():
+        if not BRUK_VAKTHUND:
+            return
+        if _psutil() is None:
+            log.warning("⚠ psutil mangler — vakthunden kan ikke drepe en "
+                        "hengende Chromium. Installer: pip install psutil")
+        _vakt_stopp.clear()
+        threading.Thread(target=_vakt_loop, name="vakthund", daemon=True).start()
+
+    def stopp_vakthund():
+        _vakt_stopp.set()
+
+    def _lite_minne():
+        if not MINNE_VAKT_PROSENT:
+            return False
+        ps = _psutil()
+        if ps is None:
+            return False
+        try:
+            return ps.virtual_memory().percent >= MINNE_VAKT_PROSENT
+        except Exception:
+            return False
+
+    _BLOKK_STATUS = (403, 429, 503)
+    _BLOKK_TITTEL = ("just a moment", "attention required", "access denied",
+                     "too many requests")
+    _BLOKK_TEKST  = ("captcha", "er du en robot", "are you a robot",
+                     "unusual traffic", "too many requests", "access denied",
+                     "verify you are human", "bekreft at du er et menneske")
+    _INGEN_TREFF_RE = re.compile(
+        r"ingen treff|fant ingen|ingen resultater|ingen boliger"
+        r"|(?:^|[^\d\s])\s*0\s+treff")
+    _FATALE_FEIL = ("target closed", "has been closed", "crash",
+                    "browser closed", "connection closed", "not connected")
+
+    def _tolk_antall(body):
+        """Leser "1 234 treff" fra en FINN-søkeside. None hvis ukjent."""
+        if not body:
+            return None
+        # ★ v19: streng variant først. [\d\s] i de gamle mønstrene kan
+        # lime sammen tall fra to linjer ("2024\n1 234 treff").
+        for pat in (r"(?<!\d)(?<!\d )(\d{1,3}(?: \d{3})+|\d+) treff",
+                    r"([\d\s]{1,12})\s+treff",
+                    r"av\s+([\d\s]{1,12})\s+(?:bolig|annonse|resultat|treff)",
+                    r"([\d\s]{1,12})\s+bolig(?:er)?\s+til\s+salgs"):
+            m = re.search(pat, body)
+            if m:
+                n = re.sub(r"\D", "", m.group(1))
+                if n:
+                    return int(n)
+        return None
+
+    def _pkey(lo, hi):
+        return f"{lo}:{hi}"
+
+    def _unike_sider(sider):
+        """Fjerner duplikater fra køen [[lo, hi, side], ...]."""
+        sett, ut = set(), []
+        for s in sider or []:
+            try:
+                k = (s[0], s[1], int(s[2]))
+            except Exception:
+                continue
+            if k not in sett:
+                sett.add(k)
+                ut.append([s[0], s[1], int(s[2])])
+        return ut
+
     # ══════════════════════════════════════════════
     # SCRAPER
     # ══════════════════════════════════════════════
@@ -1828,49 +2117,78 @@ def finnDødsboScraperv18(maks_annonser=None):
         def __init__(self, worker_id=0):
             self.worker_id = worker_id
             self._pw = self._browser = self._context = self._page = None
+            # ★ v19 — helsetilstand for vakthunden og restart-logikken
+            self._merke = None
+            self._sist_puls = time.time()
+            self._sist_op = "start"
+            self._vakt_aktiv = True
+            self._drept_av_vakt = False
+            self._krasjet = False
+            self._sist_status = None
+            self._sist_minne_restart = 0.0
+            self.partisjon_antall = {}
             self._start_browser()
 
         def _start_browser(self):
             self._stop_browser()
-            self._pw = sync_playwright().start()
-            self._browser = self._pw.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-sandbox",
-                    "--disable-gpu",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--mute-audio",
-                    "--js-flags=--max-old-space-size=512",
-                ],
-            )
-            self._context = self._browser.new_context(
-                accept_downloads=True, user_agent=USER_AGENT,
-                viewport={"width": 1280, "height": 900},
-                java_script_enabled=True)
-            if BLOKKER_TUNGE_RESSURSER:
-                try:
-                    self._context.route(
-                        "**/*.{png,jpg,jpeg,gif,webp,avif,ico,svg,woff,woff2,"
-                        "ttf,otf,eot,mp4,webm,mp3,m4v}",
-                        lambda r: r.abort())
-                    for pat in ("**/*google-analytics.com/**",
-                                "**/*googletagmanager.com/**",
-                                "**/*doubleclick.net/**",
-                                "**/*facebook.net/**",
-                                "**/*hotjar.com/**",
-                                "**/*clarity.ms/**",
-                                "**/*criteo.com/**"):
-                        self._context.route(pat, lambda r: r.abort())
-                except Exception as e:
-                    log.debug("Ruteblokkering feilet: %s", e)
-            self._page = self._context.new_page()
-            self._page.set_default_timeout(STEP_TIMEOUT_MS)
+            # ★ v19: unikt merke på kommandolinjen, så vakthunden kan finne
+            # og drepe akkurat DENNE Chromium-prosessen.
+            with _vakt_lock:
+                _vakt_teller[0] += 1
+                self._merke = (f"--finn-vakt={os.getpid()}-w{self.worker_id}"
+                               f"-{_vakt_teller[0]}")
+            self._drept_av_vakt = False
+            self._krasjet = False
+            self._puls("starter Chromium")
+            try:
+                self._pw = sync_playwright().start()
+                self._browser = self._pw.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-sandbox",
+                        "--disable-gpu",
+                        "--disable-extensions",
+                        "--disable-background-networking",
+                        "--mute-audio",
+                        "--js-flags=--max-old-space-size=512",
+                        self._merke,
+                    ],
+                )
+                self._context = self._browser.new_context(
+                    accept_downloads=True, user_agent=USER_AGENT,
+                    viewport={"width": 1280, "height": 900},
+                    java_script_enabled=True)
+                if BLOKKER_TUNGE_RESSURSER:
+                    try:
+                        self._context.route(
+                            "**/*.{png,jpg,jpeg,gif,webp,avif,ico,svg,woff,woff2,"
+                            "ttf,otf,eot,mp4,webm,mp3,m4v}",
+                            lambda r: r.abort())
+                        for pat in ("**/*google-analytics.com/**",
+                                    "**/*googletagmanager.com/**",
+                                    "**/*doubleclick.net/**",
+                                    "**/*facebook.net/**",
+                                    "**/*hotjar.com/**",
+                                    "**/*clarity.ms/**",
+                                    "**/*criteo.com/**"):
+                            self._context.route(pat, lambda r: r.abort())
+                    except Exception as e:
+                        log.debug("Ruteblokkering feilet: %s", e)
+                self._page = self._context.new_page()
+                self._page.set_default_timeout(STEP_TIMEOUT_MS)
+                self._lytt_krasj(self._page)
+            except Exception:
+                # ★ v19: ikke la en halvstartet Playwright ligge igjen
+                self._stop_browser()
+                raise
+            with _vakt_lock:
+                _vakt_scrapere[self._merke] = self
             log.info("  [w%d] Chromium klar.", self.worker_id)
 
         def _stop_browser(self):
+            self._puls("stopper Chromium")
             for obj in (self._context, self._browser):
                 try:
                     if obj: obj.close()
@@ -1880,34 +2198,172 @@ def finnDødsboScraperv18(maks_annonser=None):
                 if self._pw: self._pw.stop()
             except Exception:
                 pass
+            # ★ v19: ut av vakthundens register
+            if self._merke:
+                with _vakt_lock:
+                    _vakt_scrapere.pop(self._merke, None)
             self._pw = self._browser = self._context = self._page = None
 
         def quit(self):
             self._stop_browser()
 
-        # ── Navigasjon ────────────────────────────
-        def _goto(self, url, vent_selector=None, vent_ms=6000):
+        # ── ★ v19: puls, helse og gjenoppretting ──
+        def _puls(self, op=""):
+            """Livstegn til vakthunden. Kalles før hvert nettleserkall."""
+            self._sist_puls = time.time()
+            if op:
+                self._sist_op = op
+
+        def _sov(self, sek):
+            """Sover uten at vakthunden tolker pausen som heng."""
+            if not sek or sek <= 0:
+                return
+            self._vakt_aktiv = False
             try:
-                self._page.goto(url, wait_until="domcontentloaded",
-                                timeout=NAV_TIMEOUT_MS)
+                slutt = time.time() + sek
+                while not _STOPP.is_set():
+                    igjen = slutt - time.time()
+                    if igjen <= 0:
+                        break
+                    time.sleep(min(1.0, igjen))
+            finally:
+                self._vakt_aktiv = True
+                self._puls()
+
+        def _lytt_krasj(self, page):
+            try:
+                page.on("crash", lambda *_: setattr(self, "_krasjet", True))
+            except Exception:
+                pass
+
+        def _merk_fatal(self, e):
+            """Husker at fanen/nettleseren er død, så neste steg restarter."""
+            if any(k in str(e).lower() for k in _FATALE_FEIL):
+                self._krasjet = True
+
+        def _lever(self):
+            try:
+                if self._drept_av_vakt or self._krasjet:
+                    return False
+                if not self._browser or not self._browser.is_connected():
+                    return False
+                if not self._page or self._page.is_closed():
+                    return False
+                return True
+            except Exception:
+                return False
+
+        def _restart(self, grunn=""):
+            """Ny nettleser, med nye forsøk. False hvis alle feilet."""
+            for forsok in range(RESTART_FORSOK):
+                try:
+                    log.info("  [w%d] ↻ Ny Chromium%s", self.worker_id,
+                             f" ({grunn})" if grunn else "")
+                    self._start_browser()
+                    gc.collect()
+                    return True
+                except Exception as e:
+                    log.error("  [w%d] Chromium-start feilet (%d/%d): %s",
+                              self.worker_id, forsok + 1, RESTART_FORSOK, e)
+                    self._sov(5 * (forsok + 1))
+            return False
+
+        def _sikre_nettleser(self, grunn="nettleseren svarer ikke"):
+            if self._lever():
+                return True
+            return self._restart(grunn)
+
+        def _ny_fane(self):
+            """Lukker fanen og åpner en ny i samme nettleser."""
+            try:
+                if self._page:
+                    self._page.close()
+            except Exception:
+                pass
+            try:
+                self._puls("ny fane")
+                self._page = self._context.new_page()
+                self._page.set_default_timeout(STEP_TIMEOUT_MS)
+                self._lytt_krasj(self._page)
+                self._krasjet = False
+                return True
             except Exception as e:
+                self._merk_fatal(e)
+                return self._restart("ny fane feilet")
+
+        def _rydd_sider(self):
+            """Lukker popup-er som ble hengende, og tømmer hovedfanen."""
+            try:
+                for p in list(self._context.pages):
+                    if p is not self._page:
+                        try:
+                            p.close()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            if TOM_FANE_MELLOM:
+                try:
+                    self._puls("about:blank")
+                    self._page.goto("about:blank", timeout=5000)
+                except Exception as e:
+                    self._merk_fatal(e)
+
+        def _er_blokkert(self, sjekk_tekst=False):
+            """FINN har svart med 403/429/503 eller en robotside."""
+            if self._sist_status in _BLOKK_STATUS:
+                return True
+            try:
+                self._puls("sjekker blokk")
+                tittel = (self._page.title() or "").lower()
+            except Exception as e:
+                self._merk_fatal(e)
+                tittel = ""
+            if any(k in tittel for k in _BLOKK_TITTEL):
+                return True
+            if not sjekk_tekst:
+                return False
+            tekst = self._js(_JS_BODY_TEKST, 2000) or ""
+            return any(k in tekst for k in _BLOKK_TEKST)
+
+        def _side_sier_ingen_treff(self):
+            tekst = _norm_ws(self._js(_JS_BODY_TEKST, 5000) or "")
+            return bool(_INGEN_TREFF_RE.search(tekst))
+
+        # ── Navigasjon ────────────────────────────
+        def _goto(self, url, vent_selector=None, vent_ms=6000, timeout_ms=None):
+            self._puls("goto " + str(url)[:90])
+            self._sist_status = None
+            try:
+                resp = self._page.goto(url, wait_until="domcontentloaded",
+                                       timeout=timeout_ms or NAV_TIMEOUT_MS)
+                try:
+                    self._sist_status = resp.status if resp is not None else None
+                except Exception:
+                    pass
+            except Exception as e:
+                self._merk_fatal(e)
                 log.debug("_goto feilet: %s", e)
                 return False
             if vent_selector:
+                self._puls("venter på " + vent_selector)
                 try:
                     self._page.wait_for_selector(vent_selector, timeout=vent_ms)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._merk_fatal(e)
             return True
 
         def _js(self, script, arg=None):
+            self._puls("evaluate")
             try:
                 return self._page.evaluate(script, arg) if arg is not None \
                     else self._page.evaluate(script)
-            except Exception:
+            except Exception as e:
+                self._merk_fatal(e)
                 return None
 
         def _scroll_bunn(self):
+            self._puls("scroll")
             try:
                 self._page.evaluate(
                     "() => window.scrollTo(0, document.body.scrollHeight)")
@@ -2003,11 +2459,24 @@ def finnDødsboScraperv18(maks_annonser=None):
                 return href
 
         # ── Nedlasting ────────────────────────────
+        def _les_strom(self, resp):
+            """★ v19: les i biter og vis livstegn underveis, så vakthunden
+            ikke dreper nettleseren mens en stor PDF lastes ned."""
+            biter = []
+            while True:
+                self._puls()
+                b = resp.read(256 * 1024)
+                if not b:
+                    break
+                biter.append(b)
+            return b"".join(biter)
+
         def _last_ned_pdf_url(self, url, dest, referer=None):
             import urllib.request
             if not url:
                 return None
             try:
+                self._puls("pdf-nedlasting " + str(url)[:80])
                 cookies = self._context.cookies()
                 headers = {
                     "Cookie": "; ".join(f"{c['name']}={c['value']}" for c in cookies),
@@ -2018,7 +2487,7 @@ def finnDødsboScraperv18(maks_annonser=None):
                     headers["Referer"] = referer
                 req = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(req, timeout=PDF_DOWNLOAD_TIMEOUT) as resp:
-                    data = resp.read()
+                    data = self._les_strom(resp)
                 if len(data) > 1000 and b"%PDF-" in data[:2048]:
                     with open(dest, "wb") as f:
                         f.write(data)
@@ -2026,6 +2495,7 @@ def finnDødsboScraperv18(maks_annonser=None):
             except Exception as e:
                 log.debug("    urllib-nedlasting feilet: %s", e)
             try:
+                self._puls("pw-nedlasting " + str(url)[:80])
                 resp = self._context.request.get(
                     url, timeout=PDF_DOWNLOAD_TIMEOUT * 1000)
                 data = resp.body()
@@ -2046,6 +2516,7 @@ def finnDødsboScraperv18(maks_annonser=None):
             return None
 
         def _vent_for_nedlasting(self, action_fn, dest, timeout_s=12):
+            self._puls("venter på nedlasting")
             try:
                 with self._page.expect_download(timeout=timeout_s * 1000) as dl_info:
                     action_fn()
@@ -2057,6 +2528,7 @@ def finnDødsboScraperv18(maks_annonser=None):
             return None
 
         def _prov_popup(self, tekster, dest, timeout_ms=5000):
+            self._puls("popup")
             try:
                 with self._page.expect_popup(timeout=timeout_ms) as pop:
                     self._klikk_tekst(tekster, timeout_ms=timeout_ms)
@@ -2084,22 +2556,37 @@ def finnDødsboScraperv18(maks_annonser=None):
                 return None
 
         # ── Fase 1 ────────────────────────────────
-        def hent_antall_treff(self, url):
-            if not self._goto(url):
-                return None
-            time.sleep(1.0)
+        def les_antall_fra_side(self):
+            """★ v19: leser "X treff" fra siden som allerede er lastet."""
             try:
+                self._puls("leser antall treff")
                 body = _norm_ws(self._page.inner_text("body"))
-            except Exception:
+            except Exception as e:
+                self._merk_fatal(e)
                 return None
-            for pat in (r"([\d\s]{1,12})\s+treff",
-                        r"av\s+([\d\s]{1,12})\s+(?:bolig|annonse|resultat|treff)",
-                        r"([\d\s]{1,12})\s+bolig(?:er)?\s+til\s+salgs"):
-                m = re.search(pat, body)
-                if m:
-                    n = re.sub(r"\D", "", m.group(1))
-                    if n:
-                        return int(n)
+            return _tolk_antall(body)
+
+        def hent_antall_treff(self, url):
+            # ★ v19: nye forsøk ved lastefeil eller blokk. Fant siden
+            # lastet men uten tall, svares None som før.
+            for forsok in range(3):
+                if forsok:
+                    self._sov(3 * forsok)
+                    if not self._sikre_nettleser():
+                        continue
+                if not self._goto(url):
+                    continue
+                time.sleep(1.0)
+                n = self.les_antall_fra_side()
+                if n is not None:
+                    return n
+                if self._er_blokkert(sjekk_tekst=True):
+                    pause = FINN_BLOKK_PAUSE_S * (forsok + 1)
+                    log.warning("  🚧 FINN blokkerer (HTTP %s) — venter %ds.",
+                                self._sist_status, pause)
+                    self._sov(pause)
+                    continue
+                return None
             return None
 
         def lag_pris_partisjoner(self):
@@ -2111,10 +2598,14 @@ def finnDødsboScraperv18(maks_annonser=None):
                 return [(None, None)]
             log.info("Totalt på Finn (uten filter): ~%d treff", full)
             if full <= PARTISJON_CAP:
+                self.partisjon_antall[_pkey(None, None)] = full     # ★ v19
                 return [(None, None)]
 
             leaves, stack, probes = [], [(PRIS_MIN, PRIS_MAKS)], 0
             while stack:
+                # ★ v19: frisk nettleser innimellom her også
+                if probes and probes % FASE1_RESTART_HVER == 0:
+                    self._restart("periodisk, partisjonering")
                 lo, hi = stack.pop()
                 antall = self.hent_antall_treff(bygg_sok_url(lo, hi))
                 probes += 1
@@ -2131,6 +2622,9 @@ def finnDødsboScraperv18(maks_annonser=None):
                     continue
                 if antall <= PARTISJON_CAP or (hi - lo) <= MIN_PRIS_SPENN:
                     leaves.append((lo, hi))
+                    # ★ v19: husk antallet, så Fase 1 vet hvor mange sider
+                    # partisjonen skal ha.
+                    self.partisjon_antall[_pkey(lo, hi)] = antall
                 else:
                     mid = (lo + hi) // 2
                     stack += [(lo, mid), (mid + 1, hi)]
@@ -2139,6 +2633,80 @@ def finnDødsboScraperv18(maks_annonser=None):
                 leaves.append((None, None))
             log.info("Bygde %d prispartisjoner (%d probe-kall).", len(leaves), probes)
             return leaves
+
+        def _last_sokeside(self, url, strategi):
+            """★ v19: laster én søkeside med valgt strategi."""
+            if strategi == "ny_nettleser":
+                if not self._restart("søkesiden svarer ikke"):
+                    return False
+            elif strategi == "ny_fane":
+                if not self._ny_fane():
+                    return False
+            elif not self._lever():
+                if not self._restart("nettleseren døde"):
+                    return False
+            if strategi == "normal":
+                ok = self._goto(url, vent_selector="section article", vent_ms=8000)
+            else:
+                ok = self._goto(url, vent_selector="section article", vent_ms=12000,
+                                timeout_ms=NAV_TIMEOUT_MS * 2)
+                if ok:
+                    try:
+                        self._puls("venter på nettverksro")
+                        self._page.wait_for_load_state("networkidle", timeout=8000)
+                    except Exception as e:
+                        self._merk_fatal(e)
+                    self._scroll_bunn()
+            if ok and PAGE_LOAD_WAIT:
+                time.sleep(PAGE_LOAD_WAIT)
+            return ok
+
+        def hent_sokeside(self, url, forvent_innhold=True):
+            """
+            ★ v19 — henter én søkeside med stadig kraftigere grep:
+              normal -> full lasting + scroll -> ny fane -> ny nettleser
+
+            Returnerer (listings, mistenkelig):
+              (None, False)   siden lot seg ikke laste (krasj/timeout/blokk)
+              ([],   False)   siden lastet og er tom (vanlig slutt på søket)
+              ([],   True)    tom selv om vi ventet innhold (prøves igjen senere)
+              ([..], False)   OK
+
+            En tom side uten forventet innhold godtas med én gang. Da koster
+            ikke slutten av hver partisjon ekstra forsøk.
+            """
+            lastet_tom = False
+            for forsok, strategi in enumerate(FASE1_STRATEGIER):
+                if forsok:
+                    self._sov(FASE1_BACKOFF_S[min(forsok - 1, len(FASE1_BACKOFF_S) - 1)])
+                try:
+                    if not self._last_sokeside(url, strategi):
+                        log.debug("    søkeside ikke lastet (%s): %s", strategi, url)
+                        continue
+                    sidelisting = self.scrape_search_page()
+                except Exception as e:
+                    self._merk_fatal(e)
+                    log.debug("    søkeside krasjet (%s): %s", strategi, e)
+                    continue
+                if sidelisting:
+                    if forsok:
+                        log.info("    ↻ Søkesiden hentet på forsøk %d (%s)",
+                                 forsok + 1, strategi)
+                    return sidelisting, False
+                if not self._lever():
+                    continue
+                if self._er_blokkert(sjekk_tekst=True):
+                    pause = FINN_BLOKK_PAUSE_S * (forsok + 1)
+                    log.warning("  🚧 FINN blokkerer/begrenser (HTTP %s) — venter %ds.",
+                                self._sist_status, pause)
+                    self._sov(pause)
+                    continue
+                lastet_tom = True
+                if not forvent_innhold or self._side_sier_ingen_treff():
+                    return [], False
+            if lastet_tom:
+                return [], bool(forvent_innhold)
+            return None, False
 
         def scrape_search_page(self):
             kort = self._js(_JS_KORT) or []
@@ -2328,6 +2896,13 @@ def finnDødsboScraperv18(maks_annonser=None):
                 result["salgsoppgave_status"] = "feil_annonse"
                 result["pdf_feilgrunn"] = "Kunne ikke åpne annonse"
                 return result
+            # ★ v19: en robot-/rate-limit-side fra FINN er IKKE "ingen
+            # salgsoppgave-lenke". Workeren venter og prøver igjen.
+            if self._er_blokkert():
+                result["salgsoppgave_status"] = "feil_annonse"
+                result["pdf_feilgrunn"] = f"FINN blokkerte (HTTP {self._sist_status})"
+                result["_blokkert"] = True
+                return result
             time.sleep(DETAIL_WAIT)
 
             try:
@@ -2342,6 +2917,13 @@ def finnDødsboScraperv18(maks_annonser=None):
 
             megler_url = self._finn_megler_lenke()
             if not megler_url:
+                # ★ v19: døde nettleseren mens vi leste annonsen, vet vi
+                # ingenting om lenken. Da er det "feil" (prøves igjen),
+                # ikke "ingen lenke".
+                if not self._lever():
+                    result["salgsoppgave_status"] = "feil"
+                    result["pdf_feilgrunn"] = "Nettleseren døde på annonsesiden"
+                    return result
                 result["pdf_feilgrunn"] = "Ingen salgsoppgave-lenke på Finn"
                 _stats_bump("ingen_lenke", "forsokt")
                 _stats_bump("ingen_lenke", "feil")
@@ -2381,6 +2963,16 @@ def finnDødsboScraperv18(maks_annonser=None):
                 except Exception:
                     pass
 
+            # ★ v19: døde nettleseren underveis, er det ikke meglerens feil.
+            # Ikke tell det mot kjeden (kjedesperren!) — la workeren starte
+            # ny nettleser og prøve igjen.
+            if not pdf_path and not self._lever():
+                _stats_bump(kjede, "forsokt", -1)
+                result["salgsoppgave_status"] = "feil"
+                result["pdf_feilgrunn"] = (f"Nettleseren døde underveis "
+                                           f"({(feilgrunn or '')[:80]})")
+                return result
+
             if pdf_path:
                 result["salgsoppgave_pdf"] = pdf_path
                 result["salgsoppgave_status"] = "lastet_ned"
@@ -2402,6 +2994,16 @@ def finnDødsboScraperv18(maks_annonser=None):
             return result
 
         def _analyser_og_fyll(self, result, pdf_path, finn_id):
+            # ★ v19: PDF-analysen bruker ikke nettleseren. Vakthunden skal
+            # ikke tolke en lang analyse av en stor PDF som heng.
+            self._vakt_aktiv = False
+            try:
+                self._analyser_og_fyll_kjerne(result, pdf_path, finn_id)
+            finally:
+                self._vakt_aktiv = True
+                self._puls("analyse ferdig")
+
+        def _analyser_og_fyll_kjerne(self, result, pdf_path, finn_id):
             pdf_tekst = les_pdf_tekst(pdf_path)
             analyse = analyser_pdf_kontekst(pdf_tekst, pdf_path=pdf_path)
             result["pdf_treff"]           = analyse["treff_ord"] or []
@@ -2467,21 +3069,30 @@ def finnDødsboScraperv18(maks_annonser=None):
                 return p, None
 
             # Fallback: la Chromium ta nedlastingen selv.
+            # ★ v19: goto() KASTER ("Download is starting") når URL-en er en
+            # nedlasting. I v18 rev unntaket med seg expect_download-blokken,
+            # så nedlastingen ble aldri fanget. Nå svelges goto-unntaket.
+            def _start_nedlasting():
+                try:
+                    self._page.goto(megler_url, timeout=NAV_TIMEOUT_MS)
+                except Exception:
+                    pass
+
             p = self._vent_for_nedlasting(
-                lambda: self._page.goto(megler_url, timeout=NAV_TIMEOUT_MS),
-                dest, timeout_s=PDF_DOWNLOAD_TIMEOUT)
+                _start_nedlasting, dest, timeout_s=PDF_DOWNLOAD_TIMEOUT)
             if p:
                 return p, None
 
             # Siste forsøk uten cookies — noen CDN-er avviser Cookie-header.
             try:
                 import urllib.request
+                self._puls("naken pdf-henting")
                 req = urllib.request.Request(
                     megler_url, headers={"User-Agent": USER_AGENT,
                                          "Accept": "application/pdf,*/*"})
                 with urllib.request.urlopen(
                         req, timeout=PDF_DOWNLOAD_TIMEOUT) as resp:
-                    data = resp.read()
+                    data = self._les_strom(resp)
                 if len(data) > 1000 and b"%PDF-" in data[:2048]:
                     with open(dest, "wb") as fh:
                         fh.write(data)
@@ -2700,87 +3311,153 @@ def finnDødsboScraperv18(maks_annonser=None):
             return ""
 
     # ══════════════════════════════════════════════
+    # ★ v19 — OPPSTART MED NYE FORSØK
+    # ══════════════════════════════════════════════
+    def _lag_scraper(worker_id):
+        """Starter en FinnScraper. None hvis Chromium ikke vil starte."""
+        for forsok in range(RESTART_FORSOK):
+            try:
+                return FinnScraper(worker_id=worker_id)
+            except Exception as e:
+                log.error("  [w%d] Kunne ikke starte Chromium (%d/%d): %s",
+                          worker_id, forsok + 1, RESTART_FORSOK, e)
+                time.sleep(5 * (forsok + 1))
+        return None
+
+    # ══════════════════════════════════════════════
     # FASE 2 — WORKER
     # ══════════════════════════════════════════════
     def fase2_worker(worker_id, oppgaver):
-        scraper = conn = None
-        gjort = truffet = 0
+        scraper = None
+        conn_ref = [None]
+        gjort = truffet = restart_feil = 0
         t0 = time.time()
         try:
-            conn = get_conn()
-            scraper = FinnScraper(worker_id=worker_id)
+            # ★ v19: spre oppstarten — ti Chromium samtidig gir en CPU-topp
+            time.sleep(0.5 * worker_id)
+            conn_ref[0] = _db_med_retry(f"[w{worker_id}]")
+            scraper = _lag_scraper(worker_id)
+            if scraper is None:
+                log.error("[w%d] Fikk ikke startet Chromium — %d annonser tas "
+                          "ved neste kjøring.", worker_id, len(oppgaver))
+                return
             for listing in oppgaver:
+                if _STOPP.is_set():
+                    log.info("  [w%d] Stopp-signal — avslutter.", worker_id)
+                    break
                 finn_id = listing.get("finn_id")
                 url = listing.get("url")
                 if not finn_id or not url:
                     continue
 
-                if gjort > 0 and gjort % BROWSER_RESTART_EVERY == 0:
-                    try:
-                        scraper._start_browser()
-                    except Exception as e:
-                        log.error("  [w%d] Browser-restart feilet: %s", worker_id, e)
+                # ★ v19: én annonse som feiler, skal aldri ta med seg resten
+                try:
+                    scraper._puls("ny annonse " + str(finn_id))
 
-                dest = os.path.join(PDF_DIR, f"{finn_id}.pdf")
-                if (GJENBRUK_PDF and os.path.exists(dest)
-                        and os.path.getsize(dest) > 1000 and listing.get("poststed")):
-                    result = {"salgsoppgave_pdf": dest,
-                              "salgsoppgave_status": "lastet_ned",
-                              "pdf_kjede": listing.get("pdf_kjede"),
-                              "pdf_feilgrunn": None, "pdf_treff": [],
-                              "_detalj_felt": None,
-                              "pdf_url": listing.get("pdf_url")}   # ★ v18
-                    try:
-                        scraper._analyser_og_fyll(result, dest, finn_id)
-                    except Exception as e:
-                        log.debug("Reanalyse feilet for %s: %s", finn_id, e)
-                else:
-                    try:
-                        result = scraper.hent_salgsoppgave(finn_id, url)
-                    except Exception as e:
-                        log.error("[w%d] hent_salgsoppgave krasjet for %s: %s",
-                                  worker_id, finn_id, e)
-                        result = {"salgsoppgave_status": "feil", "pdf_treff": [],
-                                  "analyse_begrunnelse": str(e), "pdf_kjede": None,
-                                  "pdf_feilgrunn": str(e), "signal_kilde": None}
-                    time.sleep(SLEEP_BETWEEN)
+                    if gjort > 0 and gjort % BROWSER_RESTART_EVERY == 0:
+                        scraper._restart("periodisk")
+                    elif (_lite_minne() and time.time() - scraper._sist_minne_restart
+                            > MINNE_RESTART_MIN_S):
+                        scraper._sist_minne_restart = time.time()
+                        log.warning("  [w%d] Lite ledig minne — ny Chromium.", worker_id)
+                        scraper._restart("lite minne")
 
-                with _listings_lock:
-                    listing["salgsoppgave_pdf"]    = result.get("salgsoppgave_pdf")
-                    listing["salgsoppgave_status"] = result.get("salgsoppgave_status")
-                    listing["flagg_i_pdf"]         = result.get("flagg_i_pdf", 0)
-                    listing["er_dodsbo"]           = result.get("er_dodsbo", 0)
-                    listing["er_tvangssalg"]       = result.get("er_tvangssalg", 0)
-                    listing["analyse_begrunnelse"] = result.get("analyse_begrunnelse")
-                    listing["kontekst_sample"]     = result.get("kontekst_sample")
-                    listing["pdf_kjede"]           = result.get("pdf_kjede")
-                    listing["pdf_feilgrunn"]       = result.get("pdf_feilgrunn")
-                    listing["signal_kilde"]        = result.get("signal_kilde")
-                    listing["pdf_url"]            = (result.get("pdf_url")
-                                                     or listing.get("pdf_url"))
-                    if result.get("address"):
-                        listing["address"] = result["address"]
-                    for f in ("gateadresse", "postnr", "poststed",
-                              "kommune", "fylke", "omrade"):
-                        listing[f] = result.get(f) or listing.get(f)
-                    df_felt = result.get("_detalj_felt") or {}
-                    for f in ("property_type", "ownership", "bedrooms", "size_m2"):
-                        if not listing.get(f) and df_felt.get(f):
-                            listing[f] = df_felt[f]
-                    treff = list(result.get("pdf_treff") or [])
-                    listing["treff_ord"] = ", ".join(sorted(set(treff))) if treff else None
-                    listing["kategori"] = beregn_kategori(listing)
+                    # ★ v19: helsesjekk FØR annonsen, ikke 80 annonser senere
+                    if not scraper._sikre_nettleser():
+                        restart_feil += 1
+                        if restart_feil >= MAKS_RESTART_FEIL:
+                            log.error("[w%d] Chromium vil ikke starte (%d ganger på rad) "
+                                      "— gir opp. Resten tas ved neste kjøring.",
+                                      worker_id, restart_feil)
+                            break
+                        scraper._sov(30)
+                        continue
+                    restart_feil = 0
 
-                if listing["er_dodsbo"] or listing["er_tvangssalg"]:
-                    truffet += 1
+                    dest = os.path.join(PDF_DIR, f"{finn_id}.pdf")
+                    if (GJENBRUK_PDF and os.path.exists(dest)
+                            and os.path.getsize(dest) > 1000 and listing.get("poststed")):
+                        result = {"salgsoppgave_pdf": dest,
+                                  "salgsoppgave_status": "lastet_ned",
+                                  "pdf_kjede": listing.get("pdf_kjede"),
+                                  "pdf_feilgrunn": None, "pdf_treff": [],
+                                  "_detalj_felt": None,
+                                  "pdf_url": listing.get("pdf_url")}   # ★ v18
+                        try:
+                            scraper._analyser_og_fyll(result, dest, finn_id)
+                        except Exception as e:
+                            log.debug("Reanalyse feilet for %s: %s", finn_id, e)
+                    else:
+                        result = None
+                        for forsok in range(FASE2_ANNONSE_FORSOK):
+                            try:
+                                result = scraper.hent_salgsoppgave(finn_id, url)
+                            except Exception as e:
+                                log.error("[w%d] hent_salgsoppgave krasjet for %s: %s",
+                                          worker_id, finn_id, e)
+                                scraper._merk_fatal(e)
+                                result = {"salgsoppgave_status": "feil", "pdf_treff": [],
+                                          "analyse_begrunnelse": str(e), "pdf_kjede": None,
+                                          "pdf_feilgrunn": str(e), "signal_kilde": None}
+                            # ★ v19: nettleser-/nettverksfeil -> ny nettleser
+                            # og ett nytt forsøk. "Fant ingen PDF" prøves ikke.
+                            if (result.get("salgsoppgave_status") not in FASE2_RETRY_STATUS
+                                    or forsok + 1 >= FASE2_ANNONSE_FORSOK):
+                                break
+                            if result.get("_blokkert"):
+                                pause = FINN_BLOKK_PAUSE_S * (forsok + 1)
+                                log.warning("  [w%d] 🚧 FINN blokkerer — venter %ds.",
+                                            worker_id, pause)
+                                scraper._sov(pause)
+                            log.info("  [w%d] ↻ %s: %s — nytt forsøk (%d/%d)",
+                                     worker_id, finn_id,
+                                     (result.get("pdf_feilgrunn") or "")[:80],
+                                     forsok + 2, FASE2_ANNONSE_FORSOK)
+                            scraper._restart("annonsen feilet")
+                        scraper._rydd_sider()
+                        scraper._sov(SLEEP_BETWEEN)
 
-                lagre_til_db(conn, [listing], stille=True)
-                gjort += 1
-                if gjort % 50 == 0:
-                    fart = gjort / max(time.time() - t0, 1) * 60
-                    log.info("  [w%d] %d/%d  (%.0f/min, %d treff)",
-                             worker_id, gjort, len(oppgaver), fart, truffet)
-                    save_pdf_stats()
+                    with _listings_lock:
+                        listing["salgsoppgave_pdf"]    = result.get("salgsoppgave_pdf")
+                        listing["salgsoppgave_status"] = result.get("salgsoppgave_status")
+                        listing["flagg_i_pdf"]         = result.get("flagg_i_pdf", 0)
+                        listing["er_dodsbo"]           = result.get("er_dodsbo", 0)
+                        listing["er_tvangssalg"]       = result.get("er_tvangssalg", 0)
+                        listing["analyse_begrunnelse"] = result.get("analyse_begrunnelse")
+                        listing["kontekst_sample"]     = result.get("kontekst_sample")
+                        listing["pdf_kjede"]           = result.get("pdf_kjede")
+                        listing["pdf_feilgrunn"]       = result.get("pdf_feilgrunn")
+                        listing["signal_kilde"]        = result.get("signal_kilde")
+                        listing["pdf_url"]            = (result.get("pdf_url")
+                                                         or listing.get("pdf_url"))
+                        if result.get("address"):
+                            listing["address"] = result["address"]
+                        for f in ("gateadresse", "postnr", "poststed",
+                                  "kommune", "fylke", "omrade"):
+                            listing[f] = result.get(f) or listing.get(f)
+                        df_felt = result.get("_detalj_felt") or {}
+                        for f in ("property_type", "ownership", "bedrooms", "size_m2"):
+                            if not listing.get(f) and df_felt.get(f):
+                                listing[f] = df_felt[f]
+                        treff = list(result.get("pdf_treff") or [])
+                        listing["treff_ord"] = ", ".join(sorted(set(treff))) if treff else None
+                        listing["kategori"] = beregn_kategori(listing)
+
+                    if listing["er_dodsbo"] or listing["er_tvangssalg"]:
+                        truffet += 1
+
+                    # ★ v19: lagres med én gang, med nye forsøk ved DB-feil
+                    _lagre_trygt(conn_ref, [listing])
+                    gjort += 1
+                    if gjort % 50 == 0:
+                        fart = gjort / max(time.time() - t0, 1) * 60
+                        log.info("  [w%d] %d/%d  (%.0f/min, %d treff)",
+                                 worker_id, gjort, len(oppgaver), fart, truffet)
+                        save_pdf_stats()
+                except Exception as e:
+                    log.error("[w%d] Uventet feil på %s: %s — går videre.",
+                              worker_id, finn_id, e)
+                    log.debug(traceback.format_exc())
 
         except Exception as e:
             log.error("[w%d] Worker krasjet: %s", worker_id, e)
@@ -2789,8 +3466,8 @@ def finnDødsboScraperv18(maks_annonser=None):
             if scraper:
                 try: scraper.quit()
                 except Exception: pass
-            if conn:
-                try: conn.close()
+            if conn_ref[0]:
+                try: conn_ref[0].close()
                 except Exception: pass
         log.info("  [w%d] Ferdig: %d oppgaver, %d treff, %.1f min.",
                  worker_id, gjort, truffet, (time.time() - t0) / 60)
@@ -2798,58 +3475,180 @@ def finnDødsboScraperv18(maks_annonser=None):
     # ══════════════════════════════════════════════
     # FASE 1
     # ══════════════════════════════════════════════
+    def _fase1_retry(scraper, cp, ta_imot):
+        """
+        ★ v19: ny runde for søkesidene som feilet i Fase 1. FINN får
+        en pause først, og nettleseren er ny.
+        """
+        ko = _unike_sider(cp.get("fase1_feilede"))
+        for runde in range(1, FASE1_RETRY_RUNDER + 1):
+            if not ko:
+                break
+            log.info("")
+            log.info("══ Fase 1 — retry-runde %d/%d: %d side(r) ══",
+                     runde, FASE1_RETRY_RUNDER, len(ko))
+            scraper._sov(FASE1_RETRY_PAUSE_S * runde)
+            scraper._restart("retry-runde")
+            igjen = []
+            for i, (lo, hi, side) in enumerate(ko):
+                if i and i % FASE1_RESTART_HVER == 0:
+                    scraper._restart("periodisk, retry")
+                sidelisting, _ = scraper.hent_sokeside(
+                    bygg_sok_url(lo, hi, side), forvent_innhold=False)
+                if sidelisting is None:
+                    igjen.append([lo, hi, side])
+                    continue
+                nye = ta_imot(sidelisting)
+                if nye:
+                    log.info("  ↻ pris %s–%s side %d: %d nye annonser",
+                             lo, hi, side, len(nye))
+            ko = igjen
+            cp["fase1_feilede"] = ko
+            save_checkpoint(cp, force=True)
+        if ko:
+            log.warning("⚠ %d søkeside(r) kunne fortsatt ikke hentes. De står i "
+                        "'fase1_feilede' i checkpointet.", len(ko))
+
     def kjor_fase1(cp, conn):
         all_listings = cp.get("listings", [])
         log.info("╔═══════════════════════════════════════╗")
         log.info("║  FASE 1: Scraper søkeresultater        ║")
         log.info("╚═══════════════════════════════════════╝")
 
-        scraper = FinnScraper(worker_id=0)
+        # ★ v19: egen DB-tilkobling for lagring underveis
+        db_ref = [_db_med_retry("[Fase 1]")]
+        scraper = _lag_scraper(0)
+        if scraper is None:
+            raise RuntimeError("Fikk ikke startet Chromium for Fase 1")
         t0 = time.time()
         try:
             if not cp.get("partisjoner"):
                 cp["partisjoner"] = scraper.lag_pris_partisjoner()
+                cp["partisjon_antall"] = dict(scraper.partisjon_antall)
                 cp["fase1_part_index"] = 0
+                cp["fase1_side"] = 1
                 save_checkpoint(cp, force=True)
             partisjoner = cp["partisjoner"]
+            antall_pr_part = cp.get("partisjon_antall") or {}
+            feilede = cp.setdefault("fase1_feilede", [])
             seen = {l.get("finn_id") for l in all_listings if l.get("finn_id")}
             stopp = False
+            sider_siden_restart = 0
+            start_pidx = cp.get("fase1_part_index", 0)
+            start_side = max(1, int(cp.get("fase1_side") or 1))
+            # Annonser pr. side er lik for hele FINN. Læres fra fulle sider
+            # og huskes i checkpointet, så en gjenopptatt partisjon ikke
+            # regner ut antall sider fra en halvfull siste side.
+            per_side = cp.get("fase1_per_side")
 
-            for pidx in range(cp.get("fase1_part_index", 0), len(partisjoner)):
+            def ta_imot(sidelisting):
+                """★ v19: nye annonser i minnet OG i DB med én gang."""
+                nye = [l for l in sidelisting
+                       if l.get("finn_id") and l["finn_id"] not in seen]
+                if MAKS_ANNONSER is not None:
+                    nye = nye[:max(0, MAKS_ANNONSER - len(all_listings))]
+                for l in nye:
+                    seen.add(l["finn_id"])
+                all_listings.extend(nye)
+                if nye:
+                    _lagre_trygt(db_ref, nye)
+                return nye
+
+            for pidx in range(start_pidx, len(partisjoner)):
                 lo, hi = partisjoner[pidx]
-                log.info("═══ Partisjon %d/%d  pris %s–%s ═══",
+                # ★ v19: fortsett på siden vi var på, ikke fra side 1
+                forste_side = start_side if pidx == start_pidx else 1
+                antall = antall_pr_part.get(_pkey(lo, hi))
+                antall_lest = antall is not None
+                log.info("═══ Partisjon %d/%d  pris %s–%s%s ═══",
                          pidx + 1, len(partisjoner),
                          lo if lo is not None else "0",
-                         hi if hi is not None else "∞")
+                         hi if hi is not None else "∞",
+                         f"  (~{antall} treff)" if antall else "")
+                if forste_side > 1:
+                    log.info("  Fortsetter fra side %d.", forste_side)
 
                 tomme = 0
-                for page_num in range(1, FINN_SIDE_CAP + 1):
+                feil_pa_rad = 0
+                nedkjolinger = 0
+                tom_side = None
+                page_num = forste_side
+                while page_num <= FINN_SIDE_CAP:
+                    # ★ v19: frisk nettleser jevnlig, så minnet ikke vokser
+                    if sider_siden_restart >= FASE1_RESTART_HVER:
+                        scraper._restart("periodisk, frigjør minne")
+                        sider_siden_restart = 0
+
+                    forventet_sider = (min(FINN_SIDE_CAP, math.ceil(antall / per_side))
+                                       if antall and per_side else None)
+                    forvent_innhold = (page_num == 1 or (forventet_sider is not None
+                                                         and page_num <= forventet_sider))
                     url = bygg_sok_url(lo, hi, page_num)
-                    if not scraper._goto(url, vent_selector="section article",
-                                         vent_ms=8000):
-                        log.error("Klarte ikke åpne %s", url)
-                        break
-                    if PAGE_LOAD_WAIT:
-                        time.sleep(PAGE_LOAD_WAIT)
-                    try:
-                        sidelisting = scraper.scrape_search_page()
-                    except Exception as e:
-                        log.error("Feil på side %d (part %d): %s", page_num, pidx, e)
-                        break
+                    sidelisting, mistenkelig = scraper.hent_sokeside(url, forvent_innhold)
+                    sider_siden_restart += 1
+
+                    if sidelisting is None:
+                        # ★ v19: siden lot seg ikke laste. v18 brøt her og
+                        # merket HELE partisjonen som ferdig.
+                        feilede.append([lo, hi, page_num])
+                        feil_pa_rad += 1
+                        log.warning("  ⚠ Part %d side %d kunne ikke lastes — lagt i kø "
+                                    "for ny runde.", pidx + 1, page_num)
+                        if feil_pa_rad >= FASE1_MAKS_FEIL_PA_RAD:
+                            nedkjolinger += 1
+                            if nedkjolinger > FASE1_MAKS_NEDKJOLINGER:
+                                siste = forventet_sider or FINN_SIDE_CAP
+                                for s in range(page_num + 1, siste + 1):
+                                    feilede.append([lo, hi, s])
+                                log.error("  ✖ Part %d: gir opp for nå — side %d–%d tas "
+                                          "i retry-runden.", pidx + 1, page_num + 1, siste)
+                                break
+                            pause = min(FASE1_NEDKJOLING_S * nedkjolinger, 600)
+                            log.warning("  🧊 %d sider feilet på rad — kjøler ned %ds "
+                                        "og starter ny Chromium.", feil_pa_rad, pause)
+                            scraper._sov(pause)
+                            scraper._restart("mange feil på rad")
+                            sider_siden_restart = 0
+                            feil_pa_rad = 0
+                        cp["fase1_side"] = page_num + 1
+                        save_checkpoint(cp)
+                        page_num += 1
+                        continue
+                    feil_pa_rad = 0
 
                     if not sidelisting:
+                        if mistenkelig:
+                            feilede.append([lo, hi, page_num])
                         tomme += 1
-                        if tomme >= 2:
+                        # ★ v19: forbi forventet siste side -> ferdig med en gang
+                        forbi_slutt = (forventet_sider is not None
+                                       and page_num > forventet_sider)
+                        if tomme >= 2 or forbi_slutt:
+                            if forventet_sider is not None and page_num < forventet_sider:
+                                for s in range(page_num + 1, forventet_sider + 1):
+                                    feilede.append([lo, hi, s])
+                                log.warning("  ⚠ Part %d stoppet på side %d av ~%d — "
+                                            "resten tas i retry-runden.",
+                                            pidx + 1, page_num, forventet_sider)
                             break
-                        time.sleep(4)
+                        tom_side = page_num
+                        scraper._sov(4)
+                        page_num += 1
                         continue
                     tomme = 0
+                    if tom_side is not None:
+                        # ★ v19: en tom side FØR en side med innhold var en
+                        # glipp, ikke slutten. Ta den igjen i retry-runden.
+                        feilede.append([lo, hi, tom_side])
+                        tom_side = None
 
-                    nye = [l for l in sidelisting
-                           if l.get("finn_id") and l["finn_id"] not in seen]
-                    for l in nye:
-                        seen.add(l["finn_id"])
-                    all_listings.extend(nye)
+                    if not antall_lest:
+                        antall = scraper.les_antall_fra_side()
+                        antall_lest = True
+                    per_side = max(per_side or 0, len(sidelisting))
+                    cp["fase1_per_side"] = per_side
+
+                    nye = ta_imot(sidelisting)
 
                     if page_num % 10 == 0 or not nye:
                         log.info("  Part %d side %d: %d nye (totalt %d, %.0f/min)",
@@ -2857,21 +3656,33 @@ def finnDødsboScraperv18(maks_annonser=None):
                                  len(all_listings) / max(time.time() - t0, 1) * 60)
 
                     cp["listings"] = all_listings
+                    cp["fase1_side"] = page_num + 1
                     save_checkpoint(cp)
 
                     if MAKS_ANNONSER is not None and len(all_listings) >= MAKS_ANNONSER:
-                        all_listings = all_listings[:MAKS_ANNONSER]
                         log.info("★ TEST-GRENSE nådd (%d).", MAKS_ANNONSER)
                         stopp = True
                         break
+                    page_num += 1
 
                 cp["fase1_part_index"] = pidx + 1
+                cp["fase1_side"] = 1
                 cp["listings"] = all_listings
                 save_checkpoint(cp, force=True)
                 if stopp:
                     break
+
+            # ★ v19: ny runde for sidene som feilet
+            if not stopp:
+                _fase1_retry(scraper, cp, ta_imot)
         finally:
+            # ★ v19: fremdriften lagres også når noe krasjer eller Ctrl+C
+            cp["listings"] = all_listings
+            save_checkpoint(cp, force=True)
             scraper.quit()
+            if db_ref[0]:
+                try: db_ref[0].close()
+                except Exception: pass
 
         lagre_til_db(conn, all_listings)
         cp["listings"] = []
@@ -2903,7 +3714,7 @@ def finnDødsboScraperv18(maks_annonser=None):
 
         log.info("")
         log.info("╔═════════════════════════════════════════════╗")
-        log.info("║  FASE 2: PDF + SETNINGSANALYSE + STED (v17) ║")
+        log.info("║  FASE 2: PDF + SETNINGSANALYSE + STED (v19) ║")
         log.info("║  %2d parallelle workers                      ║", NUM_WORKERS)
         log.info("║  Kandidater: %6d                         ║", len(kandidater))
         log.info("║  — derav retry (pdf_ikke_funnet): %5d     ║", len(retry))
@@ -2913,12 +3724,38 @@ def finnDødsboScraperv18(maks_annonser=None):
             log.info("Ingen kandidater — Fase 2 allerede ferdig.")
             return all_listings
 
-        chunks = [[] for _ in range(NUM_WORKERS)]
-        for idx, l in enumerate(kandidater):
-            chunks[idx % NUM_WORKERS].append(l)
-
+        _STOPP.clear()
         t0 = time.time()
-        with ThreadPoolExecutor(max_workers=NUM_WORKERS) as ex:
+        _kjor_workers(kandidater, NUM_WORKERS)
+        log.info("Fase 2 ferdig på %.1f min (%.0f annonser/min)",
+                 (time.time() - t0) / 60,
+                 len(kandidater) / max(time.time() - t0, 1) * 60)
+
+        # ★ v19: én ekstra runde for annonser som feilet pga. nettleser eller
+        # nettverk. "Fant ingen PDF" tas ikke her — det er megleren, ikke oss.
+        igjen = [l for l in kandidater
+                 if l.get("salgsoppgave_status") in FASE2_RETRY_STATUS]
+        if igjen and not _STOPP.is_set():
+            log.info("")
+            log.info("══ Fase 2 — ny runde for %d annonse(r) med nettleser-/"
+                     "nettverksfeil ══", len(igjen))
+            _kjor_workers(igjen, FASE2_RETRY_WORKERS)
+            fortsatt = sum(1 for l in igjen
+                           if l.get("salgsoppgave_status") in FASE2_RETRY_STATUS)
+            if fortsatt:
+                log.warning("⚠ %d annonse(r) feilet fortsatt — de prøves ved neste "
+                            "kjøring.", fortsatt)
+        return all_listings
+
+    def _kjor_workers(kandidater, antall_workers):
+        """Fordeler kandidatene på workere og venter til alle er ferdige."""
+        antall_workers = max(1, min(antall_workers, len(kandidater)))
+        chunks = [[] for _ in range(antall_workers)]
+        for idx, l in enumerate(kandidater):
+            chunks[idx % antall_workers].append(l)
+
+        ex = ThreadPoolExecutor(max_workers=antall_workers)
+        try:
             futures = {ex.submit(fase2_worker, wid, chunk): wid
                        for wid, chunk in enumerate(chunks) if chunk}
             ferdig = 0
@@ -2930,21 +3767,28 @@ def finnDødsboScraperv18(maks_annonser=None):
                     log.error("Worker %d returnerte feil: %s", wid, e)
                 ferdig += 1
                 log.info("  Worker %d/%d ferdig.", ferdig, len(futures))
-        log.info("Fase 2 ferdig på %.1f min (%.0f annonser/min)",
-                 (time.time() - t0) / 60,
-                 len(kandidater) / max(time.time() - t0, 1) * 60)
-        return all_listings
+        except KeyboardInterrupt:
+            # ★ v19: be workerne stoppe etter annonsen de holder på med,
+            # så den blir lagret, i stedet for å henge i bakgrunnen.
+            _STOPP.set()
+            log.warning("⚠ Avbryter — venter på at workerne lagrer pågående "
+                        "annonse ...")
+            raise
+        finally:
+            ex.shutdown(wait=True)
 
     # ══════════════════════════════════════════════
     # KJØR
     # ══════════════════════════════════════════════
     log.info("╔══════════════════════════════════════════════╗")
-    log.info("║  Finn Dødsbo/Tvangssalg-Scraper v18           ║")
-    log.info("║  v17-deteksjon UENDRET + bedre PDF-henting   ║")
+    log.info("║  Finn Dødsbo/Tvangssalg-Scraper v19           ║")
+    log.info("║  v17-deteksjon UENDRET + robust lasting       ║")
     log.info("╚══════════════════════════════════════════════╝")
     log.info("  Direkte PDF .......... %s", "PÅ" if BRUK_DIREKTE_PDF else "AV")
     log.info("  Utvidet lenkesøk ..... %s", "PÅ" if BRUK_UTVIDET_LENKESOK else "AV")
     log.info("  Innbygd PDF-søk ...... %s", "PÅ" if BRUK_INNBYGD_PDF_SOK else "AV")
+    log.info("  Vakthund ............. %s", "PÅ" if BRUK_VAKTHUND else "AV")
+    log.info("  Sider pr. partisjon .. %d", FINN_SIDE_CAP)
 
     try:
         import fitz  # noqa: F401
@@ -2971,30 +3815,58 @@ def finnDødsboScraperv18(maks_annonser=None):
                   "eller flytt prosjektet ut av OneDrive-mappa.")
         return
     cp = load_checkpoint()
+    start_vakthund()
 
     listings = []
     fullfort = False
     t_start = time.time()
-    try:
-        if not cp.get("fase1_done"):
-            listings = kjor_fase1(cp, conn)
-        elif cp.get("listings_i_db"):
-            listings = last_listings_fra_db(conn)
-            log.info("Fase 1 ferdig fra før — lastet %d annonser fra DB.", len(listings))
-        else:
-            listings = cp.get("listings", [])
-            log.info("Fase 1 ferdig fra før (%d annonser i checkpoint).", len(listings))
-        listings = kjor_fase2(listings)
-        fullfort = True
-    except KeyboardInterrupt:
-        log.warning("⚠ Avbrutt av bruker. Fremdrift ligger i DB.")
-        if not listings:
-            listings = last_listings_fra_db(conn)
-    except Exception as e:
-        log.error("Uventet feil: %s", e)
-        log.error(traceback.format_exc())
-        if not listings:
-            listings = last_listings_fra_db(conn)
+    # ★ v19: ved et uventet krasj gjenopptas kjøringen automatisk. Fase 1
+    # fortsetter fra siden i checkpointet, Fase 2 fra statusene i DB.
+    for runde in range(1, MAKS_AUTO_GJENOPPTAK + 2):
+        try:
+            if not cp.get("fase1_done"):
+                listings = kjor_fase1(cp, conn)
+            elif cp.get("listings_i_db"):
+                listings = last_listings_fra_db(conn)
+                log.info("Fase 1 ferdig fra før — lastet %d annonser fra DB.", len(listings))
+            else:
+                listings = cp.get("listings", [])
+                log.info("Fase 1 ferdig fra før (%d annonser i checkpoint).", len(listings))
+            listings = kjor_fase2(listings)
+            fullfort = True
+            break
+        except KeyboardInterrupt:
+            log.warning("⚠ Avbrutt av bruker. Fremdrift ligger i DB og checkpoint.")
+            if not listings:
+                listings = last_listings_fra_db(conn)
+            break
+        except Exception as e:
+            log.error("Uventet feil: %s", e)
+            log.error(traceback.format_exc())
+            if runde <= MAKS_AUTO_GJENOPPTAK:
+                log.warning("↻ Gjenopptar automatisk om %ds (%d/%d). Fremdriften "
+                            "ligger i checkpoint og DB.", AUTO_GJENOPPTAK_PAUSE_S,
+                            runde, MAKS_AUTO_GJENOPPTAK)
+                try:
+                    time.sleep(AUTO_GJENOPPTAK_PAUSE_S)
+                except KeyboardInterrupt:
+                    if not listings:
+                        listings = last_listings_fra_db(conn)
+                    break
+                gc.collect()
+                # Ny hovedtilkobling i tilfelle den gamle er ødelagt
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                try:
+                    conn = get_conn()
+                except Exception as e2:
+                    log.error("Ny DB-tilkobling feilet: %s", e2)
+                listings = []
+                continue
+            if not listings:
+                listings = last_listings_fra_db(conn)
 
     if listings:
         try:
@@ -3027,6 +3899,10 @@ def finnDødsboScraperv18(maks_annonser=None):
         log.warning("Ingen listings — recovery fra DB...")
         eksporter_fra_db()
 
-    conn.close()
+    stopp_vakthund()
+    try:
+        conn.close()
+    except Exception:
+        pass
     log.info("Total kjøretid: %.1f min.", (time.time() - t_start) / 60)
-#finnDødsboScraperv18(maks_annonser=None)
+#finnDødsboScraperv19(maks_annonser=None)
