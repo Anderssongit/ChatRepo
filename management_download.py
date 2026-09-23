@@ -734,24 +734,18 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
                         sl.info("  Hele siden ligger allerede i DataNLP — stopper bladingen")
                         break'''),
     # 4
-    (r'''
-            return all_rows[:config.max_articles_per_company]''',
-     r'''
-            rader = all_rows[:config.max_articles_per_company]
-            if kjente is not None:
-                rader = [r for r in rader if not _er_kjent(r, kjente, config)]
-            return rader'''),
-    # 5
     (r'''            is_first: bool,''',
      r'''            is_first: bool,
             kjente: Optional[Set] = None,
             stats: Optional[dict] = None,'''),
-    # 6
+    # 5
     (r'''
             row_data = await collect_all_article_rows(page, config, sl)''',
      r'''
-            row_data = await collect_all_article_rows(page, config, sl, kjente, stats)'''),
-    # 7
+            row_data = await collect_all_article_rows(page, config, sl, kjente, stats)
+            if kjente is not None:
+                row_data = [r for r in row_data if not _er_kjent(r, kjente, config)]'''),
+    # 6
     (r'''                    sl.info(f"  ... og {len(row_data)-3} til")''',
      r'''                    sl.info(f"  ... og {len(row_data)-3} til")
             elif stats is not None and stats.get("kjente"):
@@ -764,7 +758,7 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
                 except Exception:
                     pass
                 return articles'''),
-    # 8
+    # 7
     (r'''            companies = load_companies(config)''',
      r'''            companies = load_companies(config)
             if config.only_companies.strip():
@@ -772,7 +766,7 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
                          for w in config.only_companies.split(",") if w.strip()}
                 companies = [c for c in companies if _selskapsnokkel(c) in valgt]
                 print(f"   Utvalg fra AKSJE_NLP_SELSKAPER: {len(companies)} selskaper")'''),
-    # 9
+    # 8
     (r'''            print(f"   ✅ STEG C FERDIG: {len(remaining)} selskaper gjenstår")''',
      r'''            print(f"   ✅ STEG C FERDIG: {len(remaining)} selskaper gjenstår")
             # STEG C2: Bare nye artikler
@@ -793,43 +787,34 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
 
             def kjente_for(company):
                 return known.get(_selskapsnokkel(company)) if config.incremental else None'''),
-    # 10
+    # 9
     (r'''                failed_companies = []''',
      r'''                failed_companies = []
                 oppdatert = []'''),
-    # 11
-    (r'''                    print(f"{'▓'*70}")
-''',
-     r'''                    print(f"{'▓'*70}")
-
-                    stats = {}'''),
-    # 12
+    # 10
     (r'''                    try:
                         articles = await scrape_company(page, company, config, is_first)''',
-     r'''                    try:
+     r'''                    stats = {}
+                    try:
                         articles = await scrape_company(page, company, config, is_first,
                                                         kjente_for(company), stats)'''),
-    # 13
-    (r'''                            await page.wait_for_timeout(1_500)
-                        except Exception:
-                            pass
-''',
-     r'''                            await page.wait_for_timeout(1_500)
-                        except Exception:
-                            pass
-
-                    if not articles and stats.get("oppdatert"):
+    # 11
+    (r'''                    if not articles:
+                        # A loaded page with no parsed articles may be a failed navigation.''',
+     r'''                    if not articles and stats.get("oppdatert"):
                         oppdatert.append(company)
                         mark_company_complete(company, config, today)
                         print(f"  ✓ {company}: ingen nye artikler — allerede oppdatert")
-                        continue'''),
-    # 14
+                        continue
+                    if not articles:
+                        # A loaded page with no parsed articles may be a failed navigation.'''),
+    # 12
     (r'''                                try:
                                     articles = await scrape_company(page, company, config, False)''',
      r'''                                try:
                                     articles = await scrape_company(page, company, config, False,
                                                                     kjente_for(company), stats)'''),
-    # 15
+    # 13
     (r'''            print(f"{'='*80}")
             save_results(all_results, config, today, final=not failed_companies)''',
      r'''            print(f"{'='*80}")
@@ -839,7 +824,7 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
             # og en fil med tidsstempel leses ikke av ledelses-laben.
             save_results(existing_rows + all_results, config, today,
                          final=not failed_companies or config.incremental)'''),
-    # 16
+    # 14
     (r'''            print(f"  Artikler analysert:      {arts_total}")''',
      r'''            print(f"  Artikler analysert:      {arts_total}")
             if config.incremental:
@@ -857,7 +842,12 @@ SCRAPER_PATCHES: List[Tuple[str, str]] = [
 #      returned without downloading anything. The check is replaced by a call.
 #   2. The v4.1 scraper gets «only new articles» (SCRAPER_PATCHES below). If
 #      your file differs where a change goes, none of them are applied: the
-#      scraper still runs, but downloads every article again, and step 4 warns.
+#      scraper still runs, but downloads every article again, and step 4 warns
+#      and lists every change that did not match.
+#   3. The scraper reads its companies from a list in Data_BT. When that file
+#      is missing, or only some companies are chosen (5, or named ones), the
+#      chosen companies are written to this script's own output folder and
+#      the scraper reads that list instead. Data_BT is not touched.
 
 SCRAPER_FILE = "Only_260820.py"
 SCRAPER_START = "    def NLP_Euronext_Quarter4_v41():"
@@ -875,8 +865,10 @@ def _kjor_async(coro):
     # Added by management_download.py: asyncio.run, also where a loop runs.
     import asyncio
     try:
-        asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
+        loop = None
+    if loop is None:
         return asyncio.run(coro)
     import nest_asyncio
     nest_asyncio.apply()
@@ -908,16 +900,53 @@ def patch_scraper_source(text: str) -> Tuple[str, List[str], List[str]]:
                        "again (slow)")
         return text, done, missing
     part = text[start:end]
-    for number, (old, new) in enumerate(SCRAPER_PATCHES, 1):
+    unmatched = []
+    for number, (old, _) in enumerate(SCRAPER_PATCHES, 1):
         if part.count(old + "\n") != 1:
             last = next((x.strip() for x in reversed(old.splitlines()) if x.strip()), "")
-            missing.append(f"change {number}/{len(SCRAPER_PATCHES)} does not match your "
-                           f"file (near «{last[:60]}»), so every article is downloaded "
-                           f"again (slow)")
-            return text, done, missing
+            unmatched.append(f"{number} (near «{last[:70]}»)")
+    if unmatched:
+        missing.append(f"{len(unmatched)} of {len(SCRAPER_PATCHES)} changes do not match "
+                       f"your file, so every article is downloaded again (slow). "
+                       f"Not matching: " + "; ".join(unmatched))
+        return text, done, missing
+    for old, new in SCRAPER_PATCHES:
         part = part.replace(old + "\n", new + "\n", 1)
     done.append(f"only new articles: all {len(SCRAPER_PATCHES)} changes applied")
     return text[:start] + part + text[end:], done, missing
+
+
+TICKERS_FILE = re.compile(r'^([ \t]+tickers_file:[^=\n]*=[ \t]*)r?(["\'])([^"\'\n]*)\2',
+                          re.M)
+
+
+def point_at_company_list(step: Step, s: Settings, text: str, names: List[str]) -> str:
+    """
+    Make the v4.1 scraper read the chosen companies, when that is needed.
+
+    Kept as it is: a full run whose own list exists. Otherwise the chosen
+    companies go to <output>/scraper_companies.xlsx, and the scraper's
+    tickers_file points there - in memory; Data_BT is not touched.
+    """
+    start = text.find(SCRAPER_START)
+    end = text.find(SCRAPER_END, start + 1) if start >= 0 else -1
+    found = TICKERS_FILE.search(text, start, end) if start >= 0 and end > 0 else None
+    if found is None:
+        step.warn("scraper: its company list setting (tickers_file) was not found, so "
+                  "it uses its own list" + ("" if s.full_run else
+                                            " - and may scrape more than the chosen companies"))
+        return text
+    own = s.base_dir / found.group(3).replace("\\", "/")
+    if s.full_run and own.is_file():
+        step.info(f"scraper: company list {own}")
+        return text
+    target = s.out_dir / "scraper_companies.xlsx"
+    import pandas as pd
+    pd.DataFrame({"Company": names}).to_excel(target, index=False)
+    why = (f"{own.name} is missing" if not own.is_file() else "only the chosen companies")
+    (step.warn if not own.is_file() else step.info)(
+        f"scraper: {why} - it reads {len(names)} companies from {target} instead")
+    return text[:found.start()] + found.group(1) + repr(str(target)) + text[found.end():]
 
 
 def find_scraper_file() -> Optional[Path]:
@@ -928,7 +957,8 @@ def find_scraper_file() -> Optional[Path]:
     return None
 
 
-def load_scraper(step: Step) -> Any:
+def load_scraper(step: Step, s: Optional[Settings] = None,
+                 names: Optional[List[str]] = None) -> Any:
     """Only_260820 as a module, fixed in memory. The file is never written."""
     if "Only_260820" in sys.modules:
         module = sys.modules["Only_260820"]
@@ -954,6 +984,8 @@ def load_scraper(step: Step) -> Any:
         step.info(f"scraper: {line}")
     for line in missing:
         step.warn(f"scraper: {line}")
+    if s is not None and names:
+        text = point_at_company_list(step, s, text, names)
     if "_kjor_async(main())" not in text:
         raise StepError("the scraper cannot be started from here: its start was not found",
                         hint=f"Send me the last 20 lines of NLP_Euronext_Quarter4_v41() "
@@ -1005,7 +1037,7 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
     try:
         if str(THIS_FILE.parent) not in sys.path:
             sys.path.insert(0, str(THIS_FILE.parent))
-        models = load_scraper(step)
+        models = load_scraper(step, s, names)
         try:
             from runtime_config import configure_paths
             configure_paths(models.__dict__, s.base_dir)

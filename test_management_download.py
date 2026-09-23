@@ -415,7 +415,7 @@ class ScraperFixedInMemory(unittest.TestCase):
             self.skipTest("git history not available")
         text, done, missing = MD.patch_scraper_source(original)
         self.assertEqual(missing, [])
-        self.assertIn("only new articles: all 16 changes applied", done)
+        self.assertIn(f"only new articles: all {len(MD.SCRAPER_PATCHES)} changes applied", done)
         self.assertIn("scraper start fixed in 2 place(s)", done)
         fixed = (Path(__file__).resolve().parent / "Only_260820.py").read_text(encoding="utf-8")
         self.assertEqual(v41(text), v41(fixed))
@@ -430,7 +430,7 @@ class ScraperFixedInMemory(unittest.TestCase):
             "row_data = await collect_all_article_rows(page, config,  sl)", 1)
         text, done, missing = MD.patch_scraper_source(changed)
         self.assertIn("scraper start fixed in 2 place(s)", done)
-        self.assertTrue(any("does not match your file" in m for m in missing), missing)
+        self.assertTrue(any("do not match your file" in m for m in missing), missing)
         self.assertNotIn("def load_known_articles", text)
         compile(text, "Only_260820.py", "exec", dont_inherit=True)
 
@@ -460,6 +460,54 @@ class ScraperFixedInMemory(unittest.TestCase):
             self.assertEqual(module.calls, ["BSP"], "the scraper must really run")
             self.assertEqual(path.read_bytes(), before, "the file on disk is not changed")
             self.assertTrue(any("v4.1 scraper was not found" in w for w in step.warnings))
+
+
+class ScraperCompanyList(unittest.TestCase):
+    TEXT = (MD.SCRAPER_START + "\n        class Config:\n"
+            "            tickers_file: str       = r\"Data_BT\\AllTickers_OSEBX_TW_current.xlsx\"\n"
+            + MD.SCRAPER_END + "\n")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def settings(self, companies):
+        s = MD.Settings(base_dir=self.base, companies=companies)
+        s.out_dir.mkdir(parents=True)
+        return s
+
+    def point(self, companies, names):
+        step = MD.Step(MD.Report(), 4, "test")
+        with contextlib.redirect_stdout(io.StringIO()):
+            text = MD.point_at_company_list(step, self.settings(companies), self.TEXT, names)
+        return text, step
+
+    def test_a_missing_list_is_replaced_by_the_chosen_companies(self):
+        text, step = self.point(["all"], ["2020", "ABG", "BSP"])
+        target = self.base / MD.OUTPUT_DIR / "management_download" / "all" / "scraper_companies.xlsx"
+        self.assertIn(repr(str(target)), text)
+        self.assertNotIn("TW_current", text)
+        self.assertEqual(pd.read_excel(target)["Company"].astype(str).tolist(),
+                         ["2020", "ABG", "BSP"])
+        self.assertTrue(any("is missing" in w for w in step.warnings))
+
+    def test_a_full_run_keeps_its_own_list_when_it_exists(self):
+        (self.base / "Data_BT").mkdir()
+        pd.DataFrame({"Company": ["X"]}).to_excel(
+            self.base / "Data_BT" / "AllTickers_OSEBX_TW_current.xlsx")
+        text, step = self.point(["all"], ["BSP"])
+        self.assertEqual(text, self.TEXT)
+
+    def test_five_companies_always_get_their_own_list(self):
+        (self.base / "Data_BT").mkdir()
+        pd.DataFrame({"Company": ["X"]}).to_excel(
+            self.base / "Data_BT" / "AllTickers_OSEBX_TW_current.xlsx")
+        text, step = self.point(["5"], ["2020", "ABG", "BSP", "EAM", "ZAL"])
+        self.assertIn("scraper_companies.xlsx", text)
+        self.assertEqual(step.warnings, [])
 
 
 class YahooReasons(unittest.TestCase):

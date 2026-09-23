@@ -201,8 +201,10 @@ def _kjor_async(coro):
     """asyncio.run, også i Spyder og Jupyter der en hendelsesløkke allerede går."""
     import asyncio
     try:
-        asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
+        loop = None
+    if loop is None:
         return asyncio.run(coro)
     nest_asyncio.apply()
     return asyncio.get_event_loop().run_until_complete(coro)
@@ -6519,10 +6521,7 @@ def SentimentManagement():
                     pass
                 await page.wait_for_timeout(1_500)
 
-            rader = all_rows[:config.max_articles_per_company]
-            if kjente is not None:
-                rader = [r for r in rader if not _er_kjent(r, kjente, config)]
-            return rader
+            return all_rows[:config.max_articles_per_company]
 
 
         # ─────────────────────────────────────────────────────────────────────────────
@@ -6830,6 +6829,8 @@ def SentimentManagement():
             sl.step(f"Henter artikkelliste fra tabellen (paginering, maks {config.max_pages} sider)")
 
             row_data = await collect_all_article_rows(page, config, sl, kjente, stats)
+            if kjente is not None:
+                row_data = [r for r in row_data if not _er_kjent(r, kjente, config)]
 
             if row_data:
                 sl.ok(f"Fant {len(row_data)} artikler totalt")

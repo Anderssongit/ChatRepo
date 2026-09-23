@@ -6,7 +6,6 @@ fail if the scraper changes. Nothing here opens a browser or the network.
 import ast
 import asyncio
 import logging
-import sys
 import tempfile
 import textwrap
 import time
@@ -90,6 +89,8 @@ class OnlyNewArticles(unittest.TestCase):
         stats = {}
         page = FakePage(pages)
         rows = asyncio.run(self.ns["collect_all_article_rows"](page, CONFIG, Log(), known, stats))
+        if known is not None:       # as scrape_company does with the rows
+            rows = [r for r in rows if not self.ns["_er_kjent"](r, known, CONFIG)]
         return rows, stats, page
 
     def test_stops_at_the_first_page_that_is_already_saved(self):
