@@ -654,6 +654,26 @@ def article_snapshot(pd: Any, folder: Path) -> Tuple[set, str]:
 # (text in the old Only_260820.py, text it becomes). Taken from the
 # difference between the original file and the fixed one, and checked
 # against the original in test_management_download.py.
+# Changes that make the v4.1 scraper sturdier. Each is applied on its own when
+# its text matches, whether or not the «only new articles» changes fit.
+ROBUST_PATCHES: List[Tuple[str, str, str]] = [
+    ("one article without text or score no longer stops the scraper",
+     r'''                        sent  = analyzer.analyze(art.text)''',
+     r'''                        # En artikkel uten tekst (klikket feilet) eller uten språkmodell
+                        # får ingen score. Den hoppes over og lagres ikke, så den hentes
+                        # på nytt neste gang - i stedet for at hele skrapingen stopper.
+                        if len(art.text or "") < 100 or not getattr(analyzer, "pipe", True):
+                            print(f"    [{ai}/{len(articles)}] {art.title[:50]}... hoppet over: "
+                                  f"ingen tekst eller modell - prøves igjen neste gang")
+                            continue
+                        try:
+                            sent  = analyzer.analyze(art.text)
+                        except Exception as e:
+                            print(f"    [{ai}/{len(articles)}] {art.title[:50]}... hoppet over: "
+                                  f"{type(e).__name__}: {e} - prøves igjen neste gang")
+                            continue'''),
+]
+
 SCRAPER_PATCHES: List[Tuple[str, str]] = [
     # 1
     (r'''            force_rerun: bool       = True''',
@@ -914,6 +934,14 @@ def patch_scraper_source(text: str) -> Tuple[str, List[str], List[str]]:
                        "again (slow)")
         return text, done, missing
     part = text[start:end]
+    for what, old, new in ROBUST_PATCHES:
+        if part.count(old + "\n") == 1:
+            part = part.replace(old + "\n", new + "\n", 1)
+            done.append(what)
+        else:
+            missing.append(f"not applied (text differs in your file): {what}")
+    text = text[:start] + part + text[end:]
+    end = start + len(part)
     unmatched = []
     for number, (old, _) in enumerate(SCRAPER_PATCHES, 1):
         if part.count(old + "\n") != 1:
@@ -1061,6 +1089,7 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
                     "AKSJE_NLP_ONLY_DOWNLOAD": "1",
                     "AKSJE_NLP_SELSKAPER": "" if s.full_run else ",".join(names)}
     previous = {k: os.environ.get(k) for k in settings_env}
+    started = time.time()
     os.environ.update(settings_env)
     error = ""
     try:
@@ -1094,6 +1123,18 @@ def download_articles(step: Step, s: Settings, mods: Dict[str, Any],
         step.warn(f"Article download failed: {error}. Continuing with the articles "
                   f"already saved" + (f" ({new} new ones were saved first)" if new else "")
                   + ".")
+        # The scraper saves progress every 5 companies under a time-stamped name,
+        # which the backtest does not read. The next run reads them as saved
+        # articles and puts them in its complete _FINAL file.
+        try:
+            progress = [f for f in s.nlp_dir.glob("NLP_Sentiment_Detail_*.xlsx")
+                        if f not in article_files(s.nlp_dir)
+                        and f.stat().st_mtime >= started]
+        except OSError:
+            progress = []
+        if progress:
+            step.info(f"{len(progress)} progress file(s) were saved before it stopped "
+                      f"({progress[-1].name}); the next run includes those articles")
     step.info(f"{new} new article(s); newest article is now {newest_after}")
     step.summary = f"{new} new articles, newest {newest_after}"
     return new

@@ -7290,7 +7290,19 @@ def SentimentManagement():
 
                     print(f"\n  🧠 FinBERT-analyse på {len(articles)} artikler for {company}...")
                     for ai, art in enumerate(articles, 1):
-                        sent  = analyzer.analyze(art.text)
+                        # En artikkel uten tekst (klikket feilet) eller uten språkmodell
+                        # får ingen score. Den hoppes over og lagres ikke, så den hentes
+                        # på nytt neste gang - i stedet for at hele skrapingen stopper.
+                        if len(art.text or "") < 100 or not getattr(analyzer, "pipe", True):
+                            print(f"    [{ai}/{len(articles)}] {art.title[:50]}... hoppet over: "
+                                  f"ingen tekst eller modell - prøves igjen neste gang")
+                            continue
+                        try:
+                            sent  = analyzer.analyze(art.text)
+                        except Exception as e:
+                            print(f"    [{ai}/{len(articles)}] {art.title[:50]}... hoppet over: "
+                                  f"{type(e).__name__}: {e} - prøves igjen neste gang")
+                            continue
                         final = sent["positive"] - sent["negative"]
                         rec   = {
                             "Company":        company,

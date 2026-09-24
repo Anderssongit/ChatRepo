@@ -476,6 +476,7 @@ class ScraperFixedInMemory(unittest.TestCase):
         self.assertEqual(missing, [])
         self.assertIn(f"only new articles: all {len(MD.SCRAPER_PATCHES)} changes applied", done)
         self.assertIn("scraper start fixed in 2 place(s)", done)
+        self.assertIn("one article without text or score no longer stops the scraper", done)
         fixed = (Path(__file__).resolve().parent / "Only_260820.py").read_text(encoding="utf-8")
         self.assertEqual(v41(text), v41(fixed))
         compile(text, "Only_260820.py", "exec", dont_inherit=True)
@@ -491,6 +492,20 @@ class ScraperFixedInMemory(unittest.TestCase):
         self.assertIn("scraper start fixed in 2 place(s)", done)
         self.assertTrue(any("do not match your file" in m for m in missing), missing)
         self.assertNotIn("def load_known_articles", text)
+        compile(text, "Only_260820.py", "exec", dont_inherit=True)
+
+    def test_the_sturdiness_change_is_applied_even_when_the_others_do_not_fit(self):
+        original = repo_original()
+        if original is None:
+            self.skipTest("git history not available")
+        changed = original.replace(
+            "row_data = await collect_all_article_rows(page, config, sl)",
+            "row_data = await collect_all_article_rows(page, config,  sl)", 1)
+        self.assertNotEqual(changed, original)
+        text, done, missing = MD.patch_scraper_source(changed)
+        self.assertIn("one article without text or score no longer stops the scraper", done)
+        self.assertTrue(any("do not match your file" in m for m in missing), missing)
+        self.assertIn("prøves igjen neste gang", v41(text))
         compile(text, "Only_260820.py", "exec", dont_inherit=True)
 
     def test_the_fixed_file_is_used_as_it_is(self):
